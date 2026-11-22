@@ -17,7 +17,7 @@ import pytest
 
 def _make_kernel_generator(kernel_size: int = 9, *, disable_sinc: bool = False) -> Any:
     """Opaque-box helper instantiating KernelGenerator across signature variants."""
-    from srtrainer.data.degradation import KernelGenerator
+    from data.degradation import KernelGenerator
 
     params = inspect.signature(KernelGenerator.__init__).parameters
     kernel_range = [k for k in (7, kernel_size) if k <= kernel_size] or [kernel_size]
@@ -63,8 +63,8 @@ def test_t1_c01_data_package_reexports_and_manifest_autodetect(
     validate_sources_caller: Callable[..., Any],
 ) -> None:
     """F02, F21, Reqs #1/#2: Short-path re-exports and per-sample gt_only/paired auto-detection."""
-    import srtrainer.data as data_pkg
-    import srtrainer.data.degradation as deg_pkg
+    import data as data_pkg
+    import data.degradation as deg_pkg
 
     expected_data = (
         "MixedSRDataset",
@@ -79,7 +79,7 @@ def test_t1_c01_data_package_reexports_and_manifest_autodetect(
         "SourceStats",
     )
     for sym in expected_data:
-        assert hasattr(data_pkg, sym), f"Missing srtrainer.data.{sym}"
+        assert hasattr(data_pkg, sym), f"Missing data.{sym}"
 
     expected_deg = (
         "RealESRGANDegrader",
@@ -92,7 +92,7 @@ def test_t1_c01_data_package_reexports_and_manifest_autodetect(
         "filter2d",
     )
     for sym in expected_deg:
-        assert hasattr(deg_pkg, sym), f"Missing srtrainer.data.degradation.{sym}"
+        assert hasattr(deg_pkg, sym), f"Missing data.degradation.{sym}"
 
     gt_src = gt_only_train_source_factory(name="pure_gt", n_samples=2, gt_h=32, gt_w=32, ratio=0.5)
     pair_src = paired_train_source_factory(
@@ -215,7 +215,7 @@ def test_t1_c04_paired_aligned_crop_and_synchronized_augmentations(
     """F22: Paired random crop aligns strictly by scale and synchronizes hflip/vflip/rot90."""
     import torch
 
-    from srtrainer.utils.image import load_image
+    from utils.image import load_image
 
     scale = 2
     src = paired_train_source_factory(
@@ -385,7 +385,7 @@ def test_t1_c07_kernels_all_six_types_sinc_identity_and_filter2d() -> None:
     """F26: circular_lowpass_kernel, all 6 blur types, KernelGenerator, and batched filter2d."""
     import torch
 
-    from srtrainer.data.degradation import (
+    from data.degradation import (
         circular_lowpass_kernel,
         filter2d,
         random_mixed_kernels,
@@ -474,7 +474,7 @@ def test_t1_c08_diffjpeg_batched_fp32_quality_monotonicity() -> None:
     """F27: Batched FP32 DiffJPEG preserves shape/range and degrades more at lower quality."""
     import torch
 
-    from srtrainer.data.degradation import DiffJPEG
+    from data.degradation import DiffJPEG
 
     yy, xx = torch.meshgrid(torch.arange(32), torch.arange(32), indexing="ij")
     checker = ((yy // 2 + xx // 2) % 2).float()
@@ -504,7 +504,7 @@ def test_t1_c09_realesrgan_degrader_masked_execution_and_usm() -> None:
     """F28: Masked RealESRGANDegrader leaves paired (~mask) bit-exact and applies USM only on mask."""
     import torch
 
-    from srtrainer.data.degradation import RealESRGANDegrader, USMSharp
+    from data.degradation import RealESRGANDegrader, USMSharp
 
     torch.manual_seed(11)
     # Textured 64x64 GT so BasicSR default USMSharp(radius=50) reflect pad (50 < 64) succeeds
@@ -584,7 +584,7 @@ def test_t1_c10_realesrgan_degrader_training_pool_pairing_and_mixing() -> None:
     """F28, F29: TrainingPool preserves exact (lq, gt) pairing while mixing across steps."""
     import torch
 
-    from srtrainer.data.degradation import RealESRGANDegrader, TrainingPool
+    from data.degradation import RealESRGANDegrader, TrainingPool
 
     torch.manual_seed(17)
     pool = TrainingPool(queue_size=8)

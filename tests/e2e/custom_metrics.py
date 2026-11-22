@@ -17,12 +17,12 @@ _BOUND_MODULE_CACHE: dict[type, type] = {}
 
 
 class _DeferredBaseMetricMixin:
-    """Dynamically binds subclasses to ``srtrainer.metrics.BaseMetric`` on instantiation."""
+    """Dynamically binds subclasses to ``metrics.BaseMetric`` on instantiation."""
 
     def __new__(cls, *args: Any, **kwargs: Any) -> Any:
         bound = _BOUND_CACHE.get(cls)
         if bound is None:
-            from srtrainer.metrics import BaseMetric
+            from metrics import BaseMetric
 
             class _Bound(cls, BaseMetric):  # type: ignore[misc, valid-type]
                 def __new__(subcls: type, *a: Any, **kw: Any) -> Any:
@@ -175,7 +175,7 @@ class _DeferredModuleMixin:
 
 
 class RecordingL1Loss(_DeferredModuleMixin):
-    """Genuine ``nn.Module`` wrapping ``srtrainer.losses.L1Loss`` and logging each forward call."""
+    """Genuine ``nn.Module`` wrapping ``losses.L1Loss`` and logging each forward call."""
 
     def __init__(
         self,
@@ -184,7 +184,7 @@ class RecordingL1Loss(_DeferredModuleMixin):
         trace_tag: str = "train_micro",
     ) -> None:
         super().__init__()
-        from srtrainer.losses import L1Loss
+        from losses import L1Loss
 
         self.criterion = L1Loss(reduction=reduction)
         self.trace_file = Path(trace_file)

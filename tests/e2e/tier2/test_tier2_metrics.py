@@ -20,7 +20,7 @@ def test_t2_d01_base_metric_abstract_enforcement() -> None:
     """F30: BaseMetric ABC enforces abstract compute() and provides default higher_is_better/to()."""
     import torch
 
-    from srtrainer.metrics import BaseMetric
+    from metrics import BaseMetric
 
     assert issubclass(BaseMetric, abc.ABC)
     assert "compute" in BaseMetric.__abstractmethods__
@@ -60,7 +60,7 @@ def test_t2_d02_val_collate_fn_rejects_non_unit_batch_sizes(
     import torch
     from torch.utils.data import DataLoader
 
-    from srtrainer.data import ValImageDataset, val_collate_fn
+    from data import ValImageDataset, val_collate_fn
 
     with pytest.raises(ValueError, match="."):
         val_collate_fn([])
@@ -91,7 +91,7 @@ def test_t2_d03_val_dataset_rejects_invalid_and_missing_manifests(
     synthetic_image_factory: Callable[..., Path],
 ) -> None:
     """F24: ValImageDataset fails fast on invalid JSON entries and missing manifest/image files."""
-    from srtrainer.data import ValImageDataset
+    from data import ValImageDataset
 
     data_dir = e2e_workdir["data"] / "val_invalid"
     synthetic_image_factory(data_dir / "lr/ok.png", width=16, height=16, seed=1)
@@ -141,7 +141,7 @@ def test_t2_d04_full_reference_metrics_reject_none_target() -> None:
     """F31, F32, F33: Full-reference PSNR, SSIM, and LPIPS metrics reject target=None."""
     import torch
 
-    from srtrainer.metrics import LPIPSMetric, PSNRMetric, SSIMMetric
+    from metrics import LPIPSMetric, PSNRMetric, SSIMMetric
 
     pred = torch.rand(1, 3, 64, 64, dtype=torch.float32)
     metrics = [
@@ -162,7 +162,7 @@ def test_t2_d05_full_reference_metrics_reject_shape_and_channel_mismatch() -> No
     """F31, F32, F33: Full-reference metrics reject spatial and channel shape mismatches."""
     import torch
 
-    from srtrainer.metrics import LPIPSMetric, PSNRMetric, SSIMMetric
+    from metrics import LPIPSMetric, PSNRMetric, SSIMMetric
 
     metrics = [
         PSNRMetric(crop_border=0, test_y_channel=False),
@@ -187,7 +187,7 @@ def test_t2_d06_psnr_metric_boundaries_and_crop_border() -> None:
     """F31: PSNRMetric matches analytical boundaries, rejects invalid crop_border, handles tight crop."""
     import torch
 
-    from srtrainer.metrics import PSNRMetric
+    from metrics import PSNRMetric
 
     zeros = torch.zeros(1, 3, 16, 16, dtype=torch.float32)
     ones = torch.ones(1, 3, 16, 16, dtype=torch.float32)
@@ -230,7 +230,7 @@ def test_t2_d07_ssim_metric_11x11_window_and_crop_border_boundaries() -> None:
     """F32: SSIMMetric enforces 11x11 post-crop spatial floor and rejects negative crop_border."""
     import torch
 
-    from srtrainer.metrics import SSIMMetric
+    from metrics import SSIMMetric
 
     img16 = torch.rand(1, 3, 16, 16, dtype=torch.float32)
     for test_y in (False, True):
@@ -271,7 +271,7 @@ def test_t2_d08_lpips_metric_no_grad_fp32_under_bf16_autocast_and_invalid_net() 
     """F33: LPIPSMetric enforces FP32+no_grad under CPU bf16 autocast and rejects invalid net."""
     import torch
 
-    from srtrainer.metrics import LPIPSMetric
+    from metrics import LPIPSMetric
 
     metric = LPIPSMetric(net="alex", pretrained=False).to("cpu")
     torch.manual_seed(17)
@@ -305,7 +305,7 @@ def test_t2_d09_custom_metric_missing_meta_key_and_edge_meta_types(
     import torch
     from torch.utils.data import DataLoader
 
-    from srtrainer.data import ValImageDataset, val_collate_fn
+    from data import ValImageDataset, val_collate_fn
 
     strict_m = hydra.utils.instantiate(
         {"_target_": "tests.e2e.custom_metrics.MockOCRAMetric", "label_key": "label", "strict": True}

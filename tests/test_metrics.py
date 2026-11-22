@@ -18,9 +18,9 @@ import torch
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
-import srtrainer.metrics
-from srtrainer.metrics import BaseMetric, LPIPSMetric, PSNRMetric, SSIMMetric
-from srtrainer.metrics.psnr_ssim import rgb_to_y_bt601
+import metrics
+from metrics import BaseMetric, LPIPSMetric, PSNRMetric, SSIMMetric
+from metrics.psnr_ssim import rgb_to_y_bt601
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIGS_DIR = str((REPO_ROOT / "configs").resolve())
@@ -153,11 +153,11 @@ class _MockOCRAMetric(BaseMetric):
 
 
 def test_metrics_package_exports() -> None:
-    assert srtrainer.metrics.__all__ == ["BaseMetric", "PSNRMetric", "SSIMMetric", "LPIPSMetric"]
-    assert srtrainer.metrics.BaseMetric is BaseMetric
-    assert srtrainer.metrics.PSNRMetric is PSNRMetric
-    assert srtrainer.metrics.SSIMMetric is SSIMMetric
-    assert srtrainer.metrics.LPIPSMetric is LPIPSMetric
+    assert metrics.__all__ == ["BaseMetric", "PSNRMetric", "SSIMMetric", "LPIPSMetric"]
+    assert metrics.BaseMetric is BaseMetric
+    assert metrics.PSNRMetric is PSNRMetric
+    assert metrics.SSIMMetric is SSIMMetric
+    assert metrics.LPIPSMetric is LPIPSMetric
     assert issubclass(PSNRMetric, BaseMetric)
     assert issubclass(SSIMMetric, BaseMetric)
     assert issubclass(LPIPSMetric, BaseMetric)

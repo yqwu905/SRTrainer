@@ -25,8 +25,8 @@ def test_t3_hydra_exp01_toy_inheritance_into_srmodel_lpips_and_cosine_t_max(
     import torch
     from accelerate import Accelerator
 
-    from srtrainer.archs import ToyModel
-    from srtrainer.models import SRModel
+    from archs import ToyModel
+    from models import SRModel
 
     cfg = hydra_compose(
         "train",
@@ -43,7 +43,7 @@ def test_t3_hydra_exp01_toy_inheritance_into_srmodel_lpips_and_cosine_t_max(
     )
 
     assert cfg.exp_name == "exp01_toy_l1_lpips_x4"
-    assert cfg.arch._target_ == "srtrainer.archs.ToyModel"
+    assert cfg.arch._target_ == "archs.ToyModel"
     assert cfg.arch.scale == 2
     assert cfg.arch.num_feat == 8
     assert cfg.arch.num_block == 1
@@ -115,8 +115,8 @@ def test_t3_mixed_dataset_weighted_sampler_usm_pool_degrader_and_srmodel(
     from torch.utils.data import DataLoader
     from torch.utils.data._utils.collate import default_collate
 
-    from srtrainer.data.degradation import RealESRGANDegrader
-    from srtrainer.models import SRModel
+    from data.degradation import RealESRGANDegrader
+    from models import SRModel
 
     # gt_size=64 ensures USMSharp default radius=50 satisfies reflect pad (50 < 64).
     gt_src = gt_only_train_source_factory(name="c_gt", n_samples=4, gt_h=64, gt_w=64, ratio=0.4)
@@ -218,8 +218,8 @@ def test_t3_pure_paired_degradation_null_toymodel_scale4_and_multistep_lr(
     from accelerate import Accelerator
     from torch.utils.data import DataLoader
 
-    from srtrainer.archs import ToyModel
-    from srtrainer.models import SRModel
+    from archs import ToyModel
+    from models import SRModel
 
     pair_src = paired_train_source_factory(
         name="pure_x4", n_samples=4, lq_h=16, lq_w=16, scale=4, ratio=1.0
@@ -318,8 +318,8 @@ def test_t3_pretrain_basicsr_pth_with_ema_warmup_grad_clip_and_accum(
     import torch
     from accelerate import Accelerator
 
-    from srtrainer.archs import ToyModel
-    from srtrainer.models import SRModel
+    from archs import ToyModel
+    from models import SRModel
 
     torch.manual_seed(34)
     ref_net = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
@@ -440,8 +440,8 @@ def test_t3_sampler_o1_resume_coupled_with_checkpointer_and_train_state(
     from accelerate.utils import ProjectConfiguration
     from torch.utils.data._utils.collate import default_collate
 
-    from srtrainer.engine import Checkpointer, TrainState
-    from srtrainer.models import SRModel
+    from engine import Checkpointer, TrainState
+    from models import SRModel
 
     s0 = paired_train_source_factory(name="res_s0", n_samples=4, lq_h=16, lq_w=16, scale=2, ratio=0.6)
     s1 = paired_train_source_factory(name="res_s1", n_samples=4, lq_h=16, lq_w=16, scale=2, ratio=0.4)
@@ -565,10 +565,10 @@ def test_t3_toymodel_scales_export_weights_safetensors_reload_parity(
     from accelerate import Accelerator
     from safetensors import safe_open
 
-    from srtrainer.archs import ToyModel
-    from srtrainer.engine import Checkpointer
-    from srtrainer.models import SRModel
-    from srtrainer.utils.misc import load_weights
+    from archs import ToyModel
+    from engine import Checkpointer
+    from models import SRModel
+    from utils.misc import load_weights
 
     for scale in (2, 4):
         accelerate_state_resetter()

@@ -14,9 +14,9 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from torch import nn
 
-from srtrainer.models.base_model import BaseModel
-from srtrainer.models.ema import ModelEMA, unwrap_model_for_ema
-from srtrainer.utils.misc import load_weights, strip_state_dict_prefix
+from models.base_model import BaseModel
+from models.ema import ModelEMA, unwrap_model_for_ema
+from utils.misc import load_weights, strip_state_dict_prefix
 
 if TYPE_CHECKING:
     from accelerate import Accelerator

@@ -25,19 +25,19 @@ def test_t2_e01_srmodel_empty_or_nonpositive_loss_fails_fast(
     """F43: SRModel fails fast with ValueError when cfg.loss is empty or has no positive weights."""
     from accelerate import Accelerator
 
-    from srtrainer.models import SRModel
+    from models import SRModel
 
     src = paired_train_source_factory(name="loss_fail_src", n_samples=2, lq_h=16, lq_w=16, scale=2)
     invalid_loss_cfgs: list[dict[str, Any]] = [
         {},
-        {"l1": {"weight": 0.0, "criterion": {"_target_": "srtrainer.losses.L1Loss", "reduction": "mean"}}},
-        {"l1": {"weight": -0.5, "criterion": {"_target_": "srtrainer.losses.L1Loss", "reduction": "mean"}}},
+        {"l1": {"weight": 0.0, "criterion": {"_target_": "losses.L1Loss", "reduction": "mean"}}},
+        {"l1": {"weight": -0.5, "criterion": {"_target_": "losses.L1Loss", "reduction": "mean"}}},
         {
-            "l1": {"weight": 0.0, "criterion": {"_target_": "srtrainer.losses.L1Loss"}},
+            "l1": {"weight": 0.0, "criterion": {"_target_": "losses.L1Loss"}},
             "lpips": {
                 "weight": -0.5,
                 "criterion": {
-                    "_target_": "srtrainer.losses.LPIPSLoss",
+                    "_target_": "losses.LPIPSLoss",
                     "net": "alex",
                     "pretrained": False,
                 },
@@ -71,9 +71,9 @@ def test_t2_e02_srmodel_pretrain_path_edge_cases(
     import torch
     from accelerate import Accelerator
 
-    from srtrainer.archs import ToyModel
-    from srtrainer.models import SRModel
-    from srtrainer.utils.misc import save_safetensors
+    from archs import ToyModel
+    from models import SRModel
+    from utils.misc import save_safetensors
 
     torch.manual_seed(42)
     ref_net = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
@@ -162,7 +162,7 @@ def test_t2_e03_srmodel_optimizer_step_was_skipped_gating(
     import torch
     from accelerate import Accelerator
 
-    from srtrainer.models import SRModel
+    from models import SRModel
 
     class _OverflowSimAccelerator(Accelerator):
         """Genuine Accelerator subclass simulating FP16 GradScaler overflow on CPU."""
@@ -263,8 +263,8 @@ def test_t2_e04_checkpointer_numerical_pruning_and_keep_all(
     from accelerate import Accelerator
     from accelerate.utils import ProjectConfiguration
 
-    from srtrainer.archs import ToyModel
-    from srtrainer.engine import Checkpointer
+    from archs import ToyModel
+    from engine import Checkpointer
 
     def _make_acc(work_dir: Path) -> Any:
         accelerate_state_resetter()
@@ -320,7 +320,7 @@ def test_t2_e05_checkpointer_and_trainer_resume_auto_empty_vs_missing_path(
     accelerate_state_resetter: Callable[[], None],
 ) -> None:
     """F45, F46: resume='auto' on empty dir starts cleanly at step 0; explicit missing path fails."""
-    from srtrainer.engine import Checkpointer, Trainer
+    from engine import Checkpointer, Trainer
 
     work_empty = e2e_workdir["work"] / "empty_ckpt"
     ckpt = Checkpointer(work_empty, max_keep_states=2)
@@ -374,7 +374,7 @@ def test_t2_e06_trainer_resume_already_completed_run_is_noop(
     import torch
     from safetensors.torch import load_file
 
-    from srtrainer.engine import Trainer
+    from engine import Trainer
 
     src = paired_train_source_factory(name="done_src", n_samples=2, lq_h=16, lq_w=16, scale=2)
     work_dir = e2e_workdir["work"] / "completed_run"
@@ -435,7 +435,7 @@ def test_t2_e07_trainer_lower_is_better_and_nan_metric_best_guard(
     import torch
     from safetensors.torch import load_file
 
-    from srtrainer.engine import Trainer
+    from engine import Trainer
 
     val_root = e2e_workdir["data"] / "val_1img"
     synthetic_image_factory(val_root / "lr/0000.png", width=16, height=16, seed=77)
@@ -598,7 +598,7 @@ def test_t2_e08_trainer_val_suites_config_boundaries_and_val_interval_zero(
     accelerate_state_resetter: Callable[[], None],
 ) -> None:
     """F09, F46: Trainer rejects bad primary metric refs, allows empty val_suites, honors val_interval=0."""
-    from srtrainer.engine import Trainer
+    from engine import Trainer
 
     src = paired_train_source_factory(name="val_cfg_src", n_samples=2, lq_h=16, lq_w=16, scale=2)
     val_info = val_suite_gt_label_factory(name="set5", scale=2, sizes=[(16, 16)])
@@ -607,7 +607,7 @@ def test_t2_e08_trainer_val_suites_config_boundaries_and_val_interval_zero(
             "dataset": {"root_dir": val_info["root_dir"], "json_path": val_info["json_path"]},
             "metrics": {
                 "psnr": {
-                    "_target_": "srtrainer.metrics.PSNRMetric",
+                    "_target_": "metrics.PSNRMetric",
                     "crop_border": 2,
                     "test_y_channel": True,
                 }
@@ -710,7 +710,7 @@ def test_t2_e09_trainer_mid_validation_preserves_grad_accum_cadence(
     minimal_train_cfg_factory: Callable[..., Any],
 ) -> None:
     """F43, F46: Mid-training validation resets gradient_state so grad_accum=2 stays [2, 2, 2]."""
-    from srtrainer.engine import Trainer
+    from engine import Trainer
 
     src = paired_train_source_factory(name="accum_val_src", n_samples=4, lq_h=16, lq_w=16, scale=2)
     val3 = val_suite_gt_less_meta_factory(name="accum_val3")

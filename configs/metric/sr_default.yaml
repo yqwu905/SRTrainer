@@ -10,15 +10,15 @@ val_suites:
       json_path: /data/manifests/set5_x4.json
     metrics:
       psnr:
-        _target_: srtrainer.metrics.PSNRMetric
+        _target_: metrics.PSNRMetric
         crop_border: ${scale}
         test_y_channel: true
       ssim:
-        _target_: srtrainer.metrics.SSIMMetric
+        _target_: metrics.SSIMMetric
         crop_border: ${scale}
         test_y_channel: true
       lpips:
-        _target_: srtrainer.metrics.LPIPSMetric
+        _target_: metrics.LPIPSMetric
         net: alex
         pretrained: true
 
@@ -28,10 +28,10 @@ val_suites:
       json_path: /data/manifests/urban100_x4.json
     metrics:
       psnr:
-        _target_: srtrainer.metrics.PSNRMetric
+        _target_: metrics.PSNRMetric
         crop_border: ${scale}
         test_y_channel: true
       ssim:
-        _target_: srtrainer.metrics.SSIMMetric
+        _target_: metrics.SSIMMetric
         crop_border: ${scale}
         test_y_channel: true

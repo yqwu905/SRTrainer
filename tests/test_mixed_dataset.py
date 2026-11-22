@@ -17,8 +17,8 @@ from omegaconf import OmegaConf
 from PIL import Image
 from torch.utils.data import DataLoader
 
-import srtrainer.data as data_pkg
-from srtrainer.data import (
+import data as data_pkg
+from data import (
     DistributedWeightedInfiniteSampler,
     MixedSRDataset,
     SourceStats,
@@ -30,8 +30,8 @@ from srtrainer.data import (
     val_collate_fn,
     validate_sources_config,
 )
-from srtrainer.data.manifest import is_valid_rel_path
-from srtrainer.data.transforms import augment_tensors, paired_random_crop, random_crop
+from data.manifest import is_valid_rel_path
+from data.transforms import augment_tensors, paired_random_crop, random_crop
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIGS_DIR = str((REPO_ROOT / "configs").resolve())

@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 
-from srtrainer.utils.misc import pad_to_min_size
+from utils.misc import pad_to_min_size
 
 __all__ = [
     "paired_random_crop",

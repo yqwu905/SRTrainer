@@ -18,27 +18,27 @@ from accelerate.utils import ProjectConfiguration, set_seed
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
-from srtrainer.data import (
+from data import (
     DistributedWeightedInfiniteSampler,
     MixedSRDataset,
     ValImageDataset,
     val_collate_fn,
 )
-from srtrainer.engine.checkpointer import Checkpointer
-from srtrainer.engine.inferencer import TiledInferencer
-from srtrainer.engine.state import TrainState
-from srtrainer.metrics.base import BaseMetric
-from srtrainer.models.base_model import BaseModel
-from srtrainer.models.ema import unwrap_model_for_ema
-from srtrainer.utils.config import (
+from engine.checkpointer import Checkpointer
+from engine.inferencer import TiledInferencer
+from engine.state import TrainState
+from metrics.base import BaseMetric
+from models.base_model import BaseModel
+from models.ema import unwrap_model_for_ema
+from utils.config import (
     flatten_config_for_tracker,
     normalize_mixed_precision,
     resolve_work_dir,
     save_resolved_config,
     setup_experiment_dirs,
 )
-from srtrainer.utils.image import load_image, make_comparison_image, save_image
-from srtrainer.utils.logging import format_train_log, log_images_to_trackers, setup_logger
+from utils.image import load_image, make_comparison_image, save_image
+from utils.logging import format_train_log, log_images_to_trackers, setup_logger
 
 __all__ = ["Trainer"]
 

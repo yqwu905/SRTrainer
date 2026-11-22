@@ -45,11 +45,11 @@ def test_t3_trainer_validation_and_tools_infer_tiled_output_parity(
     import torch
     from safetensors.torch import load_file
 
-    from srtrainer.engine import Trainer
-    from srtrainer.engine.inferencer import TiledInferencer
-    from srtrainer.utils.config import load_resolved_config
-    from srtrainer.utils.image import load_image
-    from srtrainer.utils.misc import load_weights
+    from engine import Trainer
+    from engine.inferencer import TiledInferencer
+    from utils.config import load_resolved_config
+    from utils.image import load_image
+    from utils.misc import load_weights
 
     src = paired_train_source_factory(name="t3_parity_src", n_samples=4, lq_h=16, lq_w=16, scale=2)
     val_info = val_suite_gt_label_factory(name="set5", scale=2, sizes=[(16, 16), (16, 20)])
@@ -58,7 +58,7 @@ def test_t3_trainer_validation_and_tools_infer_tiled_output_parity(
             "dataset": {"root_dir": val_info["root_dir"], "json_path": val_info["json_path"]},
             "metrics": {
                 "psnr": {
-                    "_target_": "srtrainer.metrics.PSNRMetric",
+                    "_target_": "metrics.PSNRMetric",
                     "crop_border": 2,
                     "test_y_channel": True,
                 }
@@ -154,7 +154,7 @@ def test_t3_multi_suite_gt_and_gtless_custom_meta_metrics_and_visuals(
     """Seam D x E (F09, F17, F24, F30-F34, F46): Multi-suite GT + GT-less meta metrics & visuals."""
     from PIL import Image
 
-    from srtrainer.engine import Trainer
+    from engine import Trainer
 
     train_src = paired_train_source_factory(
         name="ms_train", n_samples=4, lq_h=16, lq_w=16, scale=2
@@ -168,17 +168,17 @@ def test_t3_multi_suite_gt_and_gtless_custom_meta_metrics_and_visuals(
             "dataset": {"root_dir": gt_info["root_dir"], "json_path": gt_info["json_path"]},
             "metrics": {
                 "psnr": {
-                    "_target_": "srtrainer.metrics.PSNRMetric",
+                    "_target_": "metrics.PSNRMetric",
                     "crop_border": 2,
                     "test_y_channel": True,
                 },
                 "ssim": {
-                    "_target_": "srtrainer.metrics.SSIMMetric",
+                    "_target_": "metrics.SSIMMetric",
                     "crop_border": 2,
                     "test_y_channel": True,
                 },
                 "lpips": {
-                    "_target_": "srtrainer.metrics.LPIPSMetric",
+                    "_target_": "metrics.LPIPSMetric",
                     "net": "alex",
                     "pretrained": False,
                 },
@@ -262,11 +262,11 @@ def test_t3_2proc_distributed_validation_odd_suite_exact_gather_parity(
     from omegaconf import OmegaConf
     from safetensors.torch import load_file
 
-    from srtrainer.archs import ToyModel
-    from srtrainer.engine.inferencer import TiledInferencer
-    from srtrainer.metrics import PSNRMetric
-    from srtrainer.utils.image import load_image
-    from srtrainer.utils.misc import load_weights, save_safetensors
+    from archs import ToyModel
+    from engine.inferencer import TiledInferencer
+    from metrics import PSNRMetric
+    from utils.image import load_image
+    from utils.misc import load_weights, save_safetensors
 
     torch.manual_seed(909)
     frozen_net = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
@@ -347,7 +347,7 @@ def test_t3_2proc_distributed_validation_odd_suite_exact_gather_parity(
             "dataset": {"root_dir": str(val_root), "json_path": str(val_json)},
             "metrics": {
                 "psnr": {
-                    "_target_": "srtrainer.metrics.PSNRMetric",
+                    "_target_": "metrics.PSNRMetric",
                     "crop_border": 2,
                     "test_y_channel": True,
                 }
@@ -407,7 +407,7 @@ def test_t3_2proc_distributed_validation_odd_suite_exact_gather_parity(
             import torch.distributed as dist
             from omegaconf import OmegaConf
 
-            from srtrainer.engine import Trainer
+            from engine import Trainer
 
 
             def _extract_psnr_from_state(trainer) -> float | None:
@@ -580,8 +580,8 @@ def test_t3_toymodel_exp_dir_auto_restore_on_non_square_odd_tiled_image(
     """Seam B x F (F13, F36-F38, F40): ToyModel exp_dir auto-restore on prime-odd 29x41 tiled image."""
     import torch
 
-    from srtrainer.engine import Trainer
-    from srtrainer.utils.image import load_image
+    from engine import Trainer
+    from utils.image import load_image
 
     src = paired_train_source_factory(name="odd_tile_src", n_samples=2, lq_h=16, lq_w=16, scale=2)
     exp_dir = e2e_workdir["work"] / "toy_odd_exp"
@@ -651,7 +651,7 @@ def test_t3_tensorboard_tracker_with_resume_auto_rolling_pruning_and_best(
             "dataset": {"root_dir": val_info["root_dir"], "json_path": val_info["json_path"]},
             "metrics": {
                 "psnr": {
-                    "_target_": "srtrainer.metrics.PSNRMetric",
+                    "_target_": "metrics.PSNRMetric",
                     "crop_border": 2,
                     "test_y_channel": True,
                 }

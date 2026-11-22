@@ -15,7 +15,7 @@ from omegaconf.errors import OmegaConfBaseException
 from torch import nn
 from torch.nn import functional as F
 
-from srtrainer.data.degradation.diffjpeg import DiffJPEG
+from data.degradation.diffjpeg import DiffJPEG
 
 __all__ = [
     "filter2d",

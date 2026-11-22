@@ -1,7 +1,7 @@
 """Tier 2 E2E tests — Area F: Shared Tiled Inference & Distributed CLI Boundaries.
 
 Covers boundary, edge, and negative contracts for F35-F40.
-Imports ``from srtrainer.engine.inferencer import TiledInferencer`` inside test
+Imports ``from engine.inferencer import TiledInferencer`` inside test
 functions so Area F executes cleanly on M4 before M5 populates ``engine/__init__.py``.
 All non-stdlib imports (besides ``pytest``) are strictly deferred inside test functions.
 """
@@ -21,8 +21,8 @@ def test_t2_f01_tiled_inferencer_rejects_invalid_tile_overlap() -> None:
     """F36: TiledInferencer rejects overlap >= tile_size // 2 or < 0, accepts tight valid overlap."""
     import torch
 
-    from srtrainer.archs import ToyModel
-    from srtrainer.engine.inferencer import TiledInferencer
+    from archs import ToyModel
+    from engine.inferencer import TiledInferencer
 
     model = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
     lq = torch.rand(1, 3, 40, 40, dtype=torch.float32)
@@ -71,8 +71,8 @@ def test_t2_f02_tiled_inferencer_rejects_invalid_tile_size_blend_batch_and_auto_
     """F36: TiledInferencer rejects bad tile_size, non-positive auto tile_size, blend, batch_size."""
     import torch
 
-    from srtrainer.archs import ToyModel
-    from srtrainer.engine.inferencer import TiledInferencer
+    from archs import ToyModel
+    from engine.inferencer import TiledInferencer
 
     model_x2 = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
     model_x4 = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=4).eval()
@@ -106,8 +106,8 @@ def test_t2_f03_tiled_inferencer_auto_without_gt_size_falls_back_to_untiled() ->
     import torch
     import torch.nn as nn
 
-    from srtrainer.archs import ToyModel
-    from srtrainer.engine.inferencer import TiledInferencer
+    from archs import ToyModel
+    from engine.inferencer import TiledInferencer
 
     class _CallShapeRecorder(nn.Module):
         def __init__(self, inner: nn.Module) -> None:
@@ -158,8 +158,8 @@ def test_t2_f04_tiled_inferencer_tiny_replicate_fallback_and_strip_shapes() -> N
     """F36: TiledInferencer handles ultra-tiny (replicate fallback) and skinny strip tensors."""
     import torch
 
-    from srtrainer.archs import ToyModel
-    from srtrainer.engine.inferencer import TiledInferencer
+    from archs import ToyModel
+    from engine.inferencer import TiledInferencer
 
     torch.manual_seed(34)
     model = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
@@ -204,8 +204,8 @@ def test_t2_f05_tiled_inferencer_zero_overlap_hard_stitch_non_divisible() -> Non
     import torch
     import torch.nn as nn
 
-    from srtrainer.archs import ToyModel
-    from srtrainer.engine.inferencer import TiledInferencer
+    from archs import ToyModel
+    from engine.inferencer import TiledInferencer
 
     torch.manual_seed(35)
     lq = torch.rand(1, 3, 37, 43, dtype=torch.float32)
@@ -256,8 +256,8 @@ def test_t2_f06_tiled_inferencer_cpu_fp16_autocast_guard() -> None:
     """F36: TiledInferencer safely guards unsupported CPU fp16 autocast to FP32 output."""
     import torch
 
-    from srtrainer.archs import ToyModel
-    from srtrainer.engine.inferencer import TiledInferencer
+    from archs import ToyModel
+    from engine.inferencer import TiledInferencer
 
     torch.manual_seed(36)
     model = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
@@ -316,8 +316,8 @@ def test_t2_f07_tools_infer_cli_fail_fast_invalid_configs(
     hydra_value_formatter: Callable[[Any], str],
 ) -> None:
     """F37, F38: tools/infer.py exits non-zero on missing inputs, arch, weights, config, or format."""
-    from srtrainer.archs import ToyModel
-    from srtrainer.utils.misc import save_safetensors
+    from archs import ToyModel
+    from utils.misc import save_safetensors
 
     fmt = hydra_value_formatter
     sample_img = synthetic_image_factory(
@@ -357,7 +357,7 @@ def test_t2_f07_tools_infer_cli_fail_fast_invalid_configs(
     # (b2) Standalone missing weights_path
     arch_ovs = standalone_infer_arch_overrides_factory(
         {
-            "_target_": "srtrainer.archs.ToyModel",
+            "_target_": "archs.ToyModel",
             "num_in_ch": 3,
             "num_out_ch": 3,
             "num_feat": 8,
@@ -433,7 +433,7 @@ def test_t2_f08_tools_infer_bad_json_entry_and_non_recursive_dir_scan(
     hydra_value_formatter: Callable[[Any], str],
 ) -> None:
     """F38: tools/infer.py rejects JSON entries without lq/gt and honors recursive=false."""
-    from srtrainer.utils.image import load_image
+    from utils.image import load_image
 
     fmt = hydra_value_formatter
     exp_info = bias_tagged_exp_dir_factory(
@@ -496,7 +496,7 @@ def test_t2_f09_tools_infer_2proc_cpu_single_image_idle_rank(
     hydra_value_formatter: Callable[[Any], str],
 ) -> None:
     """F39, F40: 2-proc CPU distributed tools/infer.py handles 1 image (idle Rank 1) with zero deadlock."""
-    from srtrainer.utils.image import load_image
+    from utils.image import load_image
 
     fmt = hydra_value_formatter
     exp_info = bias_tagged_exp_dir_factory(

@@ -388,10 +388,10 @@ def get_toy_model_arch_dict(
     num_block: int = 1,
 ) -> dict[str, Any]:
     """Build a compact Hydra ``_target_`` dict for ``ToyModel`` matching its public signature."""
-    from srtrainer.archs import ToyModel
+    from archs import ToyModel
 
     params = inspect.signature(ToyModel.__init__).parameters
-    arch: dict[str, Any] = {"_target_": "srtrainer.archs.ToyModel"}
+    arch: dict[str, Any] = {"_target_": "archs.ToyModel"}
     for key, val in (
         ("num_in_ch", 3),
         ("num_out_ch", 3),
@@ -414,7 +414,7 @@ def build_mixed_dataset(
     kernel_cfg: Mapping[str, Any] | None = None,
 ) -> Any:
     """Opaque-box adapter instantiating ``MixedSRDataset`` across public signature variants."""
-    from srtrainer.data import MixedSRDataset
+    from data import MixedSRDataset
 
     params = inspect.signature(MixedSRDataset.__init__).parameters
     kwargs: dict[str, Any] = {"sources": [dict(s) for s in sources]}
@@ -475,7 +475,7 @@ def build_weighted_sampler(
     start_micro_step: int = 0,
 ) -> Any:
     """Opaque-box adapter instantiating ``DistributedWeightedInfiniteSampler``."""
-    from srtrainer.data import DistributedWeightedInfiniteSampler
+    from data import DistributedWeightedInfiniteSampler
 
     params = inspect.signature(DistributedWeightedInfiniteSampler.__init__).parameters
     kwargs: dict[str, Any] = {}
@@ -524,8 +524,8 @@ def call_validate_sources_config(
     *,
     has_degradation: bool = True,
 ) -> Any:
-    """Invoke srtrainer.data.validate_sources_config adapting to its public signature."""
-    from srtrainer.data import validate_sources_config
+    """Invoke data.validate_sources_config adapting to its public signature."""
+    from data import validate_sources_config
 
     params = inspect.signature(validate_sources_config).parameters
     if "has_degradation" in params:
@@ -612,8 +612,8 @@ def make_bias_tagged_exp_dir(
     import hydra.utils
     from omegaconf import OmegaConf
 
-    from srtrainer.utils.config import save_resolved_config
-    from srtrainer.utils.misc import save_safetensors
+    from utils.config import save_resolved_config
+    from utils.misc import save_safetensors
 
     exp_path = Path(exp_dir)
     weights_dir = exp_path / "weights"

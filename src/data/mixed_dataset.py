@@ -13,10 +13,10 @@ from omegaconf import OmegaConf
 from omegaconf.errors import OmegaConfBaseException
 from torch.utils.data import Dataset
 
-from srtrainer.data.degradation.kernels import KernelGenerator
-from srtrainer.data.manifest import SourceStats, TrainSample, validate_sources_config
-from srtrainer.data.transforms import augment_tensors, paired_random_crop, random_crop
-from srtrainer.utils.image import load_image
+from data.degradation.kernels import KernelGenerator
+from data.manifest import SourceStats, TrainSample, validate_sources_config
+from data.transforms import augment_tensors, paired_random_crop, random_crop
+from utils.image import load_image
 
 __all__ = ["MixedSRDataset"]
 

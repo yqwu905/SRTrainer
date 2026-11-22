@@ -12,7 +12,7 @@ import torch
 from accelerate.state import AcceleratorState, GradientState, PartialState
 from omegaconf import DictConfig, OmegaConf
 
-from srtrainer.engine import Trainer
+from engine import Trainer
 
 __all__ = ["main", "run_train"]
 

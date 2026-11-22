@@ -16,7 +16,7 @@ def test_t1_toymodel_scales_arbitrary_dims_and_backward() -> None:
     """F13: ToyModel supports scales {1,2,3,4}, even/prime odd dims, finite grads & eval determinism."""
     import torch
 
-    from srtrainer.archs import ToyModel
+    from archs import ToyModel
 
     # Default constructor contract check (num_in_ch=3, num_out_ch=3, num_feat=32, num_block=2, scale=4).
     default_net = ToyModel()
@@ -59,31 +59,31 @@ def test_t1_toymodel_scales_arbitrary_dims_and_backward() -> None:
 
 
 def test_t1_archs_and_losses_export_exclusivity() -> None:
-    """F02, F13-F15, Req #5: srtrainer.archs exports ONLY ToyModel; srtrainer.losses ONLY L1/LPIPS."""
+    """F02, F13-F15, Req #5: archs exports ONLY ToyModel; losses ONLY L1/LPIPS."""
     import hydra.utils
 
-    import srtrainer.archs as archs_pkg
-    import srtrainer.losses as losses_pkg
+    import archs as archs_pkg
+    import losses as losses_pkg
 
     assert hasattr(archs_pkg, "__all__")
     assert set(archs_pkg.__all__) == {"ToyModel"}, (
-        f"Expected ONLY ToyModel in srtrainer.archs.__all__, got {archs_pkg.__all__!r}"
+        f"Expected ONLY ToyModel in archs.__all__, got {archs_pkg.__all__!r}"
     )
-    assert hydra.utils.get_class("srtrainer.archs.ToyModel") is archs_pkg.ToyModel
+    assert hydra.utils.get_class("archs.ToyModel") is archs_pkg.ToyModel
     for forbidden_arch in ("RRDBNet", "SwinIR", "TinySRNet"):
         assert not hasattr(archs_pkg, forbidden_arch), (
-            f"Forbidden architecture {forbidden_arch!r} exposed in srtrainer.archs"
+            f"Forbidden architecture {forbidden_arch!r} exposed in archs"
         )
 
     assert hasattr(losses_pkg, "__all__")
     assert set(losses_pkg.__all__) == {"L1Loss", "LPIPSLoss"}, (
-        f"Expected ONLY L1Loss & LPIPSLoss in srtrainer.losses.__all__, got {losses_pkg.__all__!r}"
+        f"Expected ONLY L1Loss & LPIPSLoss in losses.__all__, got {losses_pkg.__all__!r}"
     )
     for sym in ("L1Loss", "LPIPSLoss"):
-        assert hydra.utils.get_class(f"srtrainer.losses.{sym}") is getattr(losses_pkg, sym)
+        assert hydra.utils.get_class(f"losses.{sym}") is getattr(losses_pkg, sym)
     for forbidden_loss in ("CharbonnierLoss", "FFTLoss"):
         assert not hasattr(losses_pkg, forbidden_loss), (
-            f"Forbidden loss {forbidden_loss!r} exposed in srtrainer.losses"
+            f"Forbidden loss {forbidden_loss!r} exposed in losses"
         )
 
 
@@ -92,7 +92,7 @@ def test_t1_l1_loss_values_reductions_and_grads() -> None:
     import torch
     import torch.nn.functional as F
 
-    from srtrainer.losses import L1Loss
+    from losses import L1Loss
 
     torch.manual_seed(0)
     pred_base = torch.rand(2, 3, 12, 12, dtype=torch.float32)
@@ -116,7 +116,7 @@ def test_t1_lpips_loss_offline_frozen_eval_and_range_scaling() -> None:
     """F15: LPIPSLoss(pretrained=False) runs offline, stays frozen in eval, propagates input grad."""
     import torch
 
-    from srtrainer.losses import LPIPSLoss
+    from losses import LPIPSLoss
 
     loss_fn = LPIPSLoss(net="alex", pretrained=False)
     assert loss_fn.training is False
@@ -150,7 +150,7 @@ def test_t1_image_io_formats_roundtrip_and_comparison(e2e_workdir: dict[str, Pat
     """F17: IMAGE_EXTENSIONS, load_image/save_image roundtrip across formats, comparison panels."""
     import torch
 
-    from srtrainer.utils.image import (
+    from utils.image import (
         IMAGE_EXTENSIONS,
         load_image,
         make_comparison_image,
@@ -209,7 +209,7 @@ def test_t1_logging_utils_logger_eta_and_train_format(
     isolated_logger_name: str,
 ) -> None:
     """F18: Rank-0 file logger, format_eta, and canonical format_train_log summary."""
-    from srtrainer.utils.logging import format_eta, format_train_log, setup_logger
+    from utils.logging import format_eta, format_train_log, setup_logger
 
     log_file = e2e_workdir["work"] / "train.log"
     logger = setup_logger(log_file, is_main_process=True, name=isolated_logger_name)
@@ -265,8 +265,8 @@ def test_t1_misc_safetensors_and_pth_weight_roundtrip(e2e_workdir: dict[str, Pat
     import torch
     from safetensors import safe_open
 
-    from srtrainer.archs import ToyModel
-    from srtrainer.utils.misc import load_weights, save_safetensors, strip_state_dict_prefix
+    from archs import ToyModel
+    from utils.misc import load_weights, save_safetensors, strip_state_dict_prefix
 
     raw_sd = {
         "module.conv.weight": torch.ones(2, 2),
@@ -320,7 +320,7 @@ def test_t1_misc_pad_multiple_min_size_and_unpad_roundtrip() -> None:
     """F19: pad_to_multiple, pad_to_min_size, and scaled unpad_tensor exact roundtrip."""
     import torch
 
-    from srtrainer.utils.misc import pad_to_min_size, pad_to_multiple, unpad_tensor
+    from utils.misc import pad_to_min_size, pad_to_multiple, unpad_tensor
 
     x = torch.rand(1, 3, 13, 19, dtype=torch.float32)
     padded, (orig_h, orig_w) = pad_to_multiple(x, multiple=8)

@@ -26,16 +26,16 @@ from PIL import Image
 from safetensors.torch import load_file as load_safetensors_file
 from torch import nn
 
-import srtrainer.engine as engine_pkg
-import srtrainer.models as models_pkg
-from srtrainer.archs import ToyModel
-from srtrainer.engine import Checkpointer, TiledInferencer, Trainer, TrainState
-from srtrainer.metrics.base import BaseMetric
-from srtrainer.models import BaseModel, ModelEMA, SRModel
-from srtrainer.models.ema import unwrap_model_for_ema
-from srtrainer.utils.config import load_resolved_config
-from srtrainer.utils.image import load_image
-from srtrainer.utils.misc import load_weights, save_safetensors
+import engine as engine_pkg
+import models as models_pkg
+from archs import ToyModel
+from engine import Checkpointer, TiledInferencer, Trainer, TrainState
+from metrics.base import BaseMetric
+from models import BaseModel, ModelEMA, SRModel
+from models.ema import unwrap_model_for_ema
+from utils.config import load_resolved_config
+from utils.image import load_image
+from utils.misc import load_weights, save_safetensors
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = str(REPO_ROOT / "configs")
@@ -323,7 +323,7 @@ def _make_base_train_cfg(
         {
             "l1": {
                 "weight": 1.0,
-                "criterion": {"_target_": "srtrainer.losses.L1Loss", "reduction": "mean"},
+                "criterion": {"_target_": "losses.L1Loss", "reduction": "mean"},
             }
         }
     )
@@ -332,7 +332,7 @@ def _make_base_train_cfg(
             {
                 "weight": 0.1,
                 "criterion": {
-                    "_target_": "srtrainer.losses.LPIPSLoss",
+                    "_target_": "losses.LPIPSLoss",
                     "net": "alex",
                     "pretrained": False,
                 },
@@ -389,17 +389,17 @@ def _make_base_train_cfg(
                 },
                 "metrics": {
                     "psnr": {
-                        "_target_": "srtrainer.metrics.PSNRMetric",
+                        "_target_": "metrics.PSNRMetric",
                         "crop_border": 2,
                         "test_y_channel": True,
                     },
                     "ssim": {
-                        "_target_": "srtrainer.metrics.SSIMMetric",
+                        "_target_": "metrics.SSIMMetric",
                         "crop_border": 2,
                         "test_y_channel": True,
                     },
                     "lpips": {
-                        "_target_": "srtrainer.metrics.LPIPSMetric",
+                        "_target_": "metrics.LPIPSMetric",
                         "net": "alex",
                         "pretrained": False,
                     },
@@ -925,17 +925,17 @@ def test_trainer_full_smoke_mixed_l1_lpips_multisuite_grad_accum_tb(
             },
             "metrics": {
                 "psnr": {
-                    "_target_": "srtrainer.metrics.PSNRMetric",
+                    "_target_": "metrics.PSNRMetric",
                     "crop_border": 2,
                     "test_y_channel": True,
                 },
                 "ssim": {
-                    "_target_": "srtrainer.metrics.SSIMMetric",
+                    "_target_": "metrics.SSIMMetric",
                     "crop_border": 2,
                     "test_y_channel": True,
                 },
                 "lpips": {
-                    "_target_": "srtrainer.metrics.LPIPSMetric",
+                    "_target_": "metrics.LPIPSMetric",
                     "net": "alex",
                     "pretrained": False,
                 },
@@ -1441,7 +1441,7 @@ def test_train_cli_distributed_2proc_cpu_torchrun_smoke(tmp_path: Path) -> None:
                         "score_key": "score",
                     },
                     "psnr": {
-                        "_target_": "srtrainer.metrics.PSNRMetric",
+                        "_target_": "metrics.PSNRMetric",
                         "crop_border": 2,
                         "test_y_channel": True,
                     },
@@ -1597,7 +1597,7 @@ def test_train_cli_distributed_2proc_resume_auto(tmp_path: Path) -> None:
                 },
                 "metrics": {
                     "psnr": {
-                        "_target_": "srtrainer.metrics.PSNRMetric",
+                        "_target_": "metrics.PSNRMetric",
                         "crop_border": 2,
                         "test_y_channel": True,
                     }

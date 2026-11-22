@@ -18,7 +18,7 @@ def test_t2_b01_toymodel_edge_scales_tiny_dims_channels_and_invalid_args() -> No
     """F13: ToyModel supports scale=1/3/4, tiny prime dims, 1-ch, 0-block, and rejects bad args."""
     import torch
 
-    from srtrainer.archs import ToyModel
+    from archs import ToyModel
 
     for scale in (1, 3, 4):
         net = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=scale)
@@ -64,7 +64,7 @@ def test_t2_b02_l1_loss_zero_diff_large_residuals_and_invalid_reduction() -> Non
     """F14: L1Loss handles exact zero residuals, large residuals, and invalid reduction."""
     import torch
 
-    from srtrainer.losses import L1Loss
+    from losses import L1Loss
 
     torch.manual_seed(14)
     target = torch.rand(2, 3, 8, 8, dtype=torch.float32)
@@ -92,7 +92,7 @@ def test_t2_b03_lpips_loss_train_toggle_frozen_vgg_offline_and_invalid_net() -> 
     """F15: LPIPSLoss stays frozen/eval across train(True), supports offline VGG, rejects bad net."""
     import torch
 
-    from srtrainer.losses import LPIPSLoss
+    from losses import LPIPSLoss
 
     loss_fn = LPIPSLoss(net="alex", pretrained=False)
     loss_fn.train(True)
@@ -133,7 +133,7 @@ def test_t2_b04_image_utils_grayscale_rgba_clamp_4d_nested_and_missing(
     """F17: load_image/save_image/make_comparison_image handle L, RGBA, 4D clamp, nested dirs."""
     import torch
 
-    from srtrainer.utils.image import load_image, make_comparison_image, save_image
+    from utils.image import load_image, make_comparison_image, save_image
 
     p_gray = synthetic_image_factory(
         e2e_workdir["data"] / "gray.png",
@@ -196,7 +196,7 @@ def test_t2_b05_logging_utils_non_main_dedup_eta_edges_and_noop_tracker(
     import torch
     from accelerate import Accelerator
 
-    from srtrainer.utils.logging import format_eta, log_images_to_trackers, setup_logger
+    from utils.logging import format_eta, log_images_to_trackers, setup_logger
 
     nm_name = f"{isolated_logger_name}.nm"
     nm_log = e2e_workdir["work"] / "nm_dir" / "train.log"
@@ -248,8 +248,8 @@ def test_t2_b06_misc_safetensors_aliasing_noncontig_and_load_weights_errors(
     import torch
     from safetensors.torch import load_file
 
-    from srtrainer.archs import ToyModel
-    from srtrainer.utils.misc import load_weights, save_safetensors
+    from archs import ToyModel
+    from utils.misc import load_weights, save_safetensors
 
     base = torch.arange(12, dtype=torch.float32).reshape(3, 4)
     transposed = base.t()
@@ -294,7 +294,7 @@ def test_t2_b07_misc_pad_reflect_fallback_and_aligned_noop() -> None:
     """F19: pad_to_multiple & pad_to_min_size fall back reflect->replicate and no-op when aligned."""
     import torch
 
-    from srtrainer.utils.misc import pad_to_min_size, pad_to_multiple, unpad_tensor
+    from utils.misc import pad_to_min_size, pad_to_multiple, unpad_tensor
 
     torch.manual_seed(19)
     x = torch.rand(1, 3, 3, 3, dtype=torch.float32)

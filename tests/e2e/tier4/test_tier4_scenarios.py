@@ -114,10 +114,10 @@ def test_t4_scenario1_mixed_blind_paired_train_to_auto_restore_infer(
     import torch
     from PIL import Image
 
-    from srtrainer.engine.inferencer import TiledInferencer
-    from srtrainer.utils.config import load_resolved_config
-    from srtrainer.utils.image import load_image
-    from srtrainer.utils.misc import load_weights
+    from engine.inferencer import TiledInferencer
+    from utils.config import load_resolved_config
+    from utils.image import load_image
+    from utils.misc import load_weights
 
     gt_src = gt_only_train_source_factory(name="s1_gt", n_samples=4, gt_h=80, gt_w=80, ratio=0.6)
     pair_src = paired_train_source_factory(
@@ -131,12 +131,12 @@ def test_t4_scenario1_mixed_blind_paired_train_to_auto_restore_infer(
             "dataset": {"root_dir": val_info["root_dir"], "json_path": val_info["json_path"]},
             "metrics": {
                 "psnr": {
-                    "_target_": "srtrainer.metrics.PSNRMetric",
+                    "_target_": "metrics.PSNRMetric",
                     "crop_border": 4,
                     "test_y_channel": True,
                 },
                 "ssim": {
-                    "_target_": "srtrainer.metrics.SSIMMetric",
+                    "_target_": "metrics.SSIMMetric",
                     "crop_border": 4,
                     "test_y_channel": True,
                 },
@@ -192,7 +192,7 @@ def test_t4_scenario1_mixed_blind_paired_train_to_auto_restore_infer(
     assert resolved_cfg.data.gt_size == 64
     assert resolved_cfg.loss.lpips.weight == pytest.approx(0.05)
     assert resolved_cfg.optim.optimizer.lr == pytest.approx(1.0e-4)
-    assert resolved_cfg.arch._target_ == "srtrainer.archs.ToyModel"
+    assert resolved_cfg.arch._target_ == "archs.ToyModel"
 
     log_text = (exp_dir / "train.log").read_text(encoding="utf-8")
     assert _CANONICAL_ITER_LOG_RE.search(log_text), (
@@ -282,7 +282,7 @@ def test_t4_scenario2_preempted_run_resume_auto_consistency(
             "dataset": {"root_dir": val_info["root_dir"], "json_path": val_info["json_path"]},
             "metrics": {
                 "psnr": {
-                    "_target_": "srtrainer.metrics.PSNRMetric",
+                    "_target_": "metrics.PSNRMetric",
                     "crop_border": 2,
                     "test_y_channel": True,
                 }
@@ -388,7 +388,7 @@ def test_t4_scenario3_text_sr_custom_meta_ocr_and_gtless_suites(
     from PIL import Image
     from safetensors.torch import load_file
 
-    from srtrainer.utils.config import load_resolved_config
+    from utils.config import load_resolved_config
 
     train_src = paired_train_source_factory(name="s3_train", n_samples=4, lq_h=16, lq_w=16, scale=2)
     bench_gt = val_suite_gt_label_factory(name="bench_gt", scale=2, sizes=[(16, 16), (16, 20)])
@@ -401,12 +401,12 @@ def test_t4_scenario3_text_sr_custom_meta_ocr_and_gtless_suites(
             "dataset": {"root_dir": bench_gt["root_dir"], "json_path": bench_gt["json_path"]},
             "metrics": {
                 "psnr": {
-                    "_target_": "srtrainer.metrics.PSNRMetric",
+                    "_target_": "metrics.PSNRMetric",
                     "crop_border": 2,
                     "test_y_channel": True,
                 },
                 "ssim": {
-                    "_target_": "srtrainer.metrics.SSIMMetric",
+                    "_target_": "metrics.SSIMMetric",
                     "crop_border": 2,
                     "test_y_channel": True,
                 },
@@ -517,8 +517,8 @@ def test_t4_scenario4_standalone_basicsr_pth_infer_recursive_and_json(
     import torch
     from PIL import Image
 
-    from srtrainer.archs import ToyModel
-    from srtrainer.utils.image import load_image
+    from archs import ToyModel
+    from utils.image import load_image
 
     fmt = hydra_value_formatter
     net = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
@@ -529,7 +529,7 @@ def test_t4_scenario4_standalone_basicsr_pth_infer_recursive_and_json(
 
     arch_ovs = standalone_infer_arch_overrides_factory(
         {
-            "_target_": "srtrainer.archs.ToyModel",
+            "_target_": "archs.ToyModel",
             "num_in_ch": 3,
             "num_out_ch": 3,
             "num_feat": 8,
@@ -654,7 +654,7 @@ def test_t4_scenario5_distributed_2proc_train_val_and_offline_infer(
     hydra_value_formatter: Callable[[Any], str],
 ) -> None:
     """Scenario 5: 2-proc CPU torchrun training + odd 5-image val + 2-proc offline tools/infer.py."""
-    from srtrainer.utils.image import load_image
+    from utils.image import load_image
 
     # Step 1: 2-process CPU distributed training with mixed sources & odd 5-image stateless PSNR val
     gt_src = gt_only_train_source_factory(name="s5_gt", n_samples=4, gt_h=48, gt_w=48, ratio=0.5)
@@ -669,7 +669,7 @@ def test_t4_scenario5_distributed_2proc_train_val_and_offline_infer(
             "dataset": {"root_dir": odd_val["root_dir"], "json_path": odd_val["json_path"]},
             "metrics": {
                 "psnr": {
-                    "_target_": "srtrainer.metrics.PSNRMetric",
+                    "_target_": "metrics.PSNRMetric",
                     "crop_border": 2,
                     "test_y_channel": True,
                 }
@@ -802,11 +802,11 @@ def test_t4_scenario6_two_stage_l1_to_l1_lpips_finetune_trackers_and_infer(
     from omegaconf import OmegaConf
     from safetensors.torch import load_file
 
-    import srtrainer.archs as archs_pkg
-    import srtrainer.losses as losses_pkg
-    from srtrainer.models import SRModel
-    from srtrainer.utils.config import load_resolved_config
-    from srtrainer.utils.image import load_image
+    import archs as archs_pkg
+    import losses as losses_pkg
+    from models import SRModel
+    from utils.config import load_resolved_config
+    from utils.image import load_image
 
     fmt = hydra_value_formatter
 
@@ -820,7 +820,7 @@ def test_t4_scenario6_two_stage_l1_to_l1_lpips_finetune_trackers_and_infer(
             "dataset": {"root_dir": val_info["root_dir"], "json_path": val_info["json_path"]},
             "metrics": {
                 "psnr": {
-                    "_target_": "srtrainer.metrics.PSNRMetric",
+                    "_target_": "metrics.PSNRMetric",
                     "crop_border": 2,
                     "test_y_channel": True,
                 }

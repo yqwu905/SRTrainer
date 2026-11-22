@@ -2,7 +2,7 @@
 
 > **定位**：面向图像超分与底层视觉复原（SR / 去噪 / 去模糊 / 图像增强等），基于 **PyTorch + Hugging Face Accelerate + Hydra** 的模块化、可扩展训练与推理框架。
 > **设计哲学**：保持 BasicSR 在底层视觉领域的优秀分层直觉，同时全面拥抱 **Accelerate 工程基础设施** 与 **Hydra 原生 `_target_` 组合继承体系**，以最少样板代码实现「训练—验证—续训—分布式推理」全链路 100% 一致。
-> **实现范围聚焦（Framework-First）**：当前阶段专注把 SRTrainer 框架主干做扎实（Hydra 分级继承配置、Accelerate `Trainer`、`BaseModel`/`SRModel`/`ModelEMA`、统一 JSON 混合数据集与 GPU 掩码 Real-ESRGAN 退化、`metric` 验证套件与 `meta` 透传、PSNR/SSIM/LPIPS 指标、双轨 Checkpoint、共享 `TiledInferencer` 与 `tools/infer.py` 分布式推理）。网络与损失函数保持最小克制：`src/srtrainer/archs/` 仅提供轻量占位网络 **`ToyModel`**（`src/srtrainer/archs/toy_model.py`，对应 `configs/arch/toy_x4.yaml`），`src/srtrainer/losses/` 仅内置 **`L1Loss`** 与 **`LPIPSLoss`**，用户可随时通过 Hydra `_target_` 自由接入自定义网络与损失函数。
+> **实现范围聚焦（Framework-First）**：当前阶段专注把 SRTrainer 框架主干做扎实（Hydra 分级继承配置、Accelerate `Trainer`、`BaseModel`/`SRModel`/`ModelEMA`、统一 JSON 混合数据集与 GPU 掩码 Real-ESRGAN 退化、`metric` 验证套件与 `meta` 透传、PSNR/SSIM/LPIPS 指标、双轨 Checkpoint、共享 `TiledInferencer` 与 `tools/infer.py` 分布式推理）。网络与损失函数保持最小克制：`src/archs/` 仅提供轻量占位网络 **`ToyModel`**（`src/archs/toy_model.py`，对应 `configs/arch/toy_x4.yaml`），`src/losses/` 仅内置 **`L1Loss`** 与 **`LPIPSLoss`**，用户可随时通过 Hydra `_target_` 自由接入自定义网络与损失函数。
 
 ---
 
@@ -116,7 +116,7 @@ sequenceDiagram
 
 ## 3. 工程目录结构
 
-采用标准 `src` 布局，包边界清晰，配合 `pyproject.toml` 可编辑安装（`pip install -e .`），使任意路径下都能通过 `srtrainer.*` 引用 `_target_`。
+采用扁平 `src` 源码根目录布局，配合 `pyproject.toml` 可编辑安装（`pip install -e .`），使任意路径下都能直接通过 `archs.*`、`models.*`、`losses.*` 等顶层包引用 `_target_`。
 
 ```text
 SRTrainer/
@@ -149,8 +149,7 @@ SRTrainer/
 │   └── experiment/                      # 实验配置层（支持多级继承与局部微调）
 │       ├── base_sr_x4.yaml
 │       └── exp01_toy_mixed_x4.yaml
-├── src/srtrainer/
-│   ├── __init__.py
+├── src/
 │   ├── engine/                          # 训练/验证/推理引擎层
 │   │   ├── __init__.py
 │   │   ├── trainer.py                   # Trainer：外层循环、验证、Checkpoint、Tracker
@@ -163,7 +162,7 @@ SRTrainer/
 │   │   ├── sr_model.py                  # 第一版主力：单网络 + Loss字典 + EMA + GPU退化
 │   │   └── ema.py                       # 可注册到 Accelerate Checkpoint 的 ModelEMA
 │   ├── archs/                           # 神经网络结构（纯 PyTorch nn.Module，占位实现）
-│   │   ├── __init__.py                  # 短路径重导出：srtrainer.archs.ToyModel
+│   │   ├── __init__.py                  # 短路径重导出：archs.ToyModel
 │   │   └── toy_model.py                 # 轻量占位超分网络 ToyModel
 │   ├── losses/                          # 损失函数模块（纯 PyTorch nn.Module，仅内置 L1 与 LPIPS）
 │   │   ├── __init__.py                  # 重导出 L1Loss, LPIPSLoss
@@ -203,7 +202,7 @@ SRTrainer/
     └── test_train_smoke.py
 ```
 
-> **包级重导出约定**：在 `srtrainer/archs/__init__.py`、`srtrainer/losses/__init__.py` 等处显式导出公共类，使 Hydra YAML 中只需写 `_target_: srtrainer.archs.ToyModel`、`_target_: srtrainer.losses.L1Loss` 等，既简洁又不因内部文件名重构而失效。
+> **包级重导出约定**：在 `src/archs/__init__.py`、`src/losses/__init__.py` 等处显式导出公共类，使 Hydra YAML 中只需写 `_target_: archs.ToyModel`、`_target_: losses.L1Loss` 等，既简洁又不因内部文件名重构而失效。
 
 ---
 
@@ -260,7 +259,7 @@ hydra:
 #### ② 原子模块示例：`configs/arch/toy_x4.yaml`、`configs/loss/l1_lpips.yaml`、`configs/optim/adamw_cosine.yaml`
 ```yaml
 # configs/arch/toy_x4.yaml
-_target_: srtrainer.archs.ToyModel
+_target_: archs.ToyModel
 num_in_ch: 3
 num_out_ch: 3
 num_feat: 32
@@ -274,12 +273,12 @@ scale: ${scale}
 l1:
   weight: 1.0
   criterion:
-    _target_: srtrainer.losses.L1Loss
+    _target_: losses.L1Loss
     reduction: mean
 lpips:
   weight: 0.1
   criterion:
-    _target_: srtrainer.losses.LPIPSLoss
+    _target_: losses.LPIPSLoss
     net: alex
     pretrained: true
 ```
@@ -503,7 +502,7 @@ augment:
   rot90: true
 
 degradation:
-  _target_: srtrainer.data.degradation.RealESRGANDegrader
+  _target_: data.degradation.RealESRGANDegrader
   scale: ${scale}
   use_usm: false            # 可选 GT USM 锐化
   queue_size: 0             # 可选训练 Pool（0 表示关闭；>0 时必须是 batch_size 整数倍）
@@ -629,15 +628,15 @@ val_suites:
       json_path: /data/manifests/set5_x4.json
     metrics:
       psnr:
-        _target_: srtrainer.metrics.PSNRMetric
+        _target_: metrics.PSNRMetric
         crop_border: ${scale}
         test_y_channel: true
       ssim:
-        _target_: srtrainer.metrics.SSIMMetric
+        _target_: metrics.SSIMMetric
         crop_border: ${scale}
         test_y_channel: true
       lpips:
-        _target_: srtrainer.metrics.LPIPSMetric
+        _target_: metrics.LPIPSMetric
         net: alex
 
   urban100:
@@ -646,11 +645,11 @@ val_suites:
       json_path: /data/manifests/urban100_x4.json
     metrics:
       psnr:
-        _target_: srtrainer.metrics.PSNRMetric
+        _target_: metrics.PSNRMetric
         crop_border: ${scale}
         test_y_channel: true
       ssim:
-        _target_: srtrainer.metrics.SSIMMetric
+        _target_: metrics.SSIMMetric
         crop_border: ${scale}
         test_y_channel: true
 
@@ -833,7 +832,7 @@ accelerate launch --num_processes 4 tools/infer.py \
 
 1. **Milestone 1：基础骨架与 Hydra 配置体系**
    - `pyproject.toml`、包目录骨架、Hydra 分级配置（`configs/`）与多级继承解析测试；
-   - 实现轻量占位网络 `ToyModel`（`src/srtrainer/archs/toy_model.py`）与内置 `L1Loss` / `LPIPSLoss`。
+   - 实现轻量占位网络 `ToyModel`（`src/archs/toy_model.py`）与内置 `L1Loss` / `LPIPSLoss`。
 2. **Milestone 2：数据流水线与 GPU 掩码 Real-ESRGAN 退化**
    - 统一字典列表 JSON 清单解析器（自动检测 `lq`/`gt`，透传 `meta`）、`MixedSRDataset`、`DistributedWeightedInfiniteSampler`（含比例统计与断点复现单测）；
    - `RealESRGANDegrader`（CPU 核生成 + GPU 掩码二阶退化 + DiffJPEG + 可选 USM/Pool）。

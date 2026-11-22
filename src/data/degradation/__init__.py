@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from srtrainer.data.degradation.diffjpeg import DiffJPEG
-from srtrainer.data.degradation.kernels import (
+from data.degradation.diffjpeg import DiffJPEG
+from data.degradation.kernels import (
     KernelGenerator,
     circular_lowpass_kernel,
     random_mixed_kernels,
 )
-from srtrainer.data.degradation.realesrgan import (
+from data.degradation.realesrgan import (
     RealESRGANDegrader,
     TrainingPool,
     USMSharp,

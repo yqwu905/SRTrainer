@@ -11,8 +11,8 @@ from typing import Any
 import torch
 from torch.utils.data import Dataset
 
-from srtrainer.data.manifest import ValSample, load_val_manifest
-from srtrainer.utils.image import load_image
+from data.manifest import ValSample, load_val_manifest
+from utils.image import load_image
 
 __all__ = [
     "ValImageDataset",

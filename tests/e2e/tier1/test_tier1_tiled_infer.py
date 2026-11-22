@@ -1,7 +1,7 @@
 """Tier 1 E2E tests — Area F: Shared Tiled Inference & Multi-Process Distributed CLI.
 
 Covers features F35-F40 and User Requirement #4 (NO SRPredictor).
-Imports ``from srtrainer.engine.inferencer import TiledInferencer`` inside test
+Imports ``from engine.inferencer import TiledInferencer`` inside test
 functions so Area F executes cleanly on M4 before M5 populates ``engine/__init__.py``.
 All non-stdlib imports (besides ``pytest``) are deferred inside test functions.
 """
@@ -91,10 +91,10 @@ def test_t1_no_srpredictor_across_repo_and_exports(repo_root: Path) -> None:
                     f"Forbidden SRPredictor reference found in {path}"
                 )
 
-    import srtrainer
-    import srtrainer.engine.inferencer as inferencer_mod
+    import engine
+    import engine.inferencer as inferencer_mod
 
-    assert not hasattr(srtrainer, "SRPredictor")
+    assert not hasattr(engine, "SRPredictor")
     assert not hasattr(inferencer_mod, "SRPredictor")
 
 
@@ -104,7 +104,7 @@ def test_t1_tiled_inferencer_auto_int_and_hw_tile_sizes_from_config() -> None:
     import torch.nn as nn
     from omegaconf import OmegaConf
 
-    from srtrainer.engine.inferencer import TiledInferencer
+    from engine.inferencer import TiledInferencer
 
     model = nn.Upsample(scale_factor=2, mode="nearest")
     torch.manual_seed(0)
@@ -170,7 +170,7 @@ def test_t1_tiled_inferencer_feathering_seamlessness_and_batch_parity() -> None:
     import torch
     import torch.nn as nn
 
-    from srtrainer.engine.inferencer import TiledInferencer
+    from engine.inferencer import TiledInferencer
 
     ys = torch.linspace(0.05, 0.95, 40, dtype=torch.float32)
     xs = torch.linspace(0.05, 0.95, 48, dtype=torch.float32)
@@ -218,7 +218,7 @@ def test_t1_tiled_inferencer_preserves_training_flag_and_clamps_range() -> None:
     import torch.nn as nn
     import torch.nn.functional as F
 
-    from srtrainer.engine.inferencer import TiledInferencer
+    from engine.inferencer import TiledInferencer
 
     class _OutOfRangeProbeModel(nn.Module):
         def __init__(self) -> None:
@@ -266,7 +266,7 @@ def test_t1_tiled_inferencer_untiled_pad_multiple_exact_crop() -> None:
     import torch.nn as nn
     import torch.nn.functional as F
 
-    from srtrainer.engine.inferencer import TiledInferencer
+    from engine.inferencer import TiledInferencer
 
     class _MultipleOf8StrictModel(nn.Module):
         def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -301,7 +301,7 @@ def test_t1_tools_infer_mode1_exp_dir_restore_and_weight_priority(
     hydra_value_formatter: Callable[[Any], str],
 ) -> None:
     """F37: tools/infer.py Mode 1 auto-restores exp_dir and honors best -> latest_ema -> latest -> override."""
-    from srtrainer.utils.image import load_image
+    from utils.image import load_image
 
     exp_info = bias_tagged_exp_dir_factory(
         e2e_workdir["work"] / "exp_mode1",
@@ -382,8 +382,8 @@ def test_t1_tools_infer_mode2_standalone_inputs_recursive_json_and_jpg(
     import torch
     from PIL import Image
 
-    from srtrainer.archs import ToyModel
-    from srtrainer.utils.image import load_image
+    from archs import ToyModel
+    from utils.image import load_image
 
     # Build BasicSR-style .pth with distinct non-zero params_ema vs zeroed params.
     net = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
@@ -398,7 +398,7 @@ def test_t1_tools_infer_mode2_standalone_inputs_recursive_json_and_jpg(
 
     arch_overrides = standalone_infer_arch_overrides_factory(
         {
-            "_target_": "srtrainer.archs.ToyModel",
+            "_target_": "archs.ToyModel",
             "num_in_ch": 3,
             "num_out_ch": 3,
             "num_feat": 8,
@@ -504,7 +504,7 @@ def test_t1_tools_infer_2proc_cpu_distributed_odd_image_count(
     hydra_value_formatter: Callable[[Any], str],
 ) -> None:
     """F39, F40: 2-process CPU torchrun tools/infer.py on 5 images writes 5 unique PNGs & summary."""
-    from srtrainer.utils.image import load_image
+    from utils.image import load_image
 
     exp_info = bias_tagged_exp_dir_factory(
         e2e_workdir["work"] / "exp_dist_infer",
