@@ -1,0 +1,5 @@
+l1:
+  weight: 1.0
+  criterion:
+    _target_: srtrainer.losses.L1Loss
+    reduction: mean

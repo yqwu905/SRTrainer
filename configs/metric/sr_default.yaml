@@ -1,0 +1,37 @@
+# Validation datasets and metrics are co-located exclusively under metric.val_suites
+# (never in configs/data/), supporting per-suite metrics and extra JSON fields via meta.
+primary_dataset: set5          # Benchmark suite used to select best checkpoint
+primary_metric: psnr           # Metric name within primary_dataset for best checkpoint
+
+val_suites:
+  set5:
+    dataset:
+      root_dir: /data/benchmarks/Set5
+      json_path: /data/manifests/set5_x4.json
+    metrics:
+      psnr:
+        _target_: srtrainer.metrics.PSNRMetric
+        crop_border: ${scale}
+        test_y_channel: true
+      ssim:
+        _target_: srtrainer.metrics.SSIMMetric
+        crop_border: ${scale}
+        test_y_channel: true
+      lpips:
+        _target_: srtrainer.metrics.LPIPSMetric
+        net: alex
+        pretrained: true
+
+  urban100:
+    dataset:
+      root_dir: /data/benchmarks/Urban100
+      json_path: /data/manifests/urban100_x4.json
+    metrics:
+      psnr:
+        _target_: srtrainer.metrics.PSNRMetric
+        crop_border: ${scale}
+        test_y_channel: true
+      ssim:
+        _target_: srtrainer.metrics.SSIMMetric
+        crop_border: ${scale}
+        test_y_channel: true

@@ -1,0 +1,26 @@
+defaults:
+  - arch: toy_x4
+  - loss: l1
+  - model: sr
+  - data: mixed_sr_x4
+  - optim: adamw_cosine
+  - metric: sr_default
+  - trainer: default
+  - _self_
+  - experiment: null
+  - override hydra/job_logging: disabled
+
+# Global variables shared across config groups via ${...} interpolation
+exp_name: debug_sr_x4
+scale: 4
+seed: 42
+output_root: experiments
+work_dir: ${output_root}/${exp_name}
+
+# Disable Hydra chdir and .hydra subdir; Trainer manages dirs & config_resolved.yaml on Rank 0
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${work_dir}
+  output_subdir: null

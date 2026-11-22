@@ -1,0 +1,40 @@
+# SRTrainer experiment & inference outputs
+experiments/
+outputs/
+multirun/
+.hydra/
+
+# Experiment tracker local logs
+wandb/
+mlruns/
+swanlog/
+
+# Python build, packaging & bytecode artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+src/*.egg-info/
+.eggs/
+build/
+dist/
+*.whl
+
+# Virtual environments & local env files
+.venv/
+venv/
+.env
+
+# Test, lint, typecheck & coverage caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# IDE & OS artifacts
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo

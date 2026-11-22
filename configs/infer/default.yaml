@@ -1,0 +1,24 @@
+# Inference settings for tools/infer.py backed by shared TiledInferencer
+exp_dir: null                  # Non-null: auto-restore config_resolved.yaml & weights from exp_dir
+weights_path: null             # Optional weight override (required in standalone mode when exp_dir is null)
+weights_key: null              # Optional nested dict key for external .pth checkpoints (e.g., params_ema)
+use_ema: true                  # Prefer EMA weights when weights_path is null
+
+input: null                    # Single image path | directory | JSON manifest (lq or fallback gt)
+input_root: null               # Base directory when input is a relative-path JSON manifest
+output_dir: outputs/infer
+recursive: false               # Recursively scan subdirectories in directory mode
+suffix: ""                     # Filename suffix before extension, e.g., "_x4"
+save_format: png               # png | jpg
+
+# Precision: "no" | "fp16" | "bf16" (always quote "no" in YAML; unquoted no parses as bool False)
+mixed_precision: bf16
+
+# Tiled inference strategy (identical schema to trainer.val_tile)
+tile:
+  enabled: true
+  size: auto                   # auto -> gt_size // scale | int | [H, W]
+  overlap: 16                  # LQ overlap pixels (0 <= overlap < min(tile_h, tile_w) // 2; 0 = hard stitch)
+  batch_size: 4                # Number of tiles forwarded per batch
+  blend_mode: cosine           # cosine | linear | mean
+  pad_multiple: 8              # Reflect/replicate pad multiple for untiled inference

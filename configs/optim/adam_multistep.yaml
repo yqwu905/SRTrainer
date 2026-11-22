@@ -1,0 +1,12 @@
+optimizer:
+  _target_: torch.optim.Adam
+  _partial_: true
+  lr: 2.0e-4
+  betas: [0.9, 0.99]
+  weight_decay: 0.0
+
+scheduler:
+  _target_: torch.optim.lr_scheduler.MultiStepLR
+  _partial_: true
+  milestones: [100000, 200000, 250000, 275000]
+  gamma: 0.5

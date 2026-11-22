@@ -1,0 +1,15 @@
+# @package _global_
+defaults:
+  - override /arch: toy_x4
+  - override /data: mixed_sr_x4
+  - override /loss: l1
+  - override /optim: adamw_cosine
+  - _self_
+
+scale: 4
+trainer:
+  total_iters: 300000
+  val_interval: 5000
+  save_interval: 5000
+  mixed_precision: bf16
+  gradient_accumulation_steps: 1

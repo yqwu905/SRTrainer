@@ -1,0 +1,11 @@
+l1:
+  weight: 1.0
+  criterion:
+    _target_: srtrainer.losses.L1Loss
+    reduction: mean
+lpips:
+  weight: 0.1
+  criterion:
+    _target_: srtrainer.losses.LPIPSLoss
+    net: alex
+    pretrained: true
