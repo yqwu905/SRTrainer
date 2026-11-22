@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import bisect
 import itertools
+import logging
+import math
+import numbers
+import random
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -11,14 +15,18 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 from omegaconf.errors import OmegaConfBaseException
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, default_collate
 
 from srtrainer.data.degradation.kernels import KernelGenerator
 from srtrainer.data.manifest import SourceStats, TrainSample, validate_sources_config
-from srtrainer.data.transforms import augment_tensors, paired_random_crop, random_crop
+from srtrainer.data.transforms import (
+    augment_tensors_with_flags,
+    paired_random_crop_with_coords,
+    random_crop_with_coords,
+)
 from srtrainer.utils.image import load_image
 
-__all__ = ["MixedSRDataset"]
+__all__ = ["MixedSRDataset", "train_collate_fn"]
 
 
 def _normalize_omegaconf(obj: Any, context: str) -> Any:
@@ -36,13 +44,93 @@ def _validate_positive_int(value: Any, name: str) -> int:
     return int(value)
 
 
-class MixedSRDataset(Dataset[dict[str, torch.Tensor]]):
+def _validate_prob(value: Any, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise ValueError(f"{name} must be a finite real in [0.0, 1.0], got {value!r}.")
+    val = float(value)
+    if not math.isfinite(val) or not (0.0 <= val <= 1.0):
+        raise ValueError(f"{name} must be in [0.0, 1.0], got {value!r}.")
+    return val
+
+
+def _pick_text_focus_center(
+    text_lines: tuple[dict[str, Any], ...] | None,
+) -> tuple[float, float] | None:
+    if not text_lines:
+        return None
+    centers: list[tuple[float, float]] = []
+    for line in text_lines:
+        if not line.get("valid", True) or not line.get("alignment_valid", True):
+            continue
+        if "quad" in line:
+            pts = np.asarray(line["quad"], dtype=np.float64)
+            centers.append((float(pts[:, 0].mean()), float(pts[:, 1].mean())))
+        else:
+            for glyph in line.get("glyphs", ()):
+                pts = np.asarray(glyph["quad"], dtype=np.float64)
+                centers.append((float(pts[:, 0].mean()), float(pts[:, 1].mean())))
+    if not centers:
+        return None
+    return random.choice(centers)
+
+
+def _crop_text_lines(
+    text_lines: tuple[dict[str, Any], ...] | None,
+    *,
+    crop_left: int,
+    crop_top: int,
+    crop_size: int,
+    orig_h: int,
+    orig_w: int,
+) -> list[dict[str, Any]]:
+    """Translate HR glyph quads to crop-relative coordinates, keeping only fully visible glyphs."""
+    if not text_lines:
+        return []
+    max_x = float(min(crop_size, orig_w - crop_left))
+    max_y = float(min(crop_size, orig_h - crop_top))
+    if max_x <= 0.0 or max_y <= 0.0:
+        return []
+
+    visible_lines: list[dict[str, Any]] = []
+    offset = np.array([float(crop_left), float(crop_top)], dtype=np.float64)
+    extent = np.array([max_x, max_y], dtype=np.float64)
+    for line in text_lines:
+        if not line.get("valid", True) or not line.get("alignment_valid", True):
+            continue
+        kept_glyphs: list[dict[str, Any]] = []
+        for glyph in line.get("glyphs", ()):
+            pts = np.asarray(glyph["quad"], dtype=np.float64) - offset
+            if (pts >= 0.0).all() and (pts <= extent).all():
+                kept_glyphs.append({"char": glyph["char"], "quad": pts.tolist()})
+        if kept_glyphs:
+            visible_lines.append({"glyphs": kept_glyphs})
+    return visible_lines
+
+
+def train_collate_fn(items: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Collate training batches while preserving variable-length ``text_lines`` per image."""
+    if not items:
+        raise ValueError("Cannot collate an empty training batch.")
+    has_lines = any("text_lines" in item for item in items)
+    if not has_lines:
+        return default_collate(list(items))
+    tensor_items = [
+        {k: v for k, v in item.items() if k != "text_lines"} for item in items
+    ]
+    batch: dict[str, Any] = default_collate(tensor_items)
+    batch["text_lines"] = [list(item.get("text_lines", ())) for item in items]
+    return batch
+
+
+class MixedSRDataset(Dataset[dict[str, Any]]):
     """Multi-source mixed super-resolution training dataset with per-sample auto-detection.
 
     Supports both ``(source_id, sample_idx)`` tuple indexing (used by
     ``DistributedWeightedInfiniteSampler``) and flat integer indexing. Emits uniform tensor
     dictionaries with zero placeholders so ``gt_only`` and ``paired`` samples collate seamlessly
-    into a single batch for GPU masked degradation.
+    into a single batch for GPU masked degradation. When any source carries glyph annotations
+    (inline ``text_lines``/``glyphs`` or external ``glyphs_json``), emits crop-relative
+    ``text_lines`` per sample for ``GlyphLoss``.
     """
 
     def __init__(
@@ -55,6 +143,7 @@ class MixedSRDataset(Dataset[dict[str, torch.Tensor]]):
         kernel_cfg: Mapping[str, Any] | None = None,
         is_main_process: bool = True,
         logger: Any = None,
+        text_crop_prob: float = 0.0,
     ) -> None:
         self.gt_size: int = _validate_positive_int(gt_size, "gt_size")
         self.scale: int = _validate_positive_int(scale, "scale")
@@ -63,6 +152,7 @@ class MixedSRDataset(Dataset[dict[str, torch.Tensor]]):
                 f"gt_size ({self.gt_size}) must be divisible by scale ({self.scale})."
             )
         self.lq_size: int = self.gt_size // self.scale
+        self.text_crop_prob: float = _validate_prob(text_crop_prob, "text_crop_prob")
 
         if not isinstance(has_degradation, bool):
             raise TypeError(
@@ -106,6 +196,22 @@ class MixedSRDataset(Dataset[dict[str, torch.Tensor]]):
         self._source_ratios: list[float] = [st.ratio for st in source_stats]
         self._cum_sizes: list[int] = list(itertools.accumulate(self._source_sizes))
         self._total_len: int = self._cum_sizes[-1]
+        self.has_text_annotations: bool = any(
+            sample.text_lines is not None
+            for src_samples in samples_per_source
+            for sample in src_samples
+        )
+
+        if self.has_text_annotations and (self._hflip or self._vflip or self._rot90) and is_main_process:
+            active_logger = logger if logger is not None else logging.getLogger("srtrainer")
+            active_logger.warning(
+                "[Data] Glyph annotations detected with geometric augmentations enabled "
+                "(hflip=%s, vflip=%s, rot90=%s). Flipped/rotated crops will omit glyph "
+                "supervision to avoid scoring mirrored text; disable augment for text training.",
+                self._hflip,
+                self._vflip,
+                self._rot90,
+            )
 
         if self.has_degradation:
             if kernel_cfg is None:
@@ -185,25 +291,41 @@ class MixedSRDataset(Dataset[dict[str, torch.Tensor]]):
             f"Index must be an int or a (source_id, sample_idx) tuple, got {type(index).__name__}."
         )
 
-    def __getitem__(self, index: tuple[int, int] | int) -> dict[str, torch.Tensor]:
+    def __getitem__(self, index: tuple[int, int] | int) -> dict[str, Any]:
         source_id, sample_idx = self._resolve_index(index)
         sample = self._samples_per_source[source_id][sample_idx]
         do_aug = self._hflip or self._vflip or self._rot90
+
+        focus_center: tuple[float, float] | None = None
+        if (
+            self.has_text_annotations
+            and self.text_crop_prob > 0.0
+            and sample.text_lines
+            and random.random() < self.text_crop_prob
+        ):
+            focus_center = _pick_text_focus_center(sample.text_lines)
 
         if not sample.need_degradation:
             assert sample.lq_path is not None
             gt = load_image(sample.gt_path)
             lq = load_image(sample.lq_path)
-            gt, lq = paired_random_crop(gt, lq, gt_size=self.gt_size, scale=self.scale)
+            gt, lq, gt_top, gt_left, orig_h, orig_w = paired_random_crop_with_coords(
+                gt,
+                lq,
+                gt_size=self.gt_size,
+                scale=self.scale,
+                focus_center=focus_center,
+            )
+            geom_changed = False
             if do_aug:
-                gt, lq = augment_tensors(
+                [gt, lq], geom_changed = augment_tensors_with_flags(
                     [gt, lq],
                     hflip=self._hflip,
                     vflip=self._vflip,
                     rot90=self._rot90,
                 )
 
-            item: dict[str, torch.Tensor] = {
+            item: dict[str, Any] = {
                 "gt": gt.contiguous(),
                 "lq": lq.contiguous(),
                 "need_degradation": torch.tensor(False, dtype=torch.bool),
@@ -215,13 +337,32 @@ class MixedSRDataset(Dataset[dict[str, torch.Tensor]]):
                 item["kernel1"] = torch.zeros((k, k), dtype=torch.float32)
                 item["kernel2"] = torch.zeros((k, k), dtype=torch.float32)
                 item["sinc_kernel"] = torch.zeros((k, k), dtype=torch.float32)
+            if self.has_text_annotations:
+                item["text_lines"] = (
+                    []
+                    if geom_changed
+                    else _crop_text_lines(
+                        sample.text_lines,
+                        crop_left=gt_left,
+                        crop_top=gt_top,
+                        crop_size=self.gt_size,
+                        orig_h=orig_h,
+                        orig_w=orig_w,
+                    )
+                )
             return item
 
         assert self.kernel_generator is not None
         gt = load_image(sample.gt_path)
-        gt = random_crop(gt, gt_size=self.gt_size, pad_if_smaller=True)
+        gt, gt_top, gt_left, orig_h, orig_w = random_crop_with_coords(
+            gt,
+            gt_size=self.gt_size,
+            pad_if_smaller=True,
+            focus_center=focus_center,
+        )
+        geom_changed = False
         if do_aug:
-            [gt] = augment_tensors(
+            [gt], geom_changed = augment_tensors_with_flags(
                 [gt],
                 hflip=self._hflip,
                 vflip=self._vflip,
@@ -230,7 +371,7 @@ class MixedSRDataset(Dataset[dict[str, torch.Tensor]]):
 
         lq = torch.zeros((3, self.lq_size, self.lq_size), dtype=torch.float32)
         kernel1, kernel2, sinc_kernel = self.kernel_generator.sample()
-        return {
+        out_item: dict[str, Any] = {
             "gt": gt.contiguous(),
             "lq": lq,
             "need_degradation": torch.tensor(True, dtype=torch.bool),
@@ -239,3 +380,17 @@ class MixedSRDataset(Dataset[dict[str, torch.Tensor]]):
             "kernel2": kernel2,
             "sinc_kernel": sinc_kernel,
         }
+        if self.has_text_annotations:
+            out_item["text_lines"] = (
+                []
+                if geom_changed
+                else _crop_text_lines(
+                    sample.text_lines,
+                    crop_left=gt_left,
+                    crop_top=gt_top,
+                    crop_size=self.gt_size,
+                    orig_h=orig_h,
+                    orig_w=orig_w,
+                )
+            )
+        return out_item

@@ -1,0 +1,45 @@
+_target_: srtrainer.archs.VOSR2OneStep
+scale: ${scale}
+
+# VOSR2 1.4B single-step LightningDiT configuration (VOSR2/args.json exact parity)
+input_size: 64                  # Reference latent grid (512 / 8) matching official VOSR2 checkpoint
+patch_size: 2
+in_channels: 32                 # 16 (LQ latent) + 16 (noise)
+out_channels: 16
+hidden_size: 1536
+depth: 36
+num_heads: 24
+mlp_ratio: 4.0
+z_dims: 1024
+encdim_ratio: 3
+use_qknorm: true
+use_swiglu: true
+use_rope: true
+use_rmsnorm: true
+wo_shift: false
+use_checkpoint: true            # Recommended activation checkpointing for 1.4B DiT training
+rope_mode: interpolate          # interpolate | extrapolate
+
+# One-step endpoint & decoding options
+noise_input: gaussian           # gaussian | zero
+posterior_mode: true
+clamp_decode_in_train: true
+eval_seed: 42
+
+# Frozen Qwen-Image 2D VAE (local path or HuggingFace repo + subfolder)
+vae_path: CSWRY/VOSR
+vae_subfolder: Qwen-Image-vae-2d
+vae_pretrained: true
+vae_gradient_checkpointing: false
+
+# Frozen DINOv2-ViT-L/14 vision encoder
+dino_size: 448
+dino_layer: 17
+dino_cache_dir: null
+dino_local_repo: null
+dino_checkpoint: null
+dino_pretrained: true
+
+# Optional direct DiT checkpoint (alternatively use model.pretrain_path)
+dit_checkpoint: null
+dit_filename: VOSR2/checkpoints/ema_model.safetensors

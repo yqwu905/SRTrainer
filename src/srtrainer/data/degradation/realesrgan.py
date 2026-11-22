@@ -550,6 +550,11 @@ class RealESRGANDegrader(nn.Module):
             )
 
         device = gt.device
+        if self.pool is not None and "text_lines" in batch:
+            raise ValueError(
+                "RealESRGANDegrader TrainingPool (queue_size > 0) cannot be combined with "
+                "per-sample text_lines/glyph annotations because pooling swaps samples across batches."
+            )
         mask = raw_mask.to(device=device).reshape(b)
         with torch.amp.autocast(device_type=device.type, enabled=False):
             # Zero-overhead passthrough when no sample needs degradation.

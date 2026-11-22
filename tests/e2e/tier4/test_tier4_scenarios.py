@@ -997,5 +997,5 @@ def test_t4_scenario6_two_stage_l1_to_l1_lpips_finetune_trackers_and_infer(
                             f"Forbidden token {forbidden!r} found in {path}: {token_str!r}"
                         )
 
-    assert set(archs_pkg.__all__) == {"ToyModel"}
-    assert set(losses_pkg.__all__) == {"L1Loss", "LPIPSLoss"}
+    assert set(archs_pkg.__all__) == {"ToyModel", "VOSR2OneStep"}
+    assert set(losses_pkg.__all__) == {"L1Loss", "LPIPSLoss", "OCRKLLoss", "GlyphLoss"}

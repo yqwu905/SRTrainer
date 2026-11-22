@@ -255,25 +255,26 @@ def test_hydra_instantiate_m1_components() -> None:
 
 
 def test_narrowed_scope_and_mandatory_user_requirements() -> None:
-    # Follow-up scope narrowing: ONLY ToyModel in archs; ONLY L1Loss & LPIPSLoss in losses
-    assert srtrainer.archs.__all__ == ["ToyModel"]
-    assert srtrainer.losses.__all__ == ["L1Loss", "LPIPSLoss"]
+    # Registered built-in archs and losses
+    assert srtrainer.archs.__all__ == ["ToyModel", "VOSR2OneStep"]
+    assert srtrainer.losses.__all__ == ["L1Loss", "LPIPSLoss", "OCRKLLoss", "GlyphLoss"]
 
     arch_py_files = sorted(
         p.name for p in (REPO_ROOT / "src" / "srtrainer" / "archs").glob("*.py")
     )
     assert arch_py_files == ["__init__.py", "toy_model.py"]
+    assert (REPO_ROOT / "src" / "srtrainer" / "archs" / "vosr2" / "__init__.py").is_file()
 
     arch_yaml_files = sorted(p.name for p in (REPO_ROOT / "configs" / "arch").glob("*.yaml"))
-    assert arch_yaml_files == ["toy_x4.yaml"]
+    assert arch_yaml_files == ["toy_x4.yaml", "vosr2_x4.yaml"]
 
     loss_yaml_files = sorted(p.name for p in (REPO_ROOT / "configs" / "loss").glob("*.yaml"))
-    assert loss_yaml_files == ["l1.yaml", "l1_lpips.yaml"]
+    assert loss_yaml_files == ["glyph.yaml", "l1.yaml", "l1_lpips.yaml", "ocr_kl.yaml", "vosr2_text.yaml"]
 
     exp_yaml_files = sorted(
         p.name for p in (REPO_ROOT / "configs" / "experiment").glob("*.yaml")
     )
-    assert exp_yaml_files == ["base_sr_x4.yaml", "exp01_toy_mixed_x4.yaml"]
+    assert exp_yaml_files == ["base_sr_x4.yaml", "exp01_toy_mixed_x4.yaml", "exp02_vosr2_x4.yaml"]
 
     cfg = _compose("train")
 

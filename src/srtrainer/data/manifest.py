@@ -15,6 +15,8 @@ from typing import Any
 from omegaconf import ListConfig, OmegaConf
 from omegaconf.errors import OmegaConfBaseException
 
+from srtrainer.losses.glyph_loss import canonical_quad
+
 __all__ = [
     "TrainSample",
     "ValSample",
@@ -26,6 +28,7 @@ __all__ = [
 ]
 
 _REQUIRED_SOURCE_KEYS: tuple[str, ...] = ("name", "root_dir", "json_path", "ratio")
+_IMAGE_SUFFIXES: frozenset[str] = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"})
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,7 @@ class TrainSample:
     lq_path: Path | None
     need_degradation: bool
     source_name: str = ""
+    text_lines: tuple[dict[str, Any], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -119,10 +123,113 @@ def _load_json_list(json_path: str | Path) -> tuple[Path, list[dict[str, Any]]]:
     return path, entries
 
 
+def _normalize_glyph_entry(raw: Any, context: str) -> dict[str, Any]:
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"{context}: glyph entry must be a dict, got {type(raw).__name__}.")
+    ch = raw.get("char")
+    if not isinstance(ch, str) or len(ch) != 1 or ch.isspace():
+        raise ValueError(f"{context}: each glyph needs a single non-whitespace 'char', got {ch!r}.")
+    geom_keys = [k for k in ("quad", "bbox") if k in raw]
+    if len(geom_keys) != 1:
+        raise ValueError(f"{context}: glyph {ch!r} needs exactly one of 'quad' or 'bbox'.")
+    pts = canonical_quad(raw[geom_keys[0]], name=f"{context} glyph {ch!r}")
+    return {"char": ch, "quad": pts.tolist()}
+
+
+def _normalize_text_lines(raw: Any, context: str) -> tuple[dict[str, Any], ...]:
+    if not isinstance(raw, list):
+        raise ValueError(f"{context}: text_lines must be a list, got {type(raw).__name__}.")
+    normalized: list[dict[str, Any]] = []
+    for idx, line in enumerate(raw):
+        if not isinstance(line, Mapping):
+            raise ValueError(
+                f"{context}[{idx}]: line entry must be a dict, got {type(line).__name__}."
+            )
+        valid = line.get("valid", True)
+        if not isinstance(valid, bool):
+            raise ValueError(f"{context}[{idx}].valid must be a bool.")
+        aligned = line.get("alignment_valid", True)
+        if not isinstance(aligned, bool):
+            raise ValueError(f"{context}[{idx}].alignment_valid must be a bool.")
+        for flag in ("difficult", "ignore"):
+            flag_val = line.get(flag, False)
+            if not isinstance(flag_val, bool):
+                raise ValueError(f"{context}[{idx}].{flag} must be a bool.")
+            if flag_val:
+                valid = False
+        transcript = line.get("transcript", line.get("transcription", line.get("text", "")))
+        if transcript in ("###", "*"):
+            valid = False
+
+        raw_glyphs = line.get("glyphs")
+        if raw_glyphs is None:
+            glyphs: list[dict[str, Any]] = []
+        else:
+            if not isinstance(raw_glyphs, list):
+                raise ValueError(f"{context}[{idx}].glyphs must be a list.")
+            glyphs = [
+                _normalize_glyph_entry(g, f"{context}[{idx}].glyphs[{g_idx}]")
+                for g_idx, g in enumerate(raw_glyphs)
+            ]
+
+        entry: dict[str, Any] = {
+            "valid": valid,
+            "alignment_valid": aligned,
+            "glyphs": glyphs,
+        }
+        for geom_key in ("quad", "points", "bbox", "box"):
+            if geom_key in line:
+                entry["quad"] = canonical_quad(line[geom_key], name=f"{context}[{idx}]").tolist()
+                break
+        normalized.append(entry)
+    return tuple(normalized)
+
+
+def _normalize_flat_glyphs(raw: Any, context: str) -> tuple[dict[str, Any], ...]:
+    if not isinstance(raw, list):
+        raise ValueError(f"{context}: glyphs must be a list, got {type(raw).__name__}.")
+    glyphs = [
+        _normalize_glyph_entry(g, f"{context}[{g_idx}]") for g_idx, g in enumerate(raw)
+    ]
+    return ({"valid": True, "alignment_valid": True, "glyphs": glyphs},)
+
+
+def _load_external_glyphs_map(glyphs_json: str | Path) -> dict[str, tuple[dict[str, Any], ...]]:
+    path = _validate_path_arg(glyphs_json, "glyphs_json")
+    if not path.is_file():
+        raise FileNotFoundError(f"Glyph annotations JSON file not found: {path}")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Failed to parse glyphs JSON {path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Glyph annotations JSON {path} must map image names/stems to line lists, "
+            f"got {type(raw).__name__}."
+        )
+    mapping: dict[str, tuple[dict[str, Any], ...]] = {}
+    for raw_name, records in raw.items():
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            raise ValueError(f"{path}: image keys must be non-empty strings.")
+        key_name = Path(raw_name.replace("\\", "/")).name
+        stem_key = (
+            Path(key_name).stem
+            if Path(key_name).suffix.lower() in _IMAGE_SUFFIXES
+            else key_name
+        )
+        line_list = records.get("lines") if isinstance(records, Mapping) else records
+        parsed = _normalize_text_lines(line_list, f"{path}:{raw_name}")
+        mapping[raw_name] = parsed
+        mapping[key_name] = parsed
+        mapping[stem_key] = parsed
+    return mapping
+
+
 def load_train_manifest(
     json_path: str | Path,
     root_dir: str | Path,
     source_name: str = "",
+    glyphs_json: str | Path | None = None,
 ) -> tuple[list[TrainSample], SourceStats]:
     """Parse a unified training JSON manifest with per-sample ``gt_only`` vs ``paired`` detection."""
     path, entries = _load_json_list(json_path)
@@ -131,6 +238,10 @@ def load_train_manifest(
     if not isinstance(source_name, str):
         raise ValueError(f"source_name must be a string, got {type(source_name).__name__}.")
     resolved_name = source_name.strip() if source_name.strip() else path.stem
+
+    external_glyphs = (
+        _load_external_glyphs_map(glyphs_json) if glyphs_json is not None else None
+    )
 
     samples: list[TrainSample] = []
     gt_only_count = 0
@@ -167,12 +278,30 @@ def load_train_manifest(
         else:
             paired_count += 1
 
+        sample_lines: tuple[dict[str, Any], ...] | None = None
+        if "text_lines" in entry and entry["text_lines"] is not None:
+            sample_lines = _normalize_text_lines(
+                entry["text_lines"], f"Train manifest {path}[{idx}].text_lines"
+            )
+        elif "glyphs" in entry and entry["glyphs"] is not None:
+            sample_lines = _normalize_flat_glyphs(
+                entry["glyphs"], f"Train manifest {path}[{idx}].glyphs"
+            )
+        elif external_glyphs is not None:
+            for lookup in (raw_gt, gt_path.name, gt_path.stem):
+                if lookup in external_glyphs:
+                    sample_lines = external_glyphs[lookup]
+                    break
+            if sample_lines is None:
+                sample_lines = ()
+
         samples.append(
             TrainSample(
                 gt_path=gt_path,
                 lq_path=lq_path,
                 need_degradation=need_degradation,
                 source_name=resolved_name,
+                text_lines=sample_lines,
             )
         )
 
@@ -207,7 +336,7 @@ def validate_sources_config(
     if len(normalized_sources) == 0:
         raise ValueError("data.sources must be a non-empty list.")
 
-    parsed_configs: list[tuple[str, Path, Path, float]] = []
+    parsed_configs: list[tuple[str, Path, Path, float, Path | None]] = []
     ratios: list[float] = []
 
     for idx, raw_src in enumerate(normalized_sources):
@@ -241,6 +370,13 @@ def validate_sources_config(
         src_root_dir = _validate_path_arg(src["root_dir"], f"data.sources[{idx}]['root_dir']")
         src_json_path = _validate_path_arg(src["json_path"], f"data.sources[{idx}]['json_path']")
 
+        raw_glyphs_json = src.get("glyphs_json", src.get("text_boxes", None))
+        src_glyphs_json = (
+            _validate_path_arg(raw_glyphs_json, f"data.sources[{idx}]['glyphs_json']")
+            if raw_glyphs_json is not None
+            else None
+        )
+
         raw_ratio = src["ratio"]
         if isinstance(raw_ratio, bool) or not isinstance(raw_ratio, numbers.Real):
             raise ValueError(
@@ -253,7 +389,7 @@ def validate_sources_config(
                 f"data.sources[{idx}]['ratio'] must be finite and >= 0, got {raw_ratio!r}."
             )
 
-        parsed_configs.append((src_name, src_root_dir, src_json_path, ratio_f))
+        parsed_configs.append((src_name, src_root_dir, src_json_path, ratio_f, src_glyphs_json))
         ratios.append(ratio_f)
 
     if max(ratios) <= 0.0:
@@ -263,11 +399,12 @@ def validate_sources_config(
 
     all_samples: list[list[TrainSample]] = []
     all_stats: list[SourceStats] = []
-    for src_name, src_root_dir, src_json_path, ratio_f in parsed_configs:
+    for src_name, src_root_dir, src_json_path, ratio_f, src_glyphs_json in parsed_configs:
         samples, stats = load_train_manifest(
             json_path=src_json_path,
             root_dir=src_root_dir,
             source_name=src_name,
+            glyphs_json=src_glyphs_json,
         )
         all_samples.append(samples)
         all_stats.append(
