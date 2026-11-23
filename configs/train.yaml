@@ -1,13 +1,13 @@
 defaults:
-  - arch: vosr2
-  - loss: l1
+  - arch: ???
+  - loss: ???
   - model: sr
   - data: mixed_sr
   - optim: adamw_cosine
   - metric: sr_default
   - trainer: default
   - _self_
-  - experiment: null
+  - experiment: ???
   - override hydra/job_logging: disabled
 
 # Global variables shared across config groups via ${...} interpolation
