@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections import Counter
 from collections.abc import Mapping
@@ -685,8 +686,13 @@ class Trainer:
 
         try:
             for suite_name, suite in self.val_suites.items():
-                metric_values: dict[str, list[float]] = {m_name: [] for m_name in suite.metrics}
+                metric_numerators: dict[str, float] = {m_name: 0.0 for m_name in suite.metrics}
+                metric_denominators: dict[str, float] = {m_name: 0.0 for m_name in suite.metrics}
                 local_vis_cache: dict[int, torch.Tensor] = {}
+
+                for metric in suite.metrics.values():
+                    if hasattr(metric, "clear_sample_cache"):
+                        metric.clear_sample_cache()
 
                 try:
                     for batch in suite.loader:
@@ -699,14 +705,39 @@ class Trainer:
                             gt = gt.to(device=pred.device, dtype=torch.float32)
 
                         for m_name, metric in suite.metrics.items():
-                            val = float(metric.compute(pred, target=gt, meta=meta))
-                            val_tensor = torch.tensor(
-                                [val],
+                            raw_stats = metric.compute_stats(pred, target=gt, meta=meta)
+                            if (
+                                not isinstance(raw_stats, (tuple, list))
+                                or len(raw_stats) != 2
+                                or isinstance(raw_stats[0], bool)
+                                or isinstance(raw_stats[1], bool)
+                            ):
+                                raise ValueError(
+                                    f"Metric {suite_name}.{m_name}.compute_stats() must return a "
+                                    f"(numerator, denominator) numeric 2-tuple, got {raw_stats!r}."
+                                )
+                            num_val = float(raw_stats[0])
+                            den_val = float(raw_stats[1])
+                            if not math.isfinite(den_val) or den_val < 0.0:
+                                raise ValueError(
+                                    f"Metric {suite_name}.{m_name}.compute_stats() returned "
+                                    f"invalid denominator {den_val!r}; expected finite >= 0."
+                                )
+                            stats_tensor = torch.tensor(
+                                [[num_val, den_val]],
                                 dtype=metric_dtype,
                                 device=self.accelerator.device,
                             )
-                            gathered = self.accelerator.gather_for_metrics(val_tensor)
-                            metric_values[m_name].extend(gathered.detach().cpu().tolist())
+                            gathered = self.accelerator.gather_for_metrics(stats_tensor)
+                            gathered_cpu = gathered.detach().cpu()
+                            if gathered_cpu.ndim != 2 or gathered_cpu.shape[1] != 2:
+                                raise RuntimeError(
+                                    f"Expected gathered stats shape [N, 2] for {suite_name}.{m_name}, "
+                                    f"got {tuple(gathered_cpu.shape)}."
+                                )
+                            for row_num, row_den in gathered_cpu.tolist():
+                                metric_numerators[m_name] += float(row_num)
+                                metric_denominators[m_name] += float(row_den)
 
                         gs = self.accelerator.gradient_state
                         is_padded_tail = (
@@ -734,6 +765,9 @@ class Trainer:
                             if self.accelerator.is_main_process and self.accelerator.trackers:
                                 local_vis_cache[sample_idx] = cmp_img.detach().cpu()
                 finally:
+                    for metric in suite.metrics.values():
+                        if hasattr(metric, "clear_sample_cache"):
+                            metric.clear_sample_cache()
                     if hasattr(suite.loader, "end"):
                         suite.loader.end()
                     if hasattr(suite.loader, "reset"):
@@ -773,8 +807,10 @@ class Trainer:
                             )
 
                 suite_results: dict[str, float] = {}
-                for m_name, vals in metric_values.items():
-                    mean_val = float(sum(vals) / len(vals)) if vals else float("nan")
+                for m_name in suite.metrics:
+                    total_num = metric_numerators[m_name]
+                    total_den = metric_denominators[m_name]
+                    mean_val = float(total_num / total_den) if total_den > 0.0 else float("nan")
                     suite_results[m_name] = mean_val
                     tracker_metrics[f"val/{suite_name}/{m_name}"] = mean_val
                 results[suite_name] = suite_results

@@ -33,6 +33,11 @@ trackers = [
     "mlflow",
     "swanlab",
 ]
+ocr = [
+    "opencv-python-headless>=4.8.0",
+    "paddleocr>=3.0.0",
+    "paddlepaddle>=3.0.0",
+]
 npu = [
     "torch-npu==2.9.0; sys_platform == 'linux'",
     "setuptools>=65",

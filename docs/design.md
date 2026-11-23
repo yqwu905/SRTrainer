@@ -584,7 +584,7 @@ flowchart LR
 本框架验证流程：
 1. 遍历 `cfg.metric.val_suites` 中的每个验证套件，为其构建 `ValImageDataset`（验证图分辨率不一，默认 `batch_size=1`）并交由 `accelerator.prepare(val_loader)` 自动完成分布式切分（区别于训练集的自定义加权无限采样器）；
 2. 每张图统一调用共享的 `TiledInferencer.infer_tensor(lq)`（支持自动 `tile_size` 与 `pad_to_multiple`，确保验证和最终部署推理结果比特级一致）；
-3. 在 `for batch in val_loader:` 循环内逐 step 调用该验证套件绑定的各项指标 `metric.compute(pred, target=gt, meta=meta)`，并将指标标量组装成张量直接调用 **`accelerator.gather_for_metrics()`**（Accelerate 仅在最后一个 step 根据 `prepare` 记录的余数自动截断补齐的重复样本），循环结束后在 Rank 0 对全部真实样本求精确全局均值；
+3. 在 `for batch in val_loader:` 循环内逐 step 调用该验证套件绑定的各项指标 `metric.compute_stats(pred, target=gt, meta=meta)`（默认回退为 `(compute(...), 1.0)`），将每样本统计量组装为 `[1, 2]` 张量直接调用 **`accelerator.gather_for_metrics()`**（首维为样本维，Accelerate 在最后一步按余数同时裁剪补齐样本的分子与分母），循环结束后汇总全局分子与分母求比值（总分母为 `0` 时返回 `NaN`，跳过 best 更新）；
 4. 可视化存图：每个验证套件支持配置 `max_save_images`（默认继承全局设置），仅对命中的样本在本地保存 `LQ_bicubic | SR | GT` 拼接图（无 GT 时保存 `LQ_bicubic | SR`）或单图，并同步写入 Accelerate Tracker。
 
 ### 7.3 可扩展指标协议（`BaseMetric`）
@@ -611,12 +611,24 @@ class BaseMetric(ABC):
         Returns:
             单图指标标量（float）
         """
+    def compute_stats(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> tuple[float, float]:
+        """返回可加和的 (numerator, denominator) 统计量用于全局加权归约；默认返回 (compute(...), 1.0)。"""
 ```
 
-**内置首批指标**：
+**内置指标**：
 - `PSNRMetric`：支持 `crop_border`（默认 `scale`）与 `test_y_channel`（严格对齐 BasicSR / MATLAB ITU-R BT.601 Y 通道转换公式）；
 - `SSIMMetric`：支持 `crop_border` 与 `test_y_channel`，11×11 高斯窗；
-- `LPIPSMetric`（`higher_is_better = False`）：初始化时在当前卡仅加载一次权重并置于 `eval()` + `no_grad()`，复用显存不重复加载。
+- `LPIPSMetric`（`higher_is_better = False`）：初始化时在当前卡仅加载一次权重并置于 `eval()` + `no_grad()`，复用显存不重复加载；
+- **文本 OCR 指标**（`src/metrics/ocr_metrics.py`，配置示例见 `configs/metric/text_ocr.yaml`，详细合同见 `docs/ocr_metrics_design.md`）：
+  - `OCRAccuracyMetric`（**OCR-A**，`higher_is_better = True`）、`CERMetric`（**CER**，`higher_is_better = False`，不截断允许 `> 1`）、`OneMinusNEDMetric`（**1-NED**，`higher_is_better = True`）；
+  - 与 `yqwu905/VOSR` `evaluate.py` 对齐 NFKC/空白规范化、Unicode 单位代价 Levenshtein 编辑距离与 OpenCV `INTER_CUBIC` / `BORDER_REPLICATE` 透视裁剪（高宽比 `>= 1.5` 逆时针旋转 90°）；
+  - 支持单行整图 `label` 与多框 `text_lines`（`points`/`quad`/`bbox`/`box` + 可选 `annotation_size` 显式缩放），不依赖 `target`（支持 GT-less）；
+  - 延迟导入可选依赖（`uv sync --extra ocr`），默认 `ocr_device="cpu"`（`.to(torch_device)` 安全空操作），同进程同配置三指标共享模型并有界缓存最后一个样本的一次识别结果；多进程运行前建议单进程预下载权重并统一配置只读本地 `ocr_model_dir`。
 
 #### 验证套件与指标 Hydra 配置：`configs/metric/sr_default.yaml`
 ```yaml
