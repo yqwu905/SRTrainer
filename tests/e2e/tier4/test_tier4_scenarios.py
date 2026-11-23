@@ -174,9 +174,12 @@ def test_t4_scenario1_mixed_blind_paired_train_to_auto_restore_infer(
         has_degradation=True,
         arch_num_feat=8,
         arch_num_block=1,
-        experiment="exp01_toy_mixed_x4",
+        experiment="vosr2_onestep_text",
         extra_overrides=[
+            "loss=l1_lpips",
+            "loss.lpips.weight=0.05",
             "loss.lpips.criterion.pretrained=false",
+            "optim.optimizer.lr=1.0e-4",
             "data.degradation.kernel_cfg.kernel_size=7",
             "data.degradation.kernel_cfg.kernel_range=[7]",
         ],
@@ -192,7 +195,7 @@ def test_t4_scenario1_mixed_blind_paired_train_to_auto_restore_infer(
     assert resolved_cfg.data.gt_size == 64
     assert resolved_cfg.loss.lpips.weight == pytest.approx(0.05)
     assert resolved_cfg.optim.optimizer.lr == pytest.approx(1.0e-4)
-    assert resolved_cfg.arch._target_ == "archs.ToyModel"
+    assert resolved_cfg.arch._target_ == "tests.dummy_arch.DummySRNet"
 
     log_text = (exp_dir / "train.log").read_text(encoding="utf-8")
     assert _CANONICAL_ITER_LOG_RE.search(log_text), (
@@ -516,12 +519,12 @@ def test_t4_scenario4_standalone_basicsr_pth_infer_recursive_and_json(
     """Scenario 4: Standalone Mode 2 tools/infer.py with BasicSR .pth on recursive dirs & JSON."""
     import torch
     from PIL import Image
+    from tests.dummy_arch import DummySRNet
 
-    from archs import ToyModel
     from utils.image import load_image
 
     fmt = hydra_value_formatter
-    net = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
+    net = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
     sd_ema, ema_mean = constant_bias_state_dict_factory(net, 0.72)
     sd_params, _ = constant_bias_state_dict_factory(net, 0.15)
     pth_path = e2e_workdir["work"] / "external_toy_x2.pth"
@@ -529,7 +532,7 @@ def test_t4_scenario4_standalone_basicsr_pth_infer_recursive_and_json(
 
     arch_ovs = standalone_infer_arch_overrides_factory(
         {
-            "_target_": "archs.ToyModel",
+            "_target_": "tests.dummy_arch.DummySRNet",
             "num_in_ch": 3,
             "num_out_ch": 3,
             "num_feat": 8,
@@ -967,9 +970,10 @@ def test_t4_scenario6_two_stage_l1_to_l1_lpips_finetune_trackers_and_infer(
         if isinstance(parsed, dict) and isinstance(parsed.get("sources"), list):
             assert all("mode" not in s for s in parsed["sources"] if isinstance(s, dict))
 
-    # Req #4 & #5: Zero SRPredictor across src/tools/configs & strict ToyModel + L1/LPIPS scope
+    # Req #4 & #5: Zero SRPredictor/ToyModel across src/tools/configs & strict VOSR2OneStep scope
     forbidden_tokens = (
         "SRPredictor",
+        "ToyModel",
         "RRDBNet",
         "SwinIR",
         "TinySRNet",
@@ -997,5 +1001,5 @@ def test_t4_scenario6_two_stage_l1_to_l1_lpips_finetune_trackers_and_infer(
                             f"Forbidden token {forbidden!r} found in {path}: {token_str!r}"
                         )
 
-    assert set(archs_pkg.__all__) == {"ToyModel", "VOSR2OneStep"}
+    assert set(archs_pkg.__all__) == {"VOSR2OneStep"}
     assert set(losses_pkg.__all__) == {"L1Loss", "LPIPSLoss", "OCRKLLoss", "GlyphLoss"}

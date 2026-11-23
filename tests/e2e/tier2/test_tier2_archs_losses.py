@@ -14,14 +14,13 @@ from pathlib import Path
 import pytest
 
 
-def test_t2_b01_toymodel_edge_scales_tiny_dims_channels_and_invalid_args() -> None:
-    """F13: ToyModel supports scale=1/3/4, tiny prime dims, 1-ch, 0-block, and rejects bad args."""
+def test_t2_b01_dummysrnet_edge_scales_tiny_dims_channels_and_invalid_args() -> None:
+    """F13: DummySRNet supports scale=1/3/4, tiny prime dims, 1-ch, 0-block, and rejects bad args."""
     import torch
-
-    from archs import ToyModel
+    from tests.dummy_arch import DummySRNet
 
     for scale in (1, 3, 4):
-        net = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=scale)
+        net = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=scale)
         for h, w in ((1, 1), (3, 5), (7, 9)):
             net.zero_grad(set_to_none=True)
             x = torch.rand(1, 3, h, w, dtype=torch.float32, requires_grad=True)
@@ -34,7 +33,7 @@ def test_t2_b01_toymodel_edge_scales_tiny_dims_channels_and_invalid_args() -> No
             grads = [p.grad for p in net.parameters() if p.requires_grad]
             assert grads and all(g is not None and torch.isfinite(g).all() for g in grads)
 
-    gray_net = ToyModel(num_in_ch=1, num_out_ch=1, num_feat=8, num_block=1, scale=2)
+    gray_net = DummySRNet(num_in_ch=1, num_out_ch=1, num_feat=8, num_block=1, scale=2)
     x_gray = torch.rand(1, 1, 3, 5, dtype=torch.float32, requires_grad=True)
     y_gray = gray_net(x_gray)
     assert y_gray.shape == (1, 1, 6, 10)
@@ -42,7 +41,7 @@ def test_t2_b01_toymodel_edge_scales_tiny_dims_channels_and_invalid_args() -> No
     y_gray.mean().backward()
     assert x_gray.grad is not None and torch.isfinite(x_gray.grad).all()
 
-    zero_block_net = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=0, scale=2)
+    zero_block_net = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=0, scale=2)
     y_zb = zero_block_net(torch.rand(1, 3, 3, 5, dtype=torch.float32))
     assert y_zb.shape == (1, 3, 6, 10)
     assert torch.isfinite(y_zb).all()
@@ -57,7 +56,7 @@ def test_t2_b01_toymodel_edge_scales_tiny_dims_channels_and_invalid_args() -> No
     ]
     for bad_kwargs in invalid_kwargs_list:
         with pytest.raises(ValueError, match="."):
-            ToyModel(**bad_kwargs)
+            DummySRNet(**bad_kwargs)
 
 
 def test_t2_b02_l1_loss_zero_diff_large_residuals_and_invalid_reduction() -> None:
@@ -247,8 +246,8 @@ def test_t2_b06_misc_safetensors_aliasing_noncontig_and_load_weights_errors(
     """F19: save_safetensors handles non-contiguous/aliased/grad tensors; load_weights error paths."""
     import torch
     from safetensors.torch import load_file
+    from tests.dummy_arch import DummySRNet
 
-    from archs import ToyModel
     from utils.misc import load_weights, save_safetensors
 
     base = torch.arange(12, dtype=torch.float32).reshape(3, 4)
@@ -269,7 +268,7 @@ def test_t2_b06_misc_safetensors_aliasing_noncontig_and_load_weights_errors(
     assert torch.equal(loaded["b"], base)
     assert torch.equal(loaded["c"], grad_t.detach())
 
-    net = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
+    net = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
     with pytest.raises(FileNotFoundError):
         load_weights(net, e2e_workdir["work"] / "nonexistent_weights.safetensors", strict=True)
 

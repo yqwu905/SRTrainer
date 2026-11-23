@@ -1,8 +1,8 @@
 defaults:
-  - arch: toy_x4
+  - arch: vosr2
   - loss: l1
   - model: sr
-  - data: mixed_sr_x4
+  - data: mixed_sr
   - optim: adamw_cosine
   - metric: sr_default
   - trainer: default
@@ -11,8 +11,8 @@ defaults:
   - override hydra/job_logging: disabled
 
 # Global variables shared across config groups via ${...} interpolation
-exp_name: debug_sr_x4
-scale: 4
+exp_name: debug_vosr2
+scale: 1
 seed: 42
 output_root: experiments
 work_dir: ${output_root}/${exp_name}

@@ -137,7 +137,7 @@ class MixedSRDataset(Dataset[dict[str, Any]]):
         self,
         sources: Sequence[Mapping[str, Any]],
         gt_size: int,
-        scale: int = 4,
+        scale: int = 1,
         augment: Mapping[str, Any] | None = None,
         has_degradation: bool = True,
         kernel_cfg: Mapping[str, Any] | None = None,

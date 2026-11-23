@@ -261,15 +261,15 @@ def test_t3_2proc_distributed_validation_odd_suite_exact_gather_parity(
     import torch
     from omegaconf import OmegaConf
     from safetensors.torch import load_file
+    from tests.dummy_arch import DummySRNet
 
-    from archs import ToyModel
     from engine.inferencer import TiledInferencer
     from metrics import PSNRMetric
     from utils.image import load_image
     from utils.misc import load_weights, save_safetensors
 
     torch.manual_seed(909)
-    frozen_net = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
+    frozen_net = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
     frozen_st = save_safetensors(
         frozen_net.state_dict(), e2e_workdir["work"] / "frozen_toy.safetensors"
     )
@@ -308,7 +308,7 @@ def test_t3_2proc_distributed_validation_odd_suite_exact_gather_parity(
     val_json.write_text(json.dumps(entries, indent=2), encoding="utf-8")
 
     # Compute exact analytical oracle in-process with identical TiledInferencer & PSNRMetric.
-    oracle_net = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
+    oracle_net = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
     load_weights(oracle_net, frozen_st, strict=True)
     oracle_inf = TiledInferencer(
         model=oracle_net,

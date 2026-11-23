@@ -462,10 +462,12 @@ def test_mixed_dataset_inline_and_external_glyphs_and_collate(tmp_path: Path) ->
 
 def test_hydra_configs_vosr2_ocr_kl_and_glyph() -> None:
     with hydra.initialize_config_dir(config_dir=CONFIGS_DIR, version_base=None):
-        cfg = hydra.compose(config_name="train", overrides=["experiment=exp02_vosr2_x4"])
+        cfg = hydra.compose(config_name="train", overrides=["experiment=vosr2_onestep_text"])
 
-    assert cfg.exp_name == "exp02_vosr2_onestep_text_x4"
+    assert cfg.exp_name == "vosr2_onestep_text"
+    assert cfg.scale == 1
     assert cfg.arch._target_ == "archs.VOSR2OneStep"
+    assert cfg.arch.scale == 1
     assert cfg.arch.hidden_size == 1536
     assert cfg.arch.depth == 36
     assert cfg.arch.num_heads == 24
@@ -477,6 +479,15 @@ def test_hydra_configs_vosr2_ocr_kl_and_glyph() -> None:
     assert cfg.data.augment.hflip is False
     assert cfg.data.augment.vflip is False
     assert cfg.data.augment.rot90 is False
+    assert cfg.trainer.val_tile.overlap == 64
+    assert cfg.trainer.val_tile.pad_multiple == 16
+
+    # Default VOSR2OneStep scale=1 (no upscale) produces same-resolution output
+    model_x1 = _make_tiny_vosr2(scale=1).eval()
+    assert model_x1.scale == 1
+    with torch.no_grad():
+        out_x1 = model_x1(torch.rand(1, 3, 19, 23))
+    assert out_x1.shape == (1, 3, 19, 23)
 
 
 def test_end_to_end_trainer_vosr2_with_ocr_kl_and_glyph_losses(

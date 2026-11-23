@@ -240,6 +240,9 @@ def test_t2_a06_hydra_composition_invalid_overrides_fail_fast(
 
     invalid_override_cases = [
         ["experiment=nonexistent_exp_xyz"],
+        ["experiment=base_sr_x4"],
+        ["experiment=exp01_toy_mixed_x4"],
+        ["arch=toy_x4"],
         ["arch=rrdbnet_x4"],
         ["arch=swinir_x4"],
         ["loss=charbonnier"],
@@ -267,7 +270,7 @@ def test_t2_a07_hydra_cli_edge_overrides_and_partial_loss_override(
 
     cfg_zero_lpips = hydra_compose(
         "train",
-        overrides=["experiment=exp01_toy_mixed_x4", "loss.lpips.weight=0.0"],
+        overrides=["experiment=vosr2_onestep_text", "loss.lpips.weight=0.0"],
     )
     assert cfg_zero_lpips.loss.lpips.weight == pytest.approx(0.0)
     assert cfg_zero_lpips.loss.l1.weight == pytest.approx(1.0)
@@ -363,10 +366,11 @@ def test_t2_a09_static_audit_all_configs_yaml_contracts(configs_dir: Path) -> No
     import yaml
 
     yaml_files = sorted(configs_dir.rglob("*.yaml"))
-    assert len(yaml_files) >= 15, f"Expected >= 15 YAML config files, found {len(yaml_files)}"
+    assert len(yaml_files) >= 12, f"Expected >= 12 YAML config files, found {len(yaml_files)}"
 
     forbidden_tokens = (
         "SRPredictor",
+        "ToyModel",
         "RRDBNet",
         "SwinIR",
         "TinySRNet",
@@ -414,7 +418,7 @@ def test_t2_a09_static_audit_all_configs_yaml_contracts(configs_dir: Path) -> No
             assert "mode" not in all_keys, f"Legacy 'mode' key forbidden in {data_yaml}"
 
     arch_files = {p.name for p in (configs_dir / "arch").glob("*.yaml")}
-    assert arch_files == {"toy_x4.yaml", "vosr2_x4.yaml"}, (
+    assert arch_files == {"vosr2.yaml"}, (
         f"Unexpected arch configs: {sorted(arch_files)}"
     )
 

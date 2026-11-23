@@ -1,6 +1,0 @@
-_target_: archs.ToyModel
-num_in_ch: 3
-num_out_ch: 3
-num_feat: 32
-num_block: 2
-scale: ${scale}

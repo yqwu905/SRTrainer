@@ -203,7 +203,7 @@ class VOSR2OneStep(VOSR2DiT):
 
     def __init__(
         self,
-        scale: int = 4,
+        scale: int = 1,
         # VOSR2 DiT backbone defaults (exact VOSR2/args.json 1.4B configuration)
         input_size: int = 64,
         patch_size: int = 2,

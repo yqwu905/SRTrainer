@@ -12,20 +12,19 @@ from pathlib import Path
 import pytest
 
 
-def test_t1_toymodel_scales_arbitrary_dims_and_backward() -> None:
-    """F13: ToyModel supports scales {1,2,3,4}, even/prime odd dims, finite grads & eval determinism."""
+def test_t1_dummysrnet_scales_arbitrary_dims_and_backward() -> None:
+    """F13: Test dummy SR network supports scales {1,2,3,4}, odd dims, finite grads & eval determinism."""
     import torch
+    from tests.dummy_arch import DummySRNet
 
-    from archs import ToyModel
-
-    # Default constructor contract check (num_in_ch=3, num_out_ch=3, num_feat=32, num_block=2, scale=4).
-    default_net = ToyModel()
+    # Default constructor contract check (default scale=1).
+    default_net = DummySRNet()
     default_out = default_net(torch.rand(1, 3, 4, 4, dtype=torch.float32))
-    assert default_out.shape == (1, 3, 16, 16)
+    assert default_out.shape == (1, 3, 4, 4)
     assert torch.isfinite(default_out).all()
 
     for scale in (1, 2, 3, 4):
-        net = ToyModel(
+        net = DummySRNet(
             num_in_ch=3,
             num_out_ch=3,
             num_feat=8,
@@ -46,7 +45,7 @@ def test_t1_toymodel_scales_arbitrary_dims_and_backward() -> None:
             assert x.grad is not None and torch.isfinite(x.grad).all()
             for name, param in net.named_parameters():
                 if param.requires_grad:
-                    assert param.grad is not None, f"Missing gradient on ToyModel.{name} (s={scale})"
+                    assert param.grad is not None, f"Missing gradient on DummySRNet.{name} (s={scale})"
                     assert torch.isfinite(param.grad).all(), f"Non-finite gradient on {name}"
 
         # Eval determinism check on prime odd input.
@@ -59,19 +58,18 @@ def test_t1_toymodel_scales_arbitrary_dims_and_backward() -> None:
 
 
 def test_t1_archs_and_losses_export_exclusivity() -> None:
-    """F02, F13-F15, Req #5: archs exports ONLY ToyModel; losses ONLY L1/LPIPS."""
+    """F02, F13-F15, Req #5: archs exports ONLY VOSR2OneStep; losses export built-ins."""
     import hydra.utils
 
     import archs as archs_pkg
     import losses as losses_pkg
 
     assert hasattr(archs_pkg, "__all__")
-    assert set(archs_pkg.__all__) == {"ToyModel", "VOSR2OneStep"}, (
+    assert set(archs_pkg.__all__) == {"VOSR2OneStep"}, (
         f"Unexpected archs.__all__: {archs_pkg.__all__!r}"
     )
-    for sym in ("ToyModel", "VOSR2OneStep"):
-        assert hydra.utils.get_class(f"archs.{sym}") is getattr(archs_pkg, sym)
-    for forbidden_arch in ("RRDBNet", "SwinIR", "TinySRNet"):
+    assert hydra.utils.get_class("archs.VOSR2OneStep") is archs_pkg.VOSR2OneStep
+    for forbidden_arch in ("ToyModel", "RRDBNet", "SwinIR", "TinySRNet"):
         assert not hasattr(archs_pkg, forbidden_arch), (
             f"Forbidden architecture {forbidden_arch!r} exposed in archs"
         )
@@ -265,8 +263,8 @@ def test_t1_misc_safetensors_and_pth_weight_roundtrip(e2e_workdir: dict[str, Pat
     """F19: strip_state_dict_prefix, atomic save_safetensors, load_weights (.safetensors/.pth)."""
     import torch
     from safetensors import safe_open
+    from tests.dummy_arch import DummySRNet
 
-    from archs import ToyModel
     from utils.misc import load_weights, save_safetensors, strip_state_dict_prefix
 
     raw_sd = {
@@ -280,7 +278,7 @@ def test_t1_misc_safetensors_and_pth_weight_roundtrip(e2e_workdir: dict[str, Pat
     assert set(stripped.keys()) == {"conv.weight", "conv.bias", "head.weight"}
 
     torch.manual_seed(7)
-    ref_net = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
+    ref_net = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
     ref_sd = {k: v.detach().cpu().clone() for k, v in ref_net.state_dict().items()}
 
     weights_dir = e2e_workdir["work"] / "weights"
@@ -293,7 +291,7 @@ def test_t1_misc_safetensors_and_pth_weight_roundtrip(e2e_workdir: dict[str, Pat
     with safe_open(str(st_path), framework="pt", device="cpu") as fh:
         assert fh.metadata().get("step") == "10"
 
-    fresh = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
+    fresh = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
     with torch.no_grad():
         for p in fresh.parameters():
             p.zero_()
@@ -307,7 +305,7 @@ def test_t1_misc_safetensors_and_pth_weight_roundtrip(e2e_workdir: dict[str, Pat
     zero_sd = {k: torch.zeros_like(v) for k, v in ref_sd.items()}
     torch.save({"params_ema": ref_sd, "params": zero_sd}, pth_path)
 
-    fresh_pth = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
+    fresh_pth = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
     with torch.no_grad():
         for p in fresh_pth.parameters():
             p.zero_()

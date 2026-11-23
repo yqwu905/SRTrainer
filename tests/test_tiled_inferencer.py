@@ -19,13 +19,13 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 from torch import nn
 from torch.nn import functional as F
 
-from archs import ToyModel
 from engine import inferencer as inferencer_mod
 from engine.inferencer import (
     TiledInferencer,
     build_blend_window,
     compute_tile_starts,
 )
+from tests.dummy_arch import DummySRNet
 from utils.config import save_resolved_config
 from utils.image import load_image, save_image
 from utils.misc import save_safetensors
@@ -171,7 +171,7 @@ def _make_constant_toy_state_dict(
     num_feat: int = 8,
     num_block: int = 1,
 ) -> dict[str, torch.Tensor]:
-    model = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=num_feat, num_block=num_block, scale=scale)
+    model = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=num_feat, num_block=num_block, scale=scale)
     with torch.no_grad():
         for param in model.parameters():
             param.zero_()
@@ -199,7 +199,7 @@ def _make_exp_dir(
         cfg_dict: dict[str, Any] = {
             "scale": scale,
             "arch": {
-                "_target_": "archs.ToyModel",
+                "_target_": "tests.dummy_arch.DummySRNet",
                 "num_in_ch": 3,
                 "num_out_ch": 3,
                 "num_feat": num_feat,
@@ -455,7 +455,7 @@ def test_tiled_inferencer_feathering_seamless_all_blend_modes(blend_mode: str, s
 
 def test_tiled_inferencer_batch_size_equivalence_and_chunking() -> None:
     torch.manual_seed(42)
-    model = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
+    model = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
     lq = _make_gradient_tensor(55, 67, batch=1)
 
     outs = {}
@@ -566,8 +566,8 @@ def test_tiled_inferencer_shapes_clamp_training_preservation_and_cpu_mp(
         with pytest.raises(ValueError):
             inf.infer_tensor(torch.zeros(bad_shape, dtype=torch.float32))
 
-    # Wrong channel count rejected by ToyModel
-    toy = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
+    # Wrong channel count rejected by DummySRNet
+    toy = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
     inf_toy = TiledInferencer(model=toy, scale=2, tile_size=16, tile_overlap=4)
     with pytest.raises(ValueError, match="channels"):
         inf_toy.infer_tensor(torch.zeros((1, 4, 16, 16), dtype=torch.float32))
@@ -775,7 +775,7 @@ def test_infer_mode1_exp_dir_auto_restore_and_weight_priority(tmp_path: Path) ->
     handler = _ListHandler(level=logging.WARNING)
     warn_logger.addHandler(handler)
     try:
-        cfg_with_arch = _compose_infer([f"infer.exp_dir={exp_val_no_ema}", "arch=toy_x4"])
+        cfg_with_arch = _compose_infer([f"infer.exp_dir={exp_val_no_ema}", "arch=vosr2"])
         resolved_with_arch = infer_mod.resolve_infer_config(cfg_with_arch, logger=warn_logger)
     finally:
         warn_logger.removeHandler(handler)
@@ -842,18 +842,21 @@ def test_infer_mode2_standalone_safetensors_pth_and_errors(tmp_path: Path) -> No
     lq_tensor = _make_rgb_image(in_img, h=15, w=19)
 
     torch.manual_seed(7)
-    model = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
+    model = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
     st_path = tmp_path / "toy_x2.safetensors"
     save_safetensors(model.state_dict(), st_path)
+
+    dummy_arch_ov = (
+        "++arch={_target_:tests.dummy_arch.DummySRNet,"
+        "num_in_ch:3,num_out_ch:3,num_feat:8,num_block:1,scale:2}"
+    )
 
     # Standalone with safetensors + tile.size="auto" (no gt_size -> untiled fallback)
     out_st = tmp_path / "out_st"
     cfg_st = _compose_infer(
         [
-            "arch=toy_x4",
+            dummy_arch_ov,
             "scale=2",
-            "arch.num_feat=8",
-            "arch.num_block=1",
             f"infer.weights_path={st_path}",
             f"infer.input={in_img}",
             f"infer.output_dir={out_st}",
@@ -882,10 +885,8 @@ def test_infer_mode2_standalone_safetensors_pth_and_errors(tmp_path: Path) -> No
     out_pth = tmp_path / "out_pth"
     cfg_pth = _compose_infer(
         [
-            "arch=toy_x4",
+            dummy_arch_ov,
             "scale=2",
-            "arch.num_feat=8",
-            "arch.num_block=1",
             f"infer.weights_path={pth_path}",
             "infer.weights_key=params_ema",
             f"infer.input={in_img}",
@@ -914,7 +915,7 @@ def test_infer_mode2_standalone_safetensors_pth_and_errors(tmp_path: Path) -> No
         infer_mod.run_infer(
             _compose_infer(
                 [
-                    "arch=toy_x4",
+                    "arch=vosr2",
                     f"infer.input={in_img}",
                     f"infer.output_dir={tmp_path / 'e_no_w'}",
                 ]
@@ -925,7 +926,7 @@ def test_infer_mode2_standalone_safetensors_pth_and_errors(tmp_path: Path) -> No
         infer_mod.run_infer(
             _compose_infer(
                 [
-                    "arch=toy_x4",
+                    "arch=vosr2",
                     f"infer.weights_path={tmp_path / 'missing.safetensors'}",
                     f"infer.input={in_img}",
                     f"infer.output_dir={tmp_path / 'e_missing_w'}",
@@ -937,10 +938,8 @@ def test_infer_mode2_standalone_safetensors_pth_and_errors(tmp_path: Path) -> No
         infer_mod.run_infer(
             _compose_infer(
                 [
-                    "arch=toy_x4",
+                    dummy_arch_ov,
                     "scale=2",
-                    "arch.num_feat=8",
-                    "arch.num_block=1",
                     f"infer.weights_path={pth_path}",
                     f"infer.input={in_img}",
                     f"infer.output_dir={tmp_path / 'e_no_key'}",
@@ -953,10 +952,8 @@ def test_infer_mode2_standalone_safetensors_pth_and_errors(tmp_path: Path) -> No
         infer_mod.run_infer(
             _compose_infer(
                 [
-                    "arch=toy_x4",
+                    dummy_arch_ov,
                     "scale=2",
-                    "arch.num_feat=8",
-                    "arch.num_block=1",
                     f"infer.weights_path={st_path}",
                     "infer.weights_key=params_ema",
                     f"infer.input={in_img}",
@@ -971,7 +968,7 @@ def test_infer_input_output_modes_single_dir_recursive_and_json(tmp_path: Path) 
     infer_mod = _load_infer_module()
     # Use a ToyModel that actually depends on input pixels so distinct inputs give distinct outputs
     torch.manual_seed(123)
-    model = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
+    model = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
     exp_dir = _make_exp_dir(tmp_path / "exp_io", scale=2, gt_size=32, weights_spec={})
     save_safetensors(model.state_dict(), exp_dir / "weights" / "latest.safetensors")
 
@@ -1196,6 +1193,9 @@ def _run_subprocess(cmd: list[str], cwd: str = "/tmp") -> subprocess.CompletedPr
     env = os.environ.copy()
     env["ACCELERATE_USE_CPU"] = "true"
     env["OMP_NUM_THREADS"] = "1"
+    existing_pp = env.get("PYTHONPATH", "")
+    extra_pp = f"{REPO_ROOT}:{REPO_ROOT / 'src'}"
+    env["PYTHONPATH"] = f"{extra_pp}:{existing_pp}" if existing_pp else extra_pp
     return subprocess.run(
         cmd,
         cwd=cwd,
@@ -1209,7 +1209,7 @@ def _run_subprocess(cmd: list[str], cwd: str = "/tmp") -> subprocess.CompletedPr
 
 def test_infer_cli_distributed_2proc_cpu_5_images_from_tmp(tmp_path: Path) -> None:
     torch.manual_seed(99)
-    model = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
+    model = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
     exp_dir = _make_exp_dir(tmp_path / "exp_dist5", scale=2, gt_size=32, weights_spec={})
     save_safetensors(model.state_dict(), exp_dir / "weights" / "best_set5_psnr.safetensors")
 
@@ -1272,7 +1272,7 @@ def test_infer_cli_distributed_2proc_cpu_5_images_from_tmp(tmp_path: Path) -> No
 
 def test_infer_cli_distributed_2proc_cpu_single_image_lt_world_size(tmp_path: Path) -> None:
     torch.manual_seed(11)
-    model = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
+    model = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
     exp_dir = _make_exp_dir(tmp_path / "exp_dist1", scale=2, gt_size=32, weights_spec={})
     save_safetensors(model.state_dict(), exp_dir / "weights" / "latest.safetensors")
 

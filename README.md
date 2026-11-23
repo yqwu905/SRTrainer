@@ -8,7 +8,7 @@
 
 - **分层训练引擎 + Accelerate**：`Trainer` 统一管理 `Accelerator`、纯 Iteration 驱动循环、多验证集分布式精确评估（`gather_for_metrics`）、双轨 Checkpoint 与多 Tracker 日志；`BaseModel` / `SRModel` 封装网络、FP32 `ModelEMA`、任意可组合 Loss 字典与单步更新（`lr_scheduler` 不经 `prepare()`，避免多卡倍速步进）。
 - **纯 Hydra `_target_` 分级配置与多级继承**：按 `arch / loss / model / data / optim / metric / trainer / infer` 拆分原子配置组，在 `configs/experiment/` 中通过 `# @package _global_` 多级继承并快速覆写局部参数；包级 `__init__.py` 提供短路径重导出。
-- **内置网络与损失函数**：`src/archs/` 提供轻量占位网络 `archs.ToyModel` 与单步生成超分网络 `archs.VOSR2OneStep`（含冻结 Qwen-Image 2D VAE 与 DINOv2-ViT-L/14，权重与官方 VOSR2 checkpoint 键完全对齐）；`src/losses/` 内置 `L1Loss`、`LPIPSLoss`、基于冻结 PP-OCRv5 的 `OCRKLLoss` 与基于冻结 TextVerifier Stage-3 的 `GlyphLoss`，同时支持通过 Hydra `_target_` 直接接入任意自定义网络与损失函数。
+- **内置网络与损失函数**：`src/archs/` 提供单步生成复原/超分网络 `archs.VOSR2OneStep`（含冻结 Qwen-Image 2D VAE 与 DINOv2-ViT-L/14，默认 `scale=1` 无上采样复原，也支持任意正整数倍率，权重与官方 VOSR2 checkpoint 键完全对齐）；`src/losses/` 内置 `L1Loss`、`LPIPSLoss`、基于冻结 PP-OCRv5 的 `OCRKLLoss` 与基于冻结 TextVerifier Stage-3 的 `GlyphLoss`，同时支持通过 Hydra `_target_` 直接接入任意自定义网络与损失函数。
 - **统一 JSON 清单 + 样本级混合与 GPU 掩码 Real-ESRGAN 退化**：
   - 仅读取独立图像文件（`.jpg/.png/.jpeg/.webp`），`gt_only` 与 `paired` 统一使用字典列表 JSON，自动根据样本是否含有效 `lq` 判定模式（配置中无需 `mode`）；支持在清单内嵌 `text_lines` / `glyphs` 或在数据源上挂载 VOSR `glyphs_json` 以启用 `GlyphLoss`；
   - `MixedSRDataset` + `DistributedWeightedInfiniteSampler` 严格按 `ratio` 跨数据源采样并支持 O(1) 断点续训；
@@ -75,14 +75,14 @@ uv sync --extra trackers
 ```bash
 # 单卡或通过 accelerate launch 启动多卡训练（基于实验继承配置并临时覆写参数）
 uv run accelerate launch tools/train.py \
-  experiment=exp01_toy_mixed_x4 \
-  optim.optimizer.lr=5e-5 \
-  trainer.total_iters=50000 \
+  experiment=vosr2_onestep_text \
+  optim.optimizer.lr=5e-6 \
+  trainer.total_iters=10000 \
   trainer.log_with='[tensorboard]'
 
 # 自动从最近一次状态目录精确续训
 uv run accelerate launch tools/train.py \
-  experiment=exp01_toy_mixed_x4 \
+  experiment=vosr2_onestep_text \
   trainer.resume=auto
 ```
 
@@ -91,30 +91,30 @@ uv run accelerate launch tools/train.py \
 ```bash
 # 实验目录自动还原模式（自动加载 config_resolved.yaml、最优/EMA 权重与训练输入尺寸 tile_size）
 uv run python tools/infer.py \
-  infer.exp_dir=experiments/exp01_toy_l1_lpips_x4 \
+  infer.exp_dir=experiments/vosr2_onestep_text \
   infer.input=/data/test_imgs \
-  infer.output_dir=outputs/exp01_test \
+  infer.output_dir=outputs/vosr2_test \
   infer.tile.size=auto \
-  infer.tile.overlap=16
+  infer.tile.overlap=64
 
 # 多卡分布式离线推理 JSON 清单
 uv run accelerate launch --num_processes 4 tools/infer.py \
-  infer.exp_dir=experiments/exp01_toy_l1_lpips_x4 \
+  infer.exp_dir=experiments/vosr2_onestep_text \
   infer.input=/data/manifests/large_test.json \
   infer.input_root=/data/large_test \
-  infer.output_dir=outputs/exp01_large_test \
+  infer.output_dir=outputs/vosr2_large_test \
   infer.tile.size=auto \
-  infer.tile.overlap=16 \
-  infer.tile.batch_size=8
+  infer.tile.overlap=64 \
+  infer.tile.batch_size=1
 
 # 独立配置模式（不依赖训练实验目录）
 uv run python tools/infer.py \
-  arch=toy_x4 \
-  scale=4 \
+  arch=vosr2 \
+  scale=1 \
   infer.weights_path=/path/to/weights.safetensors \
   infer.input=/data/test.png \
-  infer.tile.size=64 \
-  infer.tile.overlap=16
+  infer.tile.size=512 \
+  infer.tile.overlap=64
 ```
 
 ### 3. 扩展自定义组件

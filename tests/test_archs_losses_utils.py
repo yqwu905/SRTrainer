@@ -25,8 +25,8 @@ from PIL import Image
 from safetensors import safe_open
 from torch.nn import functional as F
 
-from archs import ToyModel
 from losses import L1Loss, LPIPSLoss
+from tests.dummy_arch import DummySRNet
 from utils import (
     IMAGE_EXTENSIONS,
     flatten_config_for_tracker,
@@ -66,17 +66,17 @@ def reset_accelerate_state():
 
 
 # ---------------------------------------------------------------------------
-# Architecture: ToyModel (ONLY architecture)
+# Test-only DummySRNet sanity check
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("scale", [1, 2, 3, 4, 5])
 @pytest.mark.parametrize("in_hw", [(1, 1), (7, 11)])
-def test_toymodel_scales_arbitrary_sizes_grad_and_bf16(
+def test_dummysrnet_scales_arbitrary_sizes_grad_and_bf16(
     scale: int,
     in_hw: tuple[int, int],
 ) -> None:
-    net = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=16, num_block=2, scale=scale)
+    net = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=16, num_block=2, scale=scale)
     x = torch.randn(2, 3, *in_hw, requires_grad=True)
     y = net(x)
     assert y.shape == (2, 3, in_hw[0] * scale, in_hw[1] * scale)
@@ -90,28 +90,28 @@ def test_toymodel_scales_arbitrary_sizes_grad_and_bf16(
     assert torch.isfinite(y_bf16).all()
 
 
-def test_toymodel_zero_blocks_channels_and_strict_validation() -> None:
-    net_zero = ToyModel(num_in_ch=1, num_out_ch=3, num_feat=8, num_block=0, scale=2)
+def test_dummysrnet_zero_blocks_channels_and_strict_validation() -> None:
+    net_zero = DummySRNet(num_in_ch=1, num_out_ch=3, num_feat=8, num_block=0, scale=2)
     assert net_zero(torch.randn(1, 1, 5, 7)).shape == (1, 3, 10, 14)
 
     # Strict validation: reject bool, float (e.g. 4.0), and <= 0 for positive-int args
     for bad_pos in (0, -1, -4, False, True, 4.0, 2.5, "4", None):
         with pytest.raises(ValueError):
-            ToyModel(scale=bad_pos)  # type: ignore[arg-type]
+            DummySRNet(scale=bad_pos)  # type: ignore[arg-type]
         with pytest.raises(ValueError):
-            ToyModel(num_in_ch=bad_pos)  # type: ignore[arg-type]
+            DummySRNet(num_in_ch=bad_pos)  # type: ignore[arg-type]
         with pytest.raises(ValueError):
-            ToyModel(num_out_ch=bad_pos)  # type: ignore[arg-type]
+            DummySRNet(num_out_ch=bad_pos)  # type: ignore[arg-type]
         with pytest.raises(ValueError):
-            ToyModel(num_feat=bad_pos)  # type: ignore[arg-type]
+            DummySRNet(num_feat=bad_pos)  # type: ignore[arg-type]
 
     # Strict validation: reject < 0, bool, float for num_block
     for bad_blocks in (-1, -5, False, True, 2.0, 1.5, "2", None):
         with pytest.raises(ValueError):
-            ToyModel(num_block=bad_blocks)  # type: ignore[arg-type]
+            DummySRNet(num_block=bad_blocks)  # type: ignore[arg-type]
 
     # Forward input validation
-    net = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
+    net = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
     with pytest.raises(TypeError):
         net(np.zeros((1, 3, 4, 4), dtype=np.float32))  # type: ignore[arg-type]
     with pytest.raises(ValueError):
@@ -346,21 +346,21 @@ def test_setup_experiment_dirs_and_resolved_config_io(tmp_path: Path) -> None:
     for d in dirs_main.values():
         assert d.is_dir()
 
-    # Resolved config save / load round-trip on real Hydra exp01_toy_mixed_x4 config
+    # Resolved config save / load round-trip on real Hydra vosr2_onestep_text config
     with hydra.initialize_config_dir(config_dir=CONFIGS_DIR, version_base=None):
-        hydra_cfg = hydra.compose(config_name="train", overrides=["experiment=exp01_toy_mixed_x4"])
+        hydra_cfg = hydra.compose(config_name="train", overrides=["experiment=vosr2_onestep_text"])
     cfg_path = main_root / "config_resolved.yaml"
     save_resolved_config(hydra_cfg, cfg_path)
     raw_yaml = cfg_path.read_text(encoding="utf-8")
     assert "${" not in raw_yaml
 
     loaded = load_resolved_config(cfg_path)
-    assert loaded.exp_name == "exp01_toy_l1_lpips_x4"
-    assert loaded.work_dir == "experiments/exp01_toy_l1_lpips_x4"
-    assert loaded.arch._target_ == "archs.ToyModel"
-    assert loaded.arch.num_feat == 16
-    assert loaded.optim.scheduler.T_max == 200000
-    assert list(loaded.optim.optimizer.betas) == [0.9, 0.99]
+    assert loaded.exp_name == "vosr2_onestep_text"
+    assert loaded.work_dir == "experiments/vosr2_onestep_text"
+    assert loaded.arch._target_ == "archs.VOSR2OneStep"
+    assert loaded.arch.depth == 36
+    assert loaded.optim.scheduler.T_max == 10000
+    assert list(loaded.optim.optimizer.betas) == [0.9, 0.95]
 
     with pytest.raises(FileNotFoundError):
         load_resolved_config(tmp_path / "missing.yaml")
@@ -407,19 +407,19 @@ def test_flatten_config_for_tracker_and_real_tensorboard_init(
     reset_accelerate_state,
 ) -> None:
     with hydra.initialize_config_dir(config_dir=CONFIGS_DIR, version_base=None):
-        cfg = hydra.compose(config_name="train", overrides=["experiment=exp01_toy_mixed_x4"])
+        cfg = hydra.compose(config_name="train", overrides=["experiment=vosr2_onestep_text"])
 
     flat = flatten_config_for_tracker(cfg)
     assert len(flat) > 10
     for k, v in flat.items():
         assert isinstance(k, str)
         assert type(v) in (bool, int, float, str), f"Unsafe type {type(v)} for {k}={v!r}"
-    assert flat["exp_name"] == "exp01_toy_l1_lpips_x4"
-    assert flat["arch._target_"] == "archs.ToyModel"
-    assert flat["arch.num_feat"] == 16
+    assert flat["exp_name"] == "vosr2_onestep_text"
+    assert flat["arch._target_"] == "archs.VOSR2OneStep"
+    assert flat["arch.depth"] == 36
     assert flat["model.pretrain_path"] == "null"
     assert flat["data.sources.0.name"] == "df2k_gt"
-    assert flat["optim.optimizer.betas"] == "[0.9, 0.99]"
+    assert flat["optim.optimizer.betas"] == "[0.9, 0.95]"
     assert yaml.safe_dump(flat)
 
     # Regression for Challenger 2 Defect 2: multi-element np.ndarray & IntEnum/StrEnum/subclasses
@@ -768,9 +768,9 @@ def test_strip_prefix_save_safetensors_and_load_weights(tmp_path: Path) -> None:
         assert f.metadata() == {"step": "42"}
         assert set(f.keys()) == {"weight", "bias", "nested", "other", "plain"}
 
-    # Round-trip load_weights with .safetensors (strict=True & strict=False) using ToyModel
-    model_src = ToyModel(num_feat=8, num_block=1, scale=2)
-    model_dst = ToyModel(num_feat=8, num_block=1, scale=2)
+    # Round-trip load_weights with .safetensors (strict=True & strict=False) using DummySRNet
+    model_src = DummySRNet(num_feat=8, num_block=1, scale=2)
+    model_dst = DummySRNet(num_feat=8, num_block=1, scale=2)
     prefixed_sd = {f"module._orig_mod.{k}": v for k, v in model_src.state_dict().items()}
     w_path = save_safetensors(prefixed_sd, tmp_path / "toy.safetensors")
 
@@ -797,12 +797,12 @@ def test_strip_prefix_save_safetensors_and_load_weights(tmp_path: Path) -> None:
     # .pth flat & nested checkpoints
     pth_flat = tmp_path / "flat.pth"
     torch.save(prefixed_sd, pth_flat)
-    model_dst2 = ToyModel(num_feat=8, num_block=1, scale=2)
+    model_dst2 = DummySRNet(num_feat=8, num_block=1, scale=2)
     assert load_weights(model_dst2, pth_flat, strict=True) == ([], [])
 
     pth_nested = tmp_path / "nested.pth"
     torch.save({"params_ema": prefixed_sd, "params": prefixed_sd}, pth_nested)
-    model_dst3 = ToyModel(num_feat=8, num_block=1, scale=2)
+    model_dst3 = DummySRNet(num_feat=8, num_block=1, scale=2)
     assert load_weights(model_dst3, pth_nested, strict=True, key="params_ema") == ([], [])
 
     with pytest.raises(KeyError, match="params_ema"):

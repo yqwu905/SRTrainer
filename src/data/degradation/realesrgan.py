@@ -337,7 +337,7 @@ class RealESRGANDegrader(nn.Module):
 
     def __init__(
         self,
-        scale: int = 4,
+        scale: int = 1,
         use_usm: bool = False,
         queue_size: int = 0,
         kernel_cfg: Mapping[str, Any] | None = None,

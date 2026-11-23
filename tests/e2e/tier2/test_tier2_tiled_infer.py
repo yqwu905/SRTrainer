@@ -20,11 +20,11 @@ import pytest
 def test_t2_f01_tiled_inferencer_rejects_invalid_tile_overlap() -> None:
     """F36: TiledInferencer rejects overlap >= tile_size // 2 or < 0, accepts tight valid overlap."""
     import torch
+    from tests.dummy_arch import DummySRNet
 
-    from archs import ToyModel
     from engine.inferencer import TiledInferencer
 
-    model = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
+    model = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
     lq = torch.rand(1, 3, 40, 40, dtype=torch.float32)
 
     invalid_pairs: list[tuple[int | list[int], int]] = [
@@ -70,12 +70,12 @@ def test_t2_f02_tiled_inferencer_rejects_invalid_tile_size_blend_batch_and_auto_
 ):
     """F36: TiledInferencer rejects bad tile_size, non-positive auto tile_size, blend, batch_size."""
     import torch
+    from tests.dummy_arch import DummySRNet
 
-    from archs import ToyModel
     from engine.inferencer import TiledInferencer
 
-    model_x2 = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
-    model_x4 = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=4).eval()
+    model_x2 = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
+    model_x4 = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=4).eval()
     lq = torch.rand(1, 3, 32, 32, dtype=torch.float32)
 
     invalid_configs: list[dict[str, Any]] = [
@@ -105,8 +105,8 @@ def test_t2_f03_tiled_inferencer_auto_without_gt_size_falls_back_to_untiled() ->
     """F36: tile_size='auto' with gt_size=None falls back to single untiled padded forward."""
     import torch
     import torch.nn as nn
+    from tests.dummy_arch import DummySRNet
 
-    from archs import ToyModel
     from engine.inferencer import TiledInferencer
 
     class _CallShapeRecorder(nn.Module):
@@ -120,7 +120,7 @@ def test_t2_f03_tiled_inferencer_auto_without_gt_size_falls_back_to_untiled() ->
             return self.inner(x)
 
     torch.manual_seed(31)
-    toy = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
+    toy = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
     probe = _CallShapeRecorder(toy)
     lq = torch.rand(1, 3, 19, 23, dtype=torch.float32)
 
@@ -157,12 +157,12 @@ def test_t2_f03_tiled_inferencer_auto_without_gt_size_falls_back_to_untiled() ->
 def test_t2_f04_tiled_inferencer_tiny_replicate_fallback_and_strip_shapes() -> None:
     """F36: TiledInferencer handles ultra-tiny (replicate fallback) and skinny strip tensors."""
     import torch
+    from tests.dummy_arch import DummySRNet
 
-    from archs import ToyModel
     from engine.inferencer import TiledInferencer
 
     torch.manual_seed(34)
-    model = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
+    model = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
     inf_tiled = TiledInferencer(
         model=model,
         scale=2,
@@ -203,8 +203,8 @@ def test_t2_f05_tiled_inferencer_zero_overlap_hard_stitch_non_divisible() -> Non
     """F36: Zero-overlap hard stitch achieves exact coverage on non-divisible dims across all blends."""
     import torch
     import torch.nn as nn
+    from tests.dummy_arch import DummySRNet
 
-    from archs import ToyModel
     from engine.inferencer import TiledInferencer
 
     torch.manual_seed(35)
@@ -234,7 +234,7 @@ def test_t2_f05_tiled_inferencer_zero_overlap_hard_stitch_non_divisible() -> Non
             f"Hard stitch mismatch under blend_mode={blend_mode!r}"
         )
 
-    toy = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
+    toy = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
     out_toy = TiledInferencer(
         model=toy,
         scale=2,
@@ -255,12 +255,12 @@ def test_t2_f05_tiled_inferencer_zero_overlap_hard_stitch_non_divisible() -> Non
 def test_t2_f06_tiled_inferencer_cpu_fp16_autocast_guard() -> None:
     """F36: TiledInferencer safely guards unsupported CPU fp16 autocast to FP32 output."""
     import torch
+    from tests.dummy_arch import DummySRNet
 
-    from archs import ToyModel
     from engine.inferencer import TiledInferencer
 
     torch.manual_seed(36)
-    model = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
+    model = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2).eval()
     lq = torch.rand(1, 3, 24, 28, dtype=torch.float32)
 
     out_no = TiledInferencer(
@@ -316,7 +316,8 @@ def test_t2_f07_tools_infer_cli_fail_fast_invalid_configs(
     hydra_value_formatter: Callable[[Any], str],
 ) -> None:
     """F37, F38: tools/infer.py exits non-zero on missing inputs, arch, weights, config, or format."""
-    from archs import ToyModel
+    from tests.dummy_arch import DummySRNet
+
     from utils.misc import save_safetensors
 
     fmt = hydra_value_formatter
@@ -325,7 +326,7 @@ def test_t2_f07_tools_infer_cli_fail_fast_invalid_configs(
     )
     exp_valid = bias_tagged_exp_dir_factory(e2e_workdir["work"] / "exp_ok", scale=2, gt_size=32)
 
-    toy = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
+    toy = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
     valid_st = save_safetensors(toy.state_dict(), e2e_workdir["work"] / "standalone_toy.safetensors")
 
     # (a) infer.input=null
@@ -357,7 +358,7 @@ def test_t2_f07_tools_infer_cli_fail_fast_invalid_configs(
     # (b2) Standalone missing weights_path
     arch_ovs = standalone_infer_arch_overrides_factory(
         {
-            "_target_": "archs.ToyModel",
+            "_target_": "tests.dummy_arch.DummySRNet",
             "num_in_ch": 3,
             "num_out_ch": 3,
             "num_feat": 8,

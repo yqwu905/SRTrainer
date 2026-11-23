@@ -1,4 +1,4 @@
-"""Unit tests for Hydra config composition, multi-level inheritance, instantiation, and scope constraints."""
+"""Unit tests for Hydra config composition, inheritance, instantiation, and scope constraints."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from torch import nn
 
 import archs
 import losses
-from archs import ToyModel
+from archs import VOSR2OneStep
 from losses import L1Loss, LPIPSLoss
 from utils import normalize_mixed_precision
 
@@ -37,19 +37,18 @@ def _compose(
 def test_train_default_compose_and_interpolations() -> None:
     cfg = _compose("train", return_hydra_config=True)
 
-    assert cfg.exp_name == "debug_sr_x4"
-    assert cfg.scale == 4
+    assert cfg.exp_name == "debug_vosr2"
+    assert cfg.scale == 1
     assert cfg.seed == 42
     assert cfg.output_root == "experiments"
-    assert cfg.work_dir == "experiments/debug_sr_x4"
+    assert cfg.work_dir == "experiments/debug_vosr2"
 
     # Arch & Loss & Model
-    assert cfg.arch._target_ == "archs.ToyModel"
-    assert cfg.arch.num_in_ch == 3
-    assert cfg.arch.num_out_ch == 3
-    assert cfg.arch.num_feat == 32
-    assert cfg.arch.num_block == 2
-    assert cfg.arch.scale == 4
+    assert cfg.arch._target_ == "archs.VOSR2OneStep"
+    assert cfg.arch.scale == 1
+    assert cfg.arch.hidden_size == 1536
+    assert cfg.arch.depth == 36
+    assert cfg.arch.num_heads == 24
     assert set(cfg.loss.keys()) == {"l1"}
     assert cfg.loss.l1.weight == 1.0
     assert cfg.loss.l1.criterion._target_ == "losses.L1Loss"
@@ -59,9 +58,9 @@ def test_train_default_compose_and_interpolations() -> None:
 
     # Data & Degradation
     assert cfg.data.gt_size == 256
-    assert cfg.data.scale == 4
+    assert cfg.data.scale == 1
     assert cfg.data.degradation._target_ == "data.degradation.RealESRGANDegrader"
-    assert cfg.data.degradation.scale == 4
+    assert cfg.data.degradation.scale == 1
 
     # Optim & Metric & Trainer
     assert cfg.optim.optimizer._partial_ is True
@@ -69,7 +68,7 @@ def test_train_default_compose_and_interpolations() -> None:
     assert cfg.optim.scheduler.T_max == 300000
     assert cfg.metric.primary_dataset == "set5"
     assert cfg.metric.primary_metric == "psnr"
-    assert cfg.metric.val_suites.set5.metrics.psnr.crop_border == 4
+    assert cfg.metric.val_suites.set5.metrics.psnr.crop_border == 1
     assert cfg.trainer.total_iters == 300000
     assert cfg.trainer.append_timestamp is False
     assert cfg.trainer.val_tile.size == "auto"
@@ -78,63 +77,55 @@ def test_train_default_compose_and_interpolations() -> None:
     # Hydra runtime safeguards
     assert cfg.hydra.job.chdir is False
     assert cfg.hydra.output_subdir is None
-    assert cfg.hydra.run.dir == "experiments/debug_sr_x4"
+    assert cfg.hydra.run.dir == "experiments/debug_vosr2"
     assert cfg.hydra.job_logging.disable_existing_loggers is True
 
 
-def test_base_sr_x4_experiment() -> None:
-    cfg = _compose("train", overrides=["experiment=base_sr_x4"])
+def test_vosr2_experiment_composition() -> None:
+    cfg = _compose("train", overrides=["experiment=vosr2_onestep_text"])
 
-    assert cfg.scale == 4
-    assert cfg.arch._target_ == "archs.ToyModel"
-    assert cfg.arch.num_feat == 32
-    assert cfg.arch.num_block == 2
-    assert cfg.trainer.total_iters == 300000
-    assert cfg.trainer.val_interval == 5000
-    assert cfg.trainer.save_interval == 5000
-    assert cfg.trainer.mixed_precision == "bf16"
-    assert cfg.trainer.gradient_accumulation_steps == 1
-    assert set(cfg.loss.keys()) == {"l1"}
+    assert cfg.exp_name == "vosr2_onestep_text"
+    assert cfg.work_dir == "experiments/vosr2_onestep_text"
+    assert cfg.scale == 1
+    assert cfg.arch._target_ == "archs.VOSR2OneStep"
+    assert cfg.arch.scale == 1
+    assert cfg.arch.hidden_size == 1536
+    assert cfg.arch.depth == 36
 
-
-def test_multi_level_experiment_inheritance() -> None:
-    cfg = _compose("train", overrides=["experiment=exp01_toy_mixed_x4"])
-
-    assert cfg.exp_name == "exp01_toy_l1_lpips_x4"
-    assert cfg.work_dir == "experiments/exp01_toy_l1_lpips_x4"
-    assert cfg.scale == 4
-    assert cfg.arch._target_ == "archs.ToyModel"
-    assert cfg.arch.num_feat == 16
-    assert cfg.arch.num_block == 2
-    assert cfg.arch.scale == 4
-
-    # Group override (l1 -> l1_lpips) + localized weight override
-    assert set(cfg.loss.keys()) == {"l1", "lpips"}
-    assert cfg.loss.l1.weight == 1.0
-    assert cfg.loss.lpips.weight == 0.05
+    # Loss group override (l1 -> vosr2_text)
+    assert set(cfg.loss.keys()) == {"l1", "lpips", "ocr_kl", "glyph"}
+    assert cfg.loss.l1.criterion._target_ == "losses.L1Loss"
     assert cfg.loss.lpips.criterion._target_ == "losses.LPIPSLoss"
-    assert cfg.loss.lpips.criterion.pretrained is True
+    assert cfg.loss.ocr_kl.criterion._target_ == "losses.OCRKLLoss"
+    assert cfg.loss.glyph.criterion._target_ == "losses.GlyphLoss"
 
-    # Localized overrides & inherited values from base_sr_x4
-    assert cfg.optim.optimizer.lr == 1e-4
-    assert cfg.trainer.total_iters == 200000
-    assert cfg.optim.scheduler.T_max == 200000
-    assert cfg.trainer.val_interval == 5000
-    assert cfg.trainer.save_interval == 5000
+    # Localized overrides & cascading interpolations
+    assert cfg.data.gt_size == 512
+    assert cfg.data.scale == 1
+    assert cfg.data.augment.hflip is False
+    assert cfg.data.augment.vflip is False
+    assert cfg.data.augment.rot90 is False
+    assert cfg.optim.optimizer.lr == pytest.approx(5e-6)
+    assert list(cfg.optim.optimizer.betas) == [0.9, 0.95]
+    assert cfg.trainer.total_iters == 10000
+    assert cfg.optim.scheduler.T_max == 10000
+    assert cfg.trainer.val_interval == 1000
+    assert cfg.trainer.save_interval == 1000
     assert cfg.trainer.mixed_precision == "bf16"
-    assert cfg.trainer.tracker_init_kwargs.wandb.name == "exp01_toy_l1_lpips_x4"
+    assert cfg.trainer.val_tile.overlap == 64
+    assert cfg.trainer.val_tile.pad_multiple == 16
+    assert cfg.trainer.tracker_init_kwargs.wandb.name == "vosr2_onestep_text"
 
 
 def test_cli_overrides_precedence() -> None:
     cfg = _compose(
         "train",
         overrides=[
-            "experiment=exp01_toy_mixed_x4",
+            "experiment=vosr2_onestep_text",
             "optim.optimizer.lr=5e-5",
             "trainer.total_iters=50000",
             "trainer.log_with=[tensorboard,wandb]",
-            "arch.num_feat=8",
-            "arch.num_block=1",
+            "arch.depth=12",
             "scale=2",
             "trainer.mixed_precision=no",
             "trainer.resume=auto",
@@ -145,9 +136,8 @@ def test_cli_overrides_precedence() -> None:
     assert cfg.trainer.total_iters == 50000
     assert cfg.optim.scheduler.T_max == 50000
     assert list(cfg.trainer.log_with) == ["tensorboard", "wandb"]
-    assert cfg.arch._target_ == "archs.ToyModel"
-    assert cfg.arch.num_feat == 8
-    assert cfg.arch.num_block == 1
+    assert cfg.arch._target_ == "archs.VOSR2OneStep"
+    assert cfg.arch.depth == 12
     assert cfg.arch.scale == 2
     assert cfg.data.scale == 2
     assert cfg.data.degradation.scale == 2
@@ -157,8 +147,8 @@ def test_cli_overrides_precedence() -> None:
 
 
 def test_atomic_config_group_switches_and_disable_degradation() -> None:
-    cfg = _compose("train", overrides=["arch=toy_x4", "loss=l1_lpips", "optim=adam_multistep"])
-    assert cfg.arch._target_ == "archs.ToyModel"
+    cfg = _compose("train", overrides=["arch=vosr2", "loss=l1_lpips", "optim=adam_multistep"])
+    assert cfg.arch._target_ == "archs.VOSR2OneStep"
     assert set(cfg.loss.keys()) == {"l1", "lpips"}
     assert cfg.optim.optimizer._target_ == "torch.optim.Adam"
     assert cfg.optim.scheduler._target_ == "torch.optim.lr_scheduler.MultiStepLR"
@@ -176,7 +166,7 @@ def test_infer_yaml_dual_modes() -> None:
     # Mode 1: exp_dir auto-restore defaults
     cfg_default = _compose("infer", return_hydra_config=True)
     assert cfg_default.arch is None
-    assert cfg_default.scale == 4
+    assert cfg_default.scale == 1
     assert cfg_default.infer.exp_dir is None
     assert cfg_default.infer.use_ema is True
     assert cfg_default.infer.tile.enabled is True
@@ -188,63 +178,88 @@ def test_infer_yaml_dual_modes() -> None:
     assert cfg_default.hydra.run.dir == "outputs/infer"
     assert cfg_default.hydra.job_logging.disable_existing_loggers is True
 
-    # Mode 2: standalone arch=toy_x4 + weights override
+    # Mode 2: standalone arch=vosr2 + weights override (tiny offline params for fast CPU check)
     cfg_standalone = _compose(
         "infer",
         overrides=[
-            "arch=toy_x4",
-            "scale=4",
+            "arch=vosr2",
+            "scale=1",
             "infer.weights_path=/tmp/w.safetensors",
-            "arch.num_feat=16",
-            "arch.num_block=1",
+            "arch.input_size=8",
+            "arch.in_channels=8",
+            "arch.out_channels=4",
+            "arch.hidden_size=32",
+            "arch.depth=1",
+            "arch.num_heads=4",
+            "arch.mlp_ratio=2.0",
+            "arch.z_dims=16",
+            "arch.encdim_ratio=2",
+            "arch.vae_pretrained=false",
+            "+arch.vae_base_dim=8",
+            "+arch.vae_dim_mult=[1,2,2,2]",
+            "+arch.vae_num_res_blocks=1",
+            "arch.dino_size=28",
+            "arch.dino_layer=0",
+            "arch.dino_pretrained=false",
         ],
     )
-    assert cfg_standalone.arch._target_ == "archs.ToyModel"
-    assert cfg_standalone.arch.scale == 4
-    assert cfg_standalone.arch.num_feat == 16
-    assert cfg_standalone.arch.num_block == 1
+    assert cfg_standalone.arch._target_ == "archs.VOSR2OneStep"
+    assert cfg_standalone.arch.scale == 1
     assert cfg_standalone.infer.weights_path == "/tmp/w.safetensors"
-    net = instantiate(cfg_standalone.arch)
-    assert isinstance(net, ToyModel)
-    assert net(torch.randn(1, 3, 8, 8)).shape == (1, 3, 32, 32)
+    net = instantiate(cfg_standalone.arch).eval()
+    assert isinstance(net, VOSR2OneStep)
+    with torch.no_grad():
+        out = net(torch.rand(1, 3, 16, 16))
+    assert out.shape == (1, 3, 16, 16)
 
 
-def test_hydra_instantiate_m1_components() -> None:
-    # Default ToyModel instantiation
-    cfg_default = _compose("train")
-    toy_default = instantiate(cfg_default.arch)
-    assert isinstance(toy_default, ToyModel)
-    assert toy_default.num_feat == 32
-    assert toy_default.num_block == 2
-    assert toy_default.scale == 4
-    assert toy_default(torch.randn(1, 3, 8, 8)).shape == (1, 3, 32, 32)
-
-    # Multi-level inherited ToyModel (num_feat=16) + losses + partial optim/scheduler
-    cfg_exp01 = _compose(
+def test_hydra_instantiate_components() -> None:
+    cfg_exp = _compose(
         "train",
-        overrides=["experiment=exp01_toy_mixed_x4", "loss.lpips.criterion.pretrained=false"],
+        overrides=[
+            "experiment=vosr2_onestep_text",
+            "loss=l1_lpips",
+            "loss.lpips.criterion.pretrained=false",
+            "arch.input_size=8",
+            "arch.in_channels=8",
+            "arch.out_channels=4",
+            "arch.hidden_size=32",
+            "arch.depth=1",
+            "arch.num_heads=4",
+            "arch.mlp_ratio=2.0",
+            "arch.z_dims=16",
+            "arch.encdim_ratio=2",
+            "arch.vae_pretrained=false",
+            "+arch.vae_base_dim=8",
+            "+arch.vae_dim_mult=[1,2,2,2]",
+            "+arch.vae_num_res_blocks=1",
+            "arch.dino_size=28",
+            "arch.dino_layer=0",
+            "arch.dino_pretrained=false",
+        ],
     )
-    toy_exp01 = instantiate(cfg_exp01.arch)
-    assert isinstance(toy_exp01, ToyModel)
-    assert toy_exp01.num_feat == 16
-    assert toy_exp01(torch.randn(1, 3, 6, 7)).shape == (1, 3, 24, 28)
+    net = instantiate(cfg_exp.arch).eval()
+    assert isinstance(net, VOSR2OneStep)
+    assert net.scale == 1
+    with torch.no_grad():
+        assert net(torch.rand(1, 3, 16, 20)).shape == (1, 3, 16, 20)
 
-    l1 = instantiate(cfg_exp01.loss.l1.criterion)
-    lpips_loss = instantiate(cfg_exp01.loss.lpips.criterion)
+    l1 = instantiate(cfg_exp.loss.l1.criterion)
+    lpips_loss = instantiate(cfg_exp.loss.lpips.criterion)
     assert isinstance(l1, L1Loss)
     assert isinstance(lpips_loss, LPIPSLoss)
     assert lpips_loss.pretrained is False
 
     dummy = nn.Linear(4, 4)
-    opt_partial = instantiate(cfg_exp01.optim.optimizer)
+    opt_partial = instantiate(cfg_exp.optim.optimizer)
     opt = opt_partial(params=dummy.parameters())
     assert isinstance(opt, torch.optim.AdamW)
-    assert opt.param_groups[0]["lr"] == pytest.approx(1e-4)
+    assert opt.param_groups[0]["lr"] == pytest.approx(5e-6)
 
-    sched_partial = instantiate(cfg_exp01.optim.scheduler)
+    sched_partial = instantiate(cfg_exp.optim.scheduler)
     sched = sched_partial(optimizer=opt)
     assert isinstance(sched, torch.optim.lr_scheduler.CosineAnnealingLR)
-    assert sched.T_max == 200000
+    assert sched.T_max == 10000
 
     cfg_multi = _compose("train", overrides=["optim=adam_multistep"])
     opt2 = instantiate(cfg_multi.optim.optimizer)(params=dummy.parameters())
@@ -254,18 +269,16 @@ def test_hydra_instantiate_m1_components() -> None:
 
 
 def test_narrowed_scope_and_mandatory_user_requirements() -> None:
-    # Registered built-in archs and losses
-    assert archs.__all__ == ["ToyModel", "VOSR2OneStep"]
+    # Registered built-in archs and losses (placeholder ToyModel removed)
+    assert archs.__all__ == ["VOSR2OneStep"]
     assert losses.__all__ == ["L1Loss", "LPIPSLoss", "OCRKLLoss", "GlyphLoss"]
 
-    arch_py_files = sorted(
-        p.name for p in (REPO_ROOT / "src" / "archs").glob("*.py")
-    )
-    assert arch_py_files == ["__init__.py", "toy_model.py"]
+    arch_py_files = sorted(p.name for p in (REPO_ROOT / "src" / "archs").glob("*.py"))
+    assert arch_py_files == ["__init__.py"]
     assert (REPO_ROOT / "src" / "archs" / "vosr2" / "__init__.py").is_file()
 
     arch_yaml_files = sorted(p.name for p in (REPO_ROOT / "configs" / "arch").glob("*.yaml"))
-    assert arch_yaml_files == ["toy_x4.yaml", "vosr2_x4.yaml"]
+    assert arch_yaml_files == ["vosr2.yaml"]
 
     loss_yaml_files = sorted(p.name for p in (REPO_ROOT / "configs" / "loss").glob("*.yaml"))
     assert loss_yaml_files == ["glyph.yaml", "l1.yaml", "l1_lpips.yaml", "ocr_kl.yaml", "vosr2_text.yaml"]
@@ -273,7 +286,7 @@ def test_narrowed_scope_and_mandatory_user_requirements() -> None:
     exp_yaml_files = sorted(
         p.name for p in (REPO_ROOT / "configs" / "experiment").glob("*.yaml")
     )
-    assert exp_yaml_files == ["base_sr_x4.yaml", "exp01_toy_mixed_x4.yaml", "exp02_vosr2_x4.yaml"]
+    assert exp_yaml_files == ["vosr2_onestep_text.yaml"]
 
     cfg = _compose("train")
 
@@ -298,9 +311,10 @@ def test_narrowed_scope_and_mandatory_user_requirements() -> None:
         assert "root_dir" in suite_cfg.dataset and "json_path" in suite_cfg.dataset
         assert "metrics" in suite_cfg and len(suite_cfg.metrics) >= 1
 
-    # Requirement #4 + Follow-up scope narrowing: ZERO prohibited symbols anywhere in src/, configs/, pyproject.toml
+    # Zero prohibited/removed placeholder symbols anywhere in src/, configs/, pyproject.toml
     prohibited_symbols = (
         "SRPredictor",
+        "ToyModel",
         "RRDBNet",
         "SwinIR",
         "TinySRNet",

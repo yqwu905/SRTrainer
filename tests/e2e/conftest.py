@@ -388,11 +388,11 @@ def get_toy_model_arch_dict(
     num_feat: int = 8,
     num_block: int = 1,
 ) -> dict[str, Any]:
-    """Build a compact Hydra ``_target_`` dict for ``ToyModel`` matching its public signature."""
-    from archs import ToyModel
+    """Build a compact Hydra ``_target_`` dict for test-only ``DummySRNet``."""
+    from tests.dummy_arch import DummySRNet
 
-    params = inspect.signature(ToyModel.__init__).parameters
-    arch: dict[str, Any] = {"_target_": "archs.ToyModel"}
+    params = inspect.signature(DummySRNet.__init__).parameters
+    arch: dict[str, Any] = {"_target_": "tests.dummy_arch.DummySRNet"}
     for key, val in (
         ("num_in_ch", 3),
         ("num_out_ch", 3),
@@ -867,9 +867,8 @@ def make_minimal_train_overrides(
             f"scale={scale}",
             f"output_root={fmt_hydra_value(str(output_root))}",
             f"exp_name={fmt_hydra_value(exp_name)}",
-            "arch=toy_x4",
-            f"++arch.num_feat={arch_num_feat}",
-            f"++arch.num_block={arch_num_block}",
+            "~arch",
+            f"+arch={fmt_hydra_value(get_toy_model_arch_dict(scale=scale, num_feat=arch_num_feat, num_block=arch_num_block))}",
             f"data.gt_size={gt_size}",
             f"data.batch_size_per_gpu={batch_size}",
             f"data.num_workers={CPU_NUM_WORKERS}",

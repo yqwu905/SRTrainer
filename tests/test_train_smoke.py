@@ -28,11 +28,11 @@ from torch import nn
 
 import engine as engine_pkg
 import models as models_pkg
-from archs import ToyModel
 from engine import Checkpointer, TiledInferencer, Trainer, TrainState
 from metrics.base import BaseMetric
 from models import BaseModel, ModelEMA, SRModel
 from models.ema import unwrap_model_for_ema
+from tests.dummy_arch import DummySRNet
 from utils.config import load_resolved_config
 from utils.image import load_image
 from utils.misc import load_weights, save_safetensors
@@ -315,9 +315,16 @@ def _make_base_train_cfg(
     cfg.output_root = str(work_dir.parent)
     cfg.work_dir = str(work_dir)
 
-    cfg.arch.num_feat = 8
-    cfg.arch.num_block = 1
-    cfg.arch.scale = 2
+    cfg.arch = OmegaConf.create(
+        {
+            "_target_": "tests.dummy_arch.DummySRNet",
+            "num_in_ch": 3,
+            "num_out_ch": 3,
+            "num_feat": 8,
+            "num_block": 1,
+            "scale": 2,
+        }
+    )
 
     cfg.loss = OmegaConf.create(
         {
@@ -714,7 +721,7 @@ def test_model_ema_train_state_and_checkpointer_units(tmp_path: Path) -> None:
         ckpt.resolve_resume_path(tmp_path / "missing_dir")
 
     acc = Accelerator(mixed_precision="no")
-    toy = ToyModel(num_feat=8, num_block=1, scale=2)
+    toy = DummySRNet(num_feat=8, num_block=1, scale=2)
     opt = torch.optim.AdamW(toy.parameters(), lr=1e-3)
     toy, opt = acc.prepare(toy, opt)
     acc.register_for_checkpointing(ts_restored)
@@ -780,7 +787,7 @@ def test_sr_model_7step_setup_losses_pretrain_and_scheduler_gating(
     ds = _create_synthetic_datasets(tmp_path)
 
     # Save a distinctive pretrained checkpoint as .pth with nested key 'params_ema'
-    ref_net = ToyModel(num_feat=8, num_block=1, scale=2)
+    ref_net = DummySRNet(num_feat=8, num_block=1, scale=2)
     with torch.no_grad():
         for p in ref_net.parameters():
             p.fill_(0.125)
@@ -1025,7 +1032,7 @@ def test_trainer_full_smoke_mixed_l1_lpips_multisuite_grad_accum_tb(
     ):
         fpath = work_dir / "weights" / fname
         assert fpath.is_file(), f"Missing expected weight file: {fname}"
-        missing, unexpected = load_weights(ToyModel(num_feat=8, num_block=1, scale=2), fpath, strict=True)
+        missing, unexpected = load_weights(DummySRNet(num_feat=8, num_block=1, scale=2), fpath, strict=True)
         assert missing == [] and unexpected == []
 
     # Visuals: 3-panel for val_ref (collision-safe duplicate stems!) and 2-panel for val_ocr_nogt
@@ -1351,6 +1358,9 @@ def test_train_to_tools_infer_exp_dir_integration(
     infer_out = tmp_path / "infer_outputs"
     env = os.environ.copy()
     env["OMP_NUM_THREADS"] = "1"
+    existing_pp = env.get("PYTHONPATH", "")
+    extra_pp = f"{REPO_ROOT}:{REPO_ROOT / 'src'}"
+    env["PYTHONPATH"] = f"{extra_pp}:{existing_pp}" if existing_pp else extra_pp
     proc = subprocess.run(
         [
             sys.executable,
@@ -1376,7 +1386,7 @@ def test_train_to_tools_infer_exp_dir_integration(
     assert out_unique.is_file()
 
     # Reference output using TiledInferencer directly with best_*.safetensors & tile_size=16 (32//2)
-    ref_model = ToyModel(num_feat=8, num_block=1, scale=2)
+    ref_model = DummySRNet(num_feat=8, num_block=1, scale=2)
     load_weights(ref_model, best_weight, strict=True)
     ref_inf = TiledInferencer(
         model=ref_model,
@@ -1473,8 +1483,8 @@ def test_train_cli_distributed_2proc_cpu_torchrun_smoke(tmp_path: Path) -> None:
         f"work_dir={base_work}",
         "scale=2",
         "seed=42",
-        "arch.num_feat=8",
-        "arch.num_block=1",
+        "~arch",
+        "+arch={_target_:tests.dummy_arch.DummySRNet,num_in_ch:3,num_out_ch:3,num_feat:8,num_block:1,scale:2}",
         "data.gt_size=32",
         "data.batch_size_per_gpu=2",
         "data.num_workers=0",
@@ -1612,8 +1622,8 @@ def test_train_cli_distributed_2proc_resume_auto(tmp_path: Path) -> None:
         f"work_dir={exp_dir}",
         "scale=2",
         "seed=42",
-        "arch.num_feat=8",
-        "arch.num_block=1",
+        "~arch",
+        "+arch={_target_:tests.dummy_arch.DummySRNet,num_in_ch:3,num_out_ch:3,num_feat:8,num_block:1,scale:2}",
         "data.gt_size=32",
         "data.batch_size_per_gpu=2",
         "data.num_workers=0",

@@ -4,9 +4,9 @@ defaults:
   - infer: default
   - override hydra/job_logging: disabled
 
-# Standalone mode example: arch=toy_x4 scale=4 infer.weights_path=/path/to/weights.safetensors
+# Standalone mode example: arch=vosr2 scale=1 infer.weights_path=/path/to/weights.safetensors
 arch: null
-scale: 4
+scale: 1
 
 hydra:
   job:

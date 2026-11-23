@@ -1,4 +1,4 @@
-"""Lightweight placeholder super-resolution network for framework development and testing."""
+"""Lightweight test-only dummy SR/restoration network for fast CPU unit & E2E tests."""
 
 from __future__ import annotations
 
@@ -16,9 +16,7 @@ def _is_non_negative_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
-class _ToyResBlock(nn.Module):
-    """Minimal residual conv block with scaled second conv for stable convergence."""
-
+class _DummyResBlock(nn.Module):
     def __init__(self, num_feat: int) -> None:
         super().__init__()
         self.conv1 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
@@ -33,21 +31,16 @@ class _ToyResBlock(nn.Module):
         return x + self.conv2(self.act(self.conv1(x)))
 
 
-class ToyModel(nn.Module):
-    """Lightweight placeholder residual-conv + PixelShuffle SR network.
-
-    Accepts ``[B, num_in_ch, H, W]`` float tensors and returns unbounded
-    ``[B, num_out_ch, H * scale, W * scale]`` float tensors. Supports any positive
-    integer ``scale >= 1``, ``num_block >= 0``, and arbitrary ``H, W >= 1``.
-    """
+class DummySRNet(nn.Module):
+    """Minimal test-only residual-conv + PixelShuffle network for CPU tests."""
 
     def __init__(
         self,
         num_in_ch: int = 3,
         num_out_ch: int = 3,
-        num_feat: int = 32,
-        num_block: int = 2,
-        scale: int = 4,
+        num_feat: int = 8,
+        num_block: int = 1,
+        scale: int = 1,
     ) -> None:
         super().__init__()
         if not _is_positive_int(scale):
@@ -69,7 +62,7 @@ class ToyModel(nn.Module):
         self.scale = scale
 
         self.conv_first = nn.Conv2d(num_in_ch, num_feat, 3, 1, 1)
-        self.body = nn.Sequential(*[_ToyResBlock(num_feat) for _ in range(num_block)])
+        self.body = nn.Sequential(*[_DummyResBlock(num_feat) for _ in range(num_block)])
         self.conv_body = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
         self.conv_last = nn.Conv2d(num_feat, num_out_ch * (scale * scale), 3, 1, 1)
         self.upsample: nn.Module = nn.PixelShuffle(scale) if scale > 1 else nn.Identity()

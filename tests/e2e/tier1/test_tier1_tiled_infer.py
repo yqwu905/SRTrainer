@@ -381,12 +381,12 @@ def test_t1_tools_infer_mode2_standalone_inputs_recursive_json_and_jpg(
     """F37, F38: tools/infer.py Mode 2 standalone ToyModel .pth (params_ema) on single/recursive/JSON."""
     import torch
     from PIL import Image
+    from tests.dummy_arch import DummySRNet
 
-    from archs import ToyModel
     from utils.image import load_image
 
     # Build BasicSR-style .pth with distinct non-zero params_ema vs zeroed params.
-    net = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
+    net = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
     sd_ema, expected_mean = constant_bias_state_dict_factory(net, 0.65)
     assert expected_mean > 0.4, f"Expected non-trivial bias-tagged output mean, got {expected_mean}"
     sd_zero = {
@@ -398,7 +398,7 @@ def test_t1_tools_infer_mode2_standalone_inputs_recursive_json_and_jpg(
 
     arch_overrides = standalone_infer_arch_overrides_factory(
         {
-            "_target_": "archs.ToyModel",
+            "_target_": "tests.dummy_arch.DummySRNet",
             "num_in_ch": 3,
             "num_out_ch": 3,
             "num_feat": 8,

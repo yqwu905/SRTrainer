@@ -70,13 +70,13 @@ def test_t2_e02_srmodel_pretrain_path_edge_cases(
     """F43: SRModel pretrain_path enforces missing file/key/strict errors and partial load into EMA."""
     import torch
     from accelerate import Accelerator
+    from tests.dummy_arch import DummySRNet
 
-    from archs import ToyModel
     from models import SRModel
     from utils.misc import save_safetensors
 
     torch.manual_seed(42)
-    ref_net = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
+    ref_net = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
     ref_sd = {
         k: (v.detach().cpu() + 0.25 if torch.is_floating_point(v) else v.detach().cpu().clone())
         for k, v in ref_net.state_dict().items()
@@ -262,8 +262,8 @@ def test_t2_e04_checkpointer_numerical_pruning_and_keep_all(
     """F45: Checkpointer prunes numerically across 6-to-7 digit boundaries and honors max_keep=0."""
     from accelerate import Accelerator
     from accelerate.utils import ProjectConfiguration
+    from tests.dummy_arch import DummySRNet
 
-    from archs import ToyModel
     from engine import Checkpointer
 
     def _make_acc(work_dir: Path) -> Any:
@@ -273,7 +273,7 @@ def test_t2_e04_checkpointer_numerical_pruning_and_keep_all(
             automatic_checkpoint_naming=False,
         )
         acc = Accelerator(cpu=True, mixed_precision="no", project_config=proj_cfg)
-        net = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=4, num_block=1, scale=2)
+        net = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=4, num_block=1, scale=2)
         acc.prepare(net)
         return acc
 

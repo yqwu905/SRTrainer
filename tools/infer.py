@@ -316,7 +316,7 @@ def resolve_infer_config(
     arch_raw = OmegaConf.select(cfg_oc, "arch", default=None)
     if arch_raw is None:
         raise ValueError(
-            "Standalone inference mode (infer.exp_dir=null) requires `arch` (e.g. `arch=toy_x4`)."
+            "Standalone inference mode (infer.exp_dir=null) requires `arch` (e.g. `arch=vosr2`)."
         )
     arch_cfg = _validate_arch_cfg(arch_raw, context="Standalone inference config")
     scale = _validate_positive_int(OmegaConf.select(cfg_oc, "scale", default=None), "scale")

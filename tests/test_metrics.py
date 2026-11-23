@@ -920,7 +920,7 @@ def test_hydra_sr_default_metric_instantiation_and_compute(
     pred = torch.rand(1, 3, 64, 64)
     target = (pred + 0.05 * torch.randn(1, 3, 64, 64)).clamp(0.0, 1.0)
 
-    # Default scale=4 composition with strict-mode offline LPIPS override (NO `+`)
+    # Default scale=1 composition with strict-mode offline LPIPS override (NO `+`)
     cfg = _compose("train", overrides=["metric.val_suites.set5.metrics.lpips.pretrained=false"])
 
     set5_metrics = {
@@ -931,10 +931,10 @@ def test_hydra_sr_default_metric_instantiation_and_compute(
     assert isinstance(set5_metrics["psnr"], PSNRMetric)
     assert isinstance(set5_metrics["ssim"], SSIMMetric)
     assert isinstance(set5_metrics["lpips"], LPIPSMetric)
-    assert set5_metrics["psnr"].crop_border == 4
+    assert set5_metrics["psnr"].crop_border == 1
     assert set5_metrics["psnr"].test_y_channel is True
     assert set5_metrics["psnr"].higher_is_better is True
-    assert set5_metrics["ssim"].crop_border == 4
+    assert set5_metrics["ssim"].crop_border == 1
     assert set5_metrics["ssim"].test_y_channel is True
     assert set5_metrics["ssim"].higher_is_better is True
     assert set5_metrics["lpips"].net == "alex"
@@ -948,8 +948,8 @@ def test_hydra_sr_default_metric_instantiation_and_compute(
     assert set(urban_metrics.keys()) == {"psnr", "ssim"}
     assert isinstance(urban_metrics["psnr"], PSNRMetric)
     assert isinstance(urban_metrics["ssim"], SSIMMetric)
-    assert urban_metrics["psnr"].crop_border == 4
-    assert urban_metrics["ssim"].crop_border == 4
+    assert urban_metrics["psnr"].crop_border == 1
+    assert urban_metrics["ssim"].crop_border == 1
 
     for suite_metrics in (set5_metrics, urban_metrics):
         for name, metric in suite_metrics.items():

@@ -1,13 +1,13 @@
 # @package _global_
 defaults:
-  - /experiment/base_sr_x4
-  - override /arch: vosr2_x4
+  - override /arch: vosr2
+  - override /data: mixed_sr
   - override /loss: vosr2_text
   - override /optim: adamw_cosine
   - _self_
 
-exp_name: exp02_vosr2_onestep_text_x4
-scale: 4
+exp_name: vosr2_onestep_text
+scale: 1
 
 data:
   gt_size: 512
@@ -36,7 +36,7 @@ trainer:
   val_tile:
     enabled: true
     size: auto
-    overlap: 16
+    overlap: 64
     batch_size: 1
     blend_mode: cosine
-    pad_multiple: 4
+    pad_multiple: 16

@@ -17,33 +17,36 @@ from typing import Any
 import pytest
 
 
-def test_t3_hydra_exp01_toy_inheritance_into_srmodel_lpips_and_cosine_t_max(
+def test_t3_hydra_experiment_inheritance_into_srmodel_lpips_and_cosine_t_max(
     hydra_compose: Callable[..., Any],
 ) -> None:
-    """Seam A x B x E (F03-F06, F08, F12-F15, F43): exp01 inheritance -> SRModel + LPIPS + Cosine LR."""
+    """Seam A x B x E (F03-F06, F08, F12-F15, F43): experiment -> SRModel + LPIPS + Cosine LR."""
     import hydra.utils
     import torch
     from accelerate import Accelerator
+    from tests.dummy_arch import DummySRNet
 
-    from archs import ToyModel
     from models import SRModel
 
     cfg = hydra_compose(
         "train",
         overrides=[
-            "experiment=exp01_toy_mixed_x4",
+            "experiment=vosr2_onestep_text",
+            "~arch",
+            "+arch={_target_:tests.dummy_arch.DummySRNet,num_in_ch:3,num_out_ch:3,num_feat:8,num_block:1,scale:2}",
             "scale=2",
-            "arch.num_feat=8",
-            "arch.num_block=1",
-            "data.gt_size=64",
+            "loss=l1_lpips",
+            "loss.lpips.weight=0.05",
             "loss.lpips.criterion.pretrained=false",
+            "optim.optimizer.lr=1.0e-4",
+            "data.gt_size=64",
             "trainer.total_iters=6",
             "trainer.mixed_precision='no'",
         ],
     )
 
-    assert cfg.exp_name == "exp01_toy_l1_lpips_x4"
-    assert cfg.arch._target_ == "archs.ToyModel"
+    assert cfg.exp_name == "vosr2_onestep_text"
+    assert cfg.arch._target_ == "tests.dummy_arch.DummySRNet"
     assert cfg.arch.scale == 2
     assert cfg.arch.num_feat == 8
     assert cfg.arch.num_block == 1
@@ -61,7 +64,7 @@ def test_t3_hydra_exp01_toy_inheritance_into_srmodel_lpips_and_cosine_t_max(
     accelerator = Accelerator(cpu=True, mixed_precision="no")
     model.setup(accelerator)
 
-    assert isinstance(model.get_infer_network(use_ema=False), ToyModel)
+    assert isinstance(model.get_infer_network(use_ema=False), DummySRNet)
     assert len(getattr(accelerator, "_schedulers", [])) == 0
 
     lr_0 = next(iter(model.get_lr_dict().values()))
@@ -216,9 +219,9 @@ def test_t3_pure_paired_degradation_null_toymodel_scale4_and_multistep_lr(
     """Seam A x B x C x E (F04, F05, F07, F08, F13, F14, F21-F23, F43): degradation=null + MultiStepLR."""
     import torch
     from accelerate import Accelerator
+    from tests.dummy_arch import DummySRNet
     from torch.utils.data import DataLoader
 
-    from archs import ToyModel
     from models import SRModel
 
     pair_src = paired_train_source_factory(
@@ -228,9 +231,8 @@ def test_t3_pure_paired_degradation_null_toymodel_scale4_and_multistep_lr(
         "train",
         overrides=[
             "scale=4",
-            "arch=toy_x4",
-            "arch.num_feat=8",
-            "arch.num_block=1",
+            "~arch",
+            "+arch={_target_:tests.dummy_arch.DummySRNet,num_in_ch:3,num_out_ch:3,num_feat:8,num_block:1,scale:4}",
             "loss=l1",
             "optim=adam_multistep",
             "optim.optimizer.lr=2.0e-4",
@@ -259,7 +261,7 @@ def test_t3_pure_paired_degradation_null_toymodel_scale4_and_multistep_lr(
 
     model = SRModel(cfg)
     model.setup(Accelerator(cpu=True, mixed_precision="no"))
-    assert isinstance(model.get_infer_network(use_ema=False), ToyModel)
+    assert isinstance(model.get_infer_network(use_ema=False), DummySRNet)
     assert next(iter(model.get_lr_dict().values())) == pytest.approx(2.0e-4, rel=1e-6)
 
     init_sd = {
@@ -317,12 +319,12 @@ def test_t3_pretrain_basicsr_pth_with_ema_warmup_grad_clip_and_accum(
     """Seam B x E (F13, F19, F42, F43): BasicSR .pth pretrain + EMA warmup + grad_clip + grad_accum."""
     import torch
     from accelerate import Accelerator
+    from tests.dummy_arch import DummySRNet
 
-    from archs import ToyModel
     from models import SRModel
 
     torch.manual_seed(34)
-    ref_net = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
+    ref_net = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
     sd_ema = {
         k: (v.detach().cpu() + 0.05 if torch.is_floating_point(v) else v.detach().cpu().clone())
         for k, v in ref_net.state_dict().items()
@@ -564,8 +566,8 @@ def test_t3_toymodel_scales_export_weights_safetensors_reload_parity(
     import torch
     from accelerate import Accelerator
     from safetensors import safe_open
+    from tests.dummy_arch import DummySRNet
 
-    from archs import ToyModel
     from engine import Checkpointer
     from models import SRModel
     from utils.misc import load_weights
@@ -639,8 +641,8 @@ def test_t3_toymodel_scales_export_weights_safetensors_reload_parity(
                 for sk in saved_keys:
                     assert not sk.startswith("module.") and not sk.startswith("_orig_mod.")
 
-        reloaded_g = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=scale)
-        reloaded_ema = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=scale)
+        reloaded_g = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=scale)
+        reloaded_ema = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=scale)
         for net_zero in (reloaded_g, reloaded_ema):
             with torch.no_grad():
                 for param in net_zero.parameters():

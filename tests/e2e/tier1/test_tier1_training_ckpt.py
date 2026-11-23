@@ -109,12 +109,12 @@ def test_t1_model_ema_fp32_update_warmup_and_state_roundtrip() -> None:
     """F42: ModelEMA FP32 shadow weights, warmup acceleration, DDP unwrap, state_dict roundtrip."""
     import torch
     import torch.nn as nn
+    from tests.dummy_arch import DummySRNet
 
-    from archs import ToyModel
     from models import ModelEMA
 
     torch.manual_seed(4)
-    net = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
+    net = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
     init_params = {k: v.detach().clone() for k, v in net.named_parameters()}
 
     ema_no_warm = ModelEMA(net, decay=0.999, warmup_steps=0)
@@ -247,13 +247,13 @@ def test_t1_srmodel_pretrain_safetensors_and_basicsr_pth_cloned_to_ema(
     import torch
     from accelerate import Accelerator
     from accelerate.state import AcceleratorState, GradientState
+    from tests.dummy_arch import DummySRNet
 
-    from archs import ToyModel
     from models import SRModel
     from utils.misc import save_safetensors
 
     torch.manual_seed(21)
-    ref_net = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
+    ref_net = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
     ref_sd = {
         k: (
             (v.detach().cpu().clone() + 0.123)
@@ -457,9 +457,9 @@ def test_t1_train_state_and_checkpointer_dual_track_and_resolve(
     """F02, F44, F45: Engine re-exports, TrainState roundtrip, Checkpointer Track 1/2/best/resume."""
     from accelerate import Accelerator
     from accelerate.utils import ProjectConfiguration
+    from tests.dummy_arch import DummySRNet
 
     import engine as engine_pkg
-    from archs import ToyModel
     from engine import Checkpointer, TrainState
 
     for sym in ("Trainer", "TrainState", "Checkpointer", "TiledInferencer"):
@@ -479,7 +479,7 @@ def test_t1_train_state_and_checkpointer_dual_track_and_resolve(
     )
     accelerator = Accelerator(cpu=True, mixed_precision="no", project_config=proj_cfg)
 
-    net = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
+    net = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
     net = accelerator.prepare(net)
     accelerator.register_for_checkpointing(state)
 

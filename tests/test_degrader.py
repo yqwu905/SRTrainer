@@ -512,7 +512,7 @@ def test_realesrgan_degrader_hydra_instantiation() -> None:
         cfg = hydra.compose(config_name="train")
     deg = instantiate(cfg.data.degradation)
     assert isinstance(deg, RealESRGANDegrader)
-    assert deg.scale == 4
+    assert deg.scale == 1
     assert deg.use_usm is False
     assert deg.queue_size == 0
     assert deg.jpeg_range == (30.0, 95.0)
@@ -835,7 +835,7 @@ def test_end_to_end_mixed_dataset_loader_and_degrader(tmp_path: Path) -> None:
     paired_json.write_text(json.dumps(paired_entries), encoding="utf-8")
 
     with hydra.initialize_config_dir(config_dir=CONFIGS_DIR, version_base=None):
-        cfg = hydra.compose(config_name="train")
+        cfg = hydra.compose(config_name="train", overrides=["scale=4"])
     degrader = instantiate(cfg.data.degradation)
 
     ds = MixedSRDataset(
