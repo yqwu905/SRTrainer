@@ -1,0 +1,42 @@
+primary_dataset: text_ocr
+primary_metric: ocr_a
+
+val_suites:
+  text_ocr:
+    dataset:
+      root_dir: /path/to/text_ocr/val
+      json_path: /path/to/text_ocr/val/manifest.json
+    metrics:
+      ocr_a:
+        _target_: metrics.OCRAccuracyMetric
+        ocr_model: PP-OCRv5_server_rec
+        ocr_model_dir: null
+        ocr_cls_model: null
+        ocr_cls_model_dir: null
+        ocr_device: cpu
+        ocr_batch_size: 1
+        ignore_case: false
+        include_difficult: false
+        label_key: label
+      cer:
+        _target_: metrics.CERMetric
+        ocr_model: PP-OCRv5_server_rec
+        ocr_model_dir: null
+        ocr_cls_model: null
+        ocr_cls_model_dir: null
+        ocr_device: cpu
+        ocr_batch_size: 1
+        ignore_case: false
+        include_difficult: false
+        label_key: label
+      one_minus_ned:
+        _target_: metrics.OneMinusNEDMetric
+        ocr_model: PP-OCRv5_server_rec
+        ocr_model_dir: null
+        ocr_cls_model: null
+        ocr_cls_model_dir: null
+        ocr_device: cpu
+        ocr_batch_size: 1
+        ignore_case: false
+        include_difficult: false
+        label_key: label

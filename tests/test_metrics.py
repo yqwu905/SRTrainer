@@ -19,7 +19,15 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
 import metrics
-from metrics import BaseMetric, LPIPSMetric, PSNRMetric, SSIMMetric
+from metrics import (
+    BaseMetric,
+    CERMetric,
+    LPIPSMetric,
+    OCRAccuracyMetric,
+    OneMinusNEDMetric,
+    PSNRMetric,
+    SSIMMetric,
+)
 from metrics.psnr_ssim import rgb_to_y_bt601
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -153,14 +161,28 @@ class _MockOCRAMetric(BaseMetric):
 
 
 def test_metrics_package_exports() -> None:
-    assert metrics.__all__ == ["BaseMetric", "PSNRMetric", "SSIMMetric", "LPIPSMetric"]
+    assert metrics.__all__ == [
+        "BaseMetric",
+        "PSNRMetric",
+        "SSIMMetric",
+        "LPIPSMetric",
+        "OCRAccuracyMetric",
+        "CERMetric",
+        "OneMinusNEDMetric",
+    ]
     assert metrics.BaseMetric is BaseMetric
     assert metrics.PSNRMetric is PSNRMetric
     assert metrics.SSIMMetric is SSIMMetric
     assert metrics.LPIPSMetric is LPIPSMetric
+    assert metrics.OCRAccuracyMetric is OCRAccuracyMetric
+    assert metrics.CERMetric is CERMetric
+    assert metrics.OneMinusNEDMetric is OneMinusNEDMetric
     assert issubclass(PSNRMetric, BaseMetric)
     assert issubclass(SSIMMetric, BaseMetric)
     assert issubclass(LPIPSMetric, BaseMetric)
+    assert issubclass(OCRAccuracyMetric, BaseMetric)
+    assert issubclass(CERMetric, BaseMetric)
+    assert issubclass(OneMinusNEDMetric, BaseMetric)
 
 
 def test_base_metric_abc_defaults_and_custom_ocr_extensibility() -> None:

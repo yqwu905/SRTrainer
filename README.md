@@ -13,7 +13,7 @@
   - 仅读取独立图像文件（`.jpg/.png/.jpeg/.webp`），`gt_only` 与 `paired` 统一使用字典列表 JSON，自动根据样本是否含有效 `lq` 判定模式（配置中无需 `mode`）；支持在清单内嵌 `text_lines` / `glyphs` 或在数据源上挂载 VOSR `glyphs_json` 以启用 `GlyphLoss`；
   - `MixedSRDataset` + `DistributedWeightedInfiniteSampler` 严格按 `ratio` 跨数据源采样并支持 O(1) 断点续训；
   - `RealESRGANDegrader` 在 GPU FP32 下仅对 `gt_only` 子集执行二阶模糊/缩放/噪声/DiffJPEG/Sinc 退化，与真实 `paired` 样本在同 Batch 平滑混合。
-- **验证集内聚于 `metric` 配置组**：每个验证套件在 `configs/metric/` 中独立绑定数据集与所需指标，并将 JSON 附加字段（如 OCR-A 的 `label`）完整透传到 `BaseMetric.compute(pred, target, meta)`；内置 BasicSR/MATLAB BT.601 对齐的 `PSNRMetric`、`SSIMMetric` 与 `LPIPSMetric`。
+- **验证集内聚于 `metric` 配置组**：每个验证套件在 `configs/metric/` 中独立绑定数据集与所需指标，并将 JSON 附加字段（如 `label` / `text_lines` / `annotation_size`）完整透传到 `BaseMetric.compute(pred, target, meta)` 与 `BaseMetric.compute_stats(pred, target, meta)`；内置 BasicSR/MATLAB BT.601 对齐的 `PSNRMetric`、`SSIMMetric`、`LPIPSMetric`，以及基于 PaddleOCR 3.x 的文本识别指标 `OCRAccuracyMetric`（OCR-A）、`CERMetric`（CER）与 `OneMinusNEDMetric`（1-NED）。
 - **双轨 Checkpoint**：滚动保存完整续训状态（`checkpoints/state_iter_XXXXXX/`，支持 `resume=auto`）+ 原子导出纯推理权重（`weights/*.safetensors`，含 `iter_*`、`_ema`、`latest`、`best_*`）并持久化 `config_resolved.yaml`。
 - **共享 `TiledInferencer` + `tools/infer.py` 分布式推理**：支持实验目录自动还原与独立 `infer.yaml` 两种模式；支持按训练输入尺寸自动推导 `tile_size`（`gt_size // scale`）与可配置 `overlap` 羽化无缝融合；支持单卡与 Accelerate 多卡分布式离线推理。
 
@@ -27,6 +27,9 @@ uv sync
 
 # 可选：安装额外实验看板依赖（wandb / mlflow / swanlab）
 uv sync --extra trackers
+
+# 可选：安装文本 OCR 评测依赖（PaddleOCR 3.x + OpenCV，用于 OCR-A / CER / 1-NED）
+uv sync --extra ocr
 ```
 
 ## JSON 数据清单格式
@@ -60,13 +63,25 @@ uv sync --extra trackers
     {"gt": "hr/0002.png", "lq": "lr_x4/0002.png"}
   ]
   ```
-- **验证集清单（在 `configs/metric/` 中配置，`gt` 可选，其余字段自动透传到 `meta`）**：
+- **验证集清单（在 `configs/metric/` 中配置，`gt` 可选，其余字段自动透传到 `meta`；OCR 指标支持单行整图 `label` 与多文本框 `text_lines` 两种标注模式）**：
   ```json
   [
     {"lq": "lr/0001.png", "gt": "hr/0001.png", "label": "HELLO 2026"},
-    {"lq": "lr/0002.png", "label": "SRTRAINER"}
+    {
+      "lq": "lr/0002.png",
+      "annotation_size": [256, 128],
+      "text_lines": [
+        {"transcript": "SRTRAINER", "bbox": [16, 20, 220, 64]},
+        {"transcription": "文本", "points": [[16, 72], [120, 72], [120, 112], [16, 112]]}
+      ]
+    }
   ]
   ```
+  > **OCR 指标说明（`configs/metric/text_ocr.yaml`）**：
+  > - 提供 `metrics.OCRAccuracyMetric`（OCR-A，越大越好）、`metrics.CERMetric`（CER，越小越好，允许 `> 1` 不截断）与 `metrics.OneMinusNEDMetric`（1-NED，越大越好），默认使用 `PP-OCRv5_server_rec`、`ocr_batch_size=1`、`ocr_device="cpu"`（出于跨平台可移植性默认固定 CPU，区别于 VOSR `evaluate.py` 的自动选设备；支持通过 `ocr_device` 与 `ocr_model_dir` / `ocr_cls_model_dir` 显式覆盖）。
+  > - 同进程、同配置的三项指标共享单个 PaddleOCR 识别模型并复用同一样本的一次识别结果（有界仅缓存最后一个样本，检查图像/标注/配置变化，不持有 GPU 张量或计算图）。
+  > - 通过 `BaseMetric.compute_stats()` 返回可加和的 `(numerator, denominator)`，在多卡 `gather_for_metrics` 后按全局有效框/字符数加权归约，避免先求每图均值再平均带来的偏差。
+  > - **多进程权重准备建议**：由于 OCR 识别后端在首次验证时延迟初始化，多进程（DDP）训练前请先在单进程预下载权重并为各 rank 显式配置同一只读本地 `ocr_model_dir`（及可选 `ocr_cls_model_dir`），避免多 rank 首次并发下载同一缓存目录；单进程预热后的验证不等同于冷启动并发下载验收。
 
 ## 快速开始
 
@@ -142,7 +157,7 @@ huggingface-cli download ATH-MaaS/TextVerifier-CJK-CLIP \
 ### 4. 扩展自定义组件
 
 - **自定义网络 / Loss**：编写普通 PyTorch `nn.Module`，在 `configs/arch/*.yaml` 或 `configs/loss/*.yaml` 中填写 `_target_` 即可。
-- **自定义指标（含附加标注输入，如 OCR-A）**：继承 `metrics.BaseMetric`，实现 `compute(self, pred, target=None, meta=None) -> float`，并在 `configs/metric/*.yaml` 对应验证套件的 `metrics` 中通过 `_target_` 挂载。
+- **自定义指标（含附加标注输入，如 OCR-A）**：继承 `metrics.BaseMetric`，实现 `compute(self, pred, target=None, meta=None) -> float`（若需跨样本加权归约可覆写 `compute_stats(...) -> tuple[float, float]`），并在 `configs/metric/*.yaml` 对应验证套件的 `metrics` 中通过 `_target_` 挂载。
 
 ## 测试与代码检查
 
