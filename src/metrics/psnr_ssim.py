@@ -15,6 +15,12 @@ _SSIM_WINDOW_SIZE: int = 11
 _SSIM_SIGMA: float = 1.5
 _SSIM_C1: float = (0.01 * 255.0) ** 2
 _SSIM_C2: float = (0.03 * 255.0) ** 2
+_NO_FLOAT64_DEVICE_TYPES: frozenset[str] = frozenset({"npu", "mps"})
+
+
+def _metric_compute_dtype(device: torch.device) -> torch.dtype:
+    """Select ``float32`` on backends without native ``float64`` ops (NPU/MPS), else ``float64``."""
+    return torch.float32 if device.type in _NO_FLOAT64_DEVICE_TYPES else torch.float64
 
 
 def _validate_metric_init(crop_border: int, test_y_channel: bool) -> None:
@@ -89,14 +95,16 @@ def _validate_image_pair(
 def rgb_to_y_bt601(img: torch.Tensor) -> torch.Tensor:
     """Convert a 4D floating-point RGB tensor in ``[0, 1]`` to studio-swing ITU-R BT.601 Y.
 
-    Computes the exact MATLAB ``rgb2ycbcr`` / BasicSR luminance formula in ``float64``:
+    Computes the exact MATLAB ``rgb2ycbcr`` / BasicSR luminance formula in ``float64``
+    (or ``float32`` on backends without native ``float64`` ops such as NPU/MPS):
     ``Y = 65.481 * R + 128.553 * G + 24.966 * B + 16.0`` (nominal range ``[16.0, 235.0]``).
 
     Args:
         img: 4D floating-point RGB tensor of shape ``[N, 3, H, W]``.
 
     Returns:
-        4D ``float64`` luminance tensor of shape ``[N, 1, H, W]`` on ``img.device``.
+        4D luminance tensor of shape ``[N, 1, H, W]`` on ``img.device`` in ``float64``
+        (or ``float32`` on NPU/MPS).
     """
     if not isinstance(img, torch.Tensor):
         raise TypeError(f"Expected img to be a torch.Tensor, got {type(img).__name__}.")
@@ -116,8 +124,9 @@ def rgb_to_y_bt601(img: torch.Tensor) -> torch.Tensor:
             f"rgb_to_y_bt601 expects a floating-point tensor in [0, 1], got dtype {img.dtype}."
         )
 
+    compute_dtype = _metric_compute_dtype(img.device)
     with torch.amp.autocast(device_type=img.device.type, enabled=False):
-        x = img.to(dtype=torch.float64)
+        x = img.to(dtype=compute_dtype)
         return (
             65.481 * x[:, 0:1, :, :] + 128.553 * x[:, 1:2, :, :] + 24.966 * x[:, 2:3, :, :] + 16.0
         )
@@ -167,6 +176,7 @@ class PSNRMetric(BaseMetric):
             min_cropped_size=1,
         )
 
+        compute_dtype = _metric_compute_dtype(pred.device)
         with torch.no_grad(), torch.amp.autocast(device_type=pred.device.type, enabled=False):
             p = pred
             t = target_tensor
@@ -179,8 +189,8 @@ class PSNRMetric(BaseMetric):
                 img1 = rgb_to_y_bt601(p)
                 img2 = rgb_to_y_bt601(t)
             else:
-                img1 = p.to(dtype=torch.float64) * 255.0
-                img2 = t.to(dtype=torch.float64) * 255.0
+                img1 = p.to(dtype=compute_dtype) * 255.0
+                img2 = t.to(dtype=compute_dtype) * 255.0
 
             mse = torch.mean((img1 - img2) ** 2, dim=(1, 2, 3))
             psnr = torch.where(
@@ -208,23 +218,39 @@ class SSIMMetric(BaseMetric):
         _validate_metric_init(crop_border, test_y_channel)
         self.crop_border = crop_border
         self.test_y_channel = test_y_channel
-        self._window_cache: dict[tuple[torch.device, int], torch.Tensor] = {}
+        self._window_cache: dict[tuple[Any, ...], torch.Tensor] = {}
 
-    def _get_window(self, device: torch.device, channels: int) -> torch.Tensor:
+    def _get_window(
+        self,
+        device: torch.device,
+        channels: int,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
         canonical_device = torch.device("cpu") if device.type == "cpu" else device
-        key = (canonical_device, channels)
+        default_dtype = _metric_compute_dtype(canonical_device)
+        target_dtype = default_dtype if dtype is None else dtype
+        key: tuple[Any, ...] = (
+            (canonical_device, channels)
+            if target_dtype == default_dtype
+            else (canonical_device, channels, target_dtype)
+        )
         window = self._window_cache.get(key)
-        if window is not None:
+        if window is not None and window.dtype == target_dtype:
             return window
 
         with torch.inference_mode(False), torch.no_grad():
             window = (
-                _BASE_SSIM_WINDOW.to(device=canonical_device, dtype=torch.float64)
+                _BASE_SSIM_WINDOW.to(dtype=target_dtype)
+                .to(device=canonical_device)
                 .expand(channels, 1, _SSIM_WINDOW_SIZE, _SSIM_WINDOW_SIZE)
                 .contiguous()
             )
 
-        resolved_key = (window.device, channels)
+        resolved_key: tuple[Any, ...] = (
+            (window.device, channels)
+            if target_dtype == default_dtype
+            else (window.device, channels, target_dtype)
+        )
         self._window_cache[resolved_key] = window
         self._window_cache[key] = window
         return window
@@ -252,6 +278,7 @@ class SSIMMetric(BaseMetric):
             min_cropped_size=_SSIM_WINDOW_SIZE,
         )
 
+        compute_dtype = _metric_compute_dtype(pred.device)
         with torch.no_grad(), torch.amp.autocast(device_type=pred.device.type, enabled=False):
             p = pred
             t = target_tensor
@@ -264,11 +291,14 @@ class SSIMMetric(BaseMetric):
                 img1 = rgb_to_y_bt601(p)
                 img2 = rgb_to_y_bt601(t)
             else:
-                img1 = p.to(dtype=torch.float64) * 255.0
-                img2 = t.to(dtype=torch.float64) * 255.0
+                img1 = p.to(dtype=compute_dtype) * 255.0
+                img2 = t.to(dtype=compute_dtype) * 255.0
+
+            if img2.dtype != img1.dtype:
+                img2 = img2.to(dtype=img1.dtype)
 
             channels = img1.shape[1]
-            window = self._get_window(img1.device, channels)
+            window = self._get_window(img1.device, channels, dtype=img1.dtype)
 
             mu1 = F.conv2d(img1, window, padding=0, groups=channels)
             mu2 = F.conv2d(img2, window, padding=0, groups=channels)
