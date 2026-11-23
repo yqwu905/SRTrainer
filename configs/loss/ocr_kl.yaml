@@ -1,7 +1,7 @@
 ocr_kl:
   weight: 0.0005
   criterion:
-    _target_: srtrainer.losses.OCRKLLoss
+    _target_: losses.OCRKLLoss
     checkpoint: PaddlePaddle/PP-OCRv5_server_rec_safetensors
     strip_height: 64
     strip_stride: 32

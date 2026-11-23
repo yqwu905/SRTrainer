@@ -1,4 +1,4 @@
-_target_: srtrainer.models.SRModel
+_target_: models.SRModel
 ema:
   enabled: true
   decay: 0.999

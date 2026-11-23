@@ -10,7 +10,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from srtrainer.utils.misc import pad_to_multiple, unpad_tensor
+from utils.misc import pad_to_multiple, unpad_tensor
 
 __all__ = ["DiffJPEG"]
 

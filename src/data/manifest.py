@@ -9,13 +9,13 @@ import math
 import numbers
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from omegaconf import ListConfig, OmegaConf
 from omegaconf.errors import OmegaConfBaseException
 
-from srtrainer.losses.glyph_loss import canonical_quad
+from losses.glyph_loss import canonical_quad
 
 __all__ = [
     "TrainSample",
@@ -136,7 +136,16 @@ def _normalize_glyph_entry(raw: Any, context: str) -> dict[str, Any]:
     return {"char": ch, "quad": pts.tolist()}
 
 
-def _normalize_text_lines(raw: Any, context: str) -> tuple[dict[str, Any], ...]:
+def _normalize_text_lines(
+    raw: Any,
+    context: str,
+    *,
+    image_alignment_valid: bool = True,
+) -> tuple[dict[str, Any], ...]:
+    if not isinstance(image_alignment_valid, bool):
+        raise ValueError(
+            f"{context}.alignment_valid must be a bool, got {type(image_alignment_valid).__name__}."
+        )
     if not isinstance(raw, list):
         raise ValueError(f"{context}: text_lines must be a list, got {type(raw).__name__}.")
     normalized: list[dict[str, Any]] = []
@@ -148,9 +157,10 @@ def _normalize_text_lines(raw: Any, context: str) -> tuple[dict[str, Any], ...]:
         valid = line.get("valid", True)
         if not isinstance(valid, bool):
             raise ValueError(f"{context}[{idx}].valid must be a bool.")
-        aligned = line.get("alignment_valid", True)
-        if not isinstance(aligned, bool):
+        line_aligned = line.get("alignment_valid", True)
+        if not isinstance(line_aligned, bool):
             raise ValueError(f"{context}[{idx}].alignment_valid must be a bool.")
+        aligned = image_alignment_valid and line_aligned
         for flag in ("difficult", "ignore"):
             flag_val = line.get(flag, False)
             if not isinstance(flag_val, bool):
@@ -194,7 +204,43 @@ def _normalize_flat_glyphs(raw: Any, context: str) -> tuple[dict[str, Any], ...]
     return ({"valid": True, "alignment_valid": True, "glyphs": glyphs},)
 
 
-def _load_external_glyphs_map(glyphs_json: str | Path) -> dict[str, tuple[dict[str, Any], ...]]:
+def _normalize_glyph_key(raw_key: str) -> str:
+    """Normalize an image path/key using pure string operations.
+
+    Converts backslashes to ``/``, collapses redundant separators and ``.`` segments,
+    and preserves case, meaningful spaces, and ``..`` segments without touching the filesystem.
+    """
+    replaced = raw_key.replace("\\", "/")
+    is_abs = replaced.startswith("/")
+    parts = [part for part in replaced.split("/") if part not in ("", ".")]
+    if is_abs:
+        return "/" + "/".join(parts)
+    if not parts:
+        return "."
+    return "/".join(parts)
+
+
+def _glyph_key_aliases(norm_key: str) -> tuple[str, str]:
+    """Return ``(basename, stem)`` aliases from an already-normalized glyph key."""
+    basename = PurePosixPath(norm_key).name
+    if not basename:
+        return "", ""
+    base_path = PurePosixPath(basename)
+    stem = base_path.stem if base_path.suffix.lower() in _IMAGE_SUFFIXES else basename
+    return basename, stem
+
+
+@dataclass(frozen=True)
+class _ExternalGlyphsIndex:
+    """Structured external glyph index separating exact full keys from basename/stem aliases."""
+
+    source_path: Path
+    exact: dict[str, tuple[dict[str, Any], ...]]
+    by_basename: dict[str, set[str]]
+    by_stem: dict[str, set[str]]
+
+
+def _load_external_glyphs_map(glyphs_json: str | Path) -> _ExternalGlyphsIndex:
     path = _validate_path_arg(glyphs_json, "glyphs_json")
     if not path.is_file():
         raise FileNotFoundError(f"Glyph annotations JSON file not found: {path}")
@@ -207,22 +253,87 @@ def _load_external_glyphs_map(glyphs_json: str | Path) -> dict[str, tuple[dict[s
             f"Glyph annotations JSON {path} must map image names/stems to line lists, "
             f"got {type(raw).__name__}."
         )
-    mapping: dict[str, tuple[dict[str, Any], ...]] = {}
+    exact: dict[str, tuple[dict[str, Any], ...]] = {}
+    raw_keys_by_norm: dict[str, str] = {}
+    by_basename: dict[str, set[str]] = {}
+    by_stem: dict[str, set[str]] = {}
     for raw_name, records in raw.items():
         if not isinstance(raw_name, str) or not raw_name.strip():
             raise ValueError(f"{path}: image keys must be non-empty strings.")
-        key_name = Path(raw_name.replace("\\", "/")).name
-        stem_key = (
-            Path(key_name).stem
-            if Path(key_name).suffix.lower() in _IMAGE_SUFFIXES
-            else key_name
+        norm_key = _normalize_glyph_key(raw_name)
+        if norm_key in exact:
+            prev_raw = raw_keys_by_norm[norm_key]
+            raise ValueError(
+                f"Duplicate normalized glyph key {norm_key!r} in {path}: "
+                f"raw keys {sorted((prev_raw, raw_name))!r} collide after path normalization."
+            )
+        if isinstance(records, Mapping):
+            image_aligned = records.get("alignment_valid", True)
+            if not isinstance(image_aligned, bool):
+                raise ValueError(
+                    f"{path}:{raw_name}.alignment_valid must be a bool, "
+                    f"got {type(image_aligned).__name__}."
+                )
+            line_list = records.get("lines")
+        else:
+            image_aligned = True
+            line_list = records
+        parsed = _normalize_text_lines(
+            line_list,
+            f"{path}:{raw_name}",
+            image_alignment_valid=image_aligned,
         )
-        line_list = records.get("lines") if isinstance(records, Mapping) else records
-        parsed = _normalize_text_lines(line_list, f"{path}:{raw_name}")
-        mapping[raw_name] = parsed
-        mapping[key_name] = parsed
-        mapping[stem_key] = parsed
-    return mapping
+        exact[norm_key] = parsed
+        raw_keys_by_norm[norm_key] = raw_name
+        basename, stem = _glyph_key_aliases(norm_key)
+        if basename:
+            by_basename.setdefault(basename, set()).add(norm_key)
+        if stem:
+            by_stem.setdefault(stem, set()).add(norm_key)
+    return _ExternalGlyphsIndex(
+        source_path=path,
+        exact=exact,
+        by_basename=by_basename,
+        by_stem=by_stem,
+    )
+
+
+def _lookup_external_glyphs(
+    index: _ExternalGlyphsIndex,
+    raw_gt: str,
+    *,
+    manifest_path: Path,
+    sample_idx: int,
+    source_name: str,
+) -> tuple[dict[str, Any], ...]:
+    norm_gt = _normalize_glyph_key(raw_gt)
+    if norm_gt in index.exact:
+        return index.exact[norm_gt]
+
+    gt_basename, gt_stem = _glyph_key_aliases(norm_gt)
+    if gt_basename and gt_basename in index.by_basename:
+        matches = index.by_basename[gt_basename]
+        if len(matches) == 1:
+            return index.exact[next(iter(matches))]
+        candidates = sorted(matches)
+        raise ValueError(
+            f"Ambiguous external glyph annotation match in {index.source_path} for "
+            f"Train manifest {manifest_path}[{sample_idx}] (source={source_name!r}, "
+            f"gt={raw_gt!r}) at basename level {gt_basename!r}: candidates={candidates!r}."
+        )
+
+    if gt_stem and gt_stem in index.by_stem:
+        matches = index.by_stem[gt_stem]
+        if len(matches) == 1:
+            return index.exact[next(iter(matches))]
+        candidates = sorted(matches)
+        raise ValueError(
+            f"Ambiguous external glyph annotation match in {index.source_path} for "
+            f"Train manifest {manifest_path}[{sample_idx}] (source={source_name!r}, "
+            f"gt={raw_gt!r}) at stem level {gt_stem!r}: candidates={candidates!r}."
+        )
+
+    return ()
 
 
 def load_train_manifest(
@@ -288,12 +399,13 @@ def load_train_manifest(
                 entry["glyphs"], f"Train manifest {path}[{idx}].glyphs"
             )
         elif external_glyphs is not None:
-            for lookup in (raw_gt, gt_path.name, gt_path.stem):
-                if lookup in external_glyphs:
-                    sample_lines = external_glyphs[lookup]
-                    break
-            if sample_lines is None:
-                sample_lines = ()
+            sample_lines = _lookup_external_glyphs(
+                external_glyphs,
+                raw_gt,
+                manifest_path=path,
+                sample_idx=idx,
+                source_name=resolved_name,
+            )
 
         samples.append(
             TrainSample(

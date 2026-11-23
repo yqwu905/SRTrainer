@@ -78,12 +78,12 @@ def test_t1_packaging_pyproject_and_gitignore(repo_root: Path) -> None:
     dev_deps = {_parse_dep_name(d) for d in project.get("optional-dependencies", {}).get("dev", [])}
     assert {"pytest", "ruff"}.issubset(dev_deps)
 
-    # Confirm src/srtrainer layout and editable import resolution.
-    assert (repo_root / "src" / "srtrainer" / "__init__.py").is_file()
-    import srtrainer
+    # Confirm flattened src/ layout and editable import resolution.
+    assert (repo_root / "src" / "archs" / "__init__.py").is_file()
+    import archs
 
-    pkg_file = Path(srtrainer.__file__).resolve()
-    expected_pkg_root = (repo_root / "src" / "srtrainer").resolve()
+    pkg_file = Path(archs.__file__).resolve()
+    expected_pkg_root = (repo_root / "src").resolve()
     assert expected_pkg_root in pkg_file.parents
 
     # Confirm .gitignore ignores generated runtime artifacts.
@@ -103,29 +103,29 @@ def test_t1_subpackage_short_target_reexports() -> None:
     """F02, Req #5: Short-path __all__ re-exports expose ONLY ToyModel and L1Loss/LPIPSLoss."""
     import hydra.utils
 
-    import srtrainer.archs as archs_pkg
-    import srtrainer.losses as losses_pkg
+    import archs as archs_pkg
+    import losses as losses_pkg
 
     assert hasattr(archs_pkg, "__all__")
     assert set(archs_pkg.__all__) == {"ToyModel", "VOSR2OneStep"}, (
-        f"Unexpected srtrainer.archs.__all__: {archs_pkg.__all__!r}"
+        f"Unexpected archs.__all__: {archs_pkg.__all__!r}"
     )
     for sym in ("ToyModel", "VOSR2OneStep"):
-        assert hydra.utils.get_class(f"srtrainer.archs.{sym}") is getattr(archs_pkg, sym)
+        assert hydra.utils.get_class(f"archs.{sym}") is getattr(archs_pkg, sym)
     for forbidden_arch in ("RRDBNet", "SwinIR", "TinySRNet"):
         assert not hasattr(archs_pkg, forbidden_arch), (
-            f"Forbidden architecture {forbidden_arch!r} must not exist in srtrainer.archs"
+            f"Forbidden architecture {forbidden_arch!r} must not exist in archs"
         )
 
     assert hasattr(losses_pkg, "__all__")
     assert set(losses_pkg.__all__) == {"L1Loss", "LPIPSLoss", "OCRKLLoss", "GlyphLoss"}, (
-        f"Unexpected srtrainer.losses.__all__: {losses_pkg.__all__!r}"
+        f"Unexpected losses.__all__: {losses_pkg.__all__!r}"
     )
     for sym in ("L1Loss", "LPIPSLoss", "OCRKLLoss", "GlyphLoss"):
-        assert hydra.utils.get_class(f"srtrainer.losses.{sym}") is getattr(losses_pkg, sym)
+        assert hydra.utils.get_class(f"losses.{sym}") is getattr(losses_pkg, sym)
     for forbidden_loss in ("CharbonnierLoss", "FFTLoss"):
         assert not hasattr(losses_pkg, forbidden_loss), (
-            f"Forbidden loss {forbidden_loss!r} must not exist in srtrainer.losses"
+            f"Forbidden loss {forbidden_loss!r} must not exist in losses"
         )
 
 
@@ -147,11 +147,11 @@ def test_t1_train_yaml_default_composition_and_hydra_guards(
     for group in ("arch", "loss", "model", "data", "optim", "metric", "trainer"):
         assert group in cfg, f"Missing atomic group {group!r} in composed train.yaml"
 
-    assert cfg.arch._target_ == "srtrainer.archs.ToyModel"
+    assert cfg.arch._target_ == "archs.ToyModel"
     assert cfg.arch.scale == 4
     assert cfg.data.scale == 4
     assert cfg.optim.scheduler.T_max == cfg.trainer.total_iters
-    assert cfg.model._target_ == "srtrainer.models.SRModel"
+    assert cfg.model._target_ == "models.SRModel"
     assert "ema" in cfg.model
     assert "pretrain_path" in cfg.model
 
@@ -199,8 +199,8 @@ def test_t1_atomic_arch_loss_optim_instantiation(
     import torch
     import torch.nn as nn
 
-    from srtrainer.archs import ToyModel
-    from srtrainer.losses import L1Loss, LPIPSLoss
+    from archs import ToyModel
+    from losses import L1Loss, LPIPSLoss
 
     cfg = hydra_compose(
         "train",
@@ -250,7 +250,7 @@ def test_t1_atomic_arch_loss_optim_instantiation(
 
     # Verify toy_x4 scale interpolation cascades from global scale.
     cfg_toy_x2 = hydra_compose("train", overrides=["arch=toy_x4", "scale=2"])
-    assert cfg_toy_x2.arch._target_ == "srtrainer.archs.ToyModel"
+    assert cfg_toy_x2.arch._target_ == "archs.ToyModel"
     assert cfg_toy_x2.arch.scale == 2
 
 
@@ -269,7 +269,7 @@ def test_t1_multilevel_experiment_inheritance(
     exp_cfg = hydra_compose("train", overrides=["experiment=exp01_toy_mixed_x4"])
     assert exp_cfg.exp_name == "exp01_toy_l1_lpips_x4"
     assert exp_cfg.work_dir == "experiments/exp01_toy_l1_lpips_x4"
-    assert exp_cfg.arch._target_ == "srtrainer.archs.ToyModel"
+    assert exp_cfg.arch._target_ == "archs.ToyModel"
     assert exp_cfg.arch.num_feat == 16
 
     # Partial overrides preserve sibling keys from inherited groups.
@@ -421,7 +421,7 @@ def test_t1_config_utils_work_dir_setup_and_resolved_roundtrip(
     hydra_value_formatter: Callable[[Any], str],
 ) -> None:
     """F16: resolve_work_dir, setup_experiment_dirs, save/load_resolved_config roundtrip."""
-    from srtrainer.utils.config import (
+    from utils.config import (
         load_resolved_config,
         resolve_work_dir,
         save_resolved_config,
@@ -465,7 +465,7 @@ def test_t1_config_utils_normalize_mp_and_flatten_for_tracker(
     hydra_compose: Callable[..., Any],
 ) -> None:
     """F16: normalize_mixed_precision and flatten_config_for_tracker contracts."""
-    from srtrainer.utils.config import flatten_config_for_tracker, normalize_mixed_precision
+    from utils.config import flatten_config_for_tracker, normalize_mixed_precision
 
     assert normalize_mixed_precision("no") == "no"
     assert normalize_mixed_precision("fp16") == "fp16"

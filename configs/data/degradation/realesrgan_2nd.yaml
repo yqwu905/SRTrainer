@@ -1,4 +1,4 @@
-_target_: srtrainer.data.degradation.RealESRGANDegrader
+_target_: data.degradation.RealESRGANDegrader
 scale: ${scale}
 use_usm: false                 # Optional GT USM sharpening (applied to gt_only subset)
 queue_size: 0                  # Optional post-degradation TrainingPool (0 = off; >0 must be multiple of batch_size)

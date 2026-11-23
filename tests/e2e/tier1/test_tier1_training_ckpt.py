@@ -42,7 +42,7 @@ def test_t1_base_model_abc_and_srmodel_setup_contracts(
     import torch.nn as nn
     from accelerate import Accelerator
 
-    from srtrainer.models import BaseModel, SRModel
+    from models import BaseModel, SRModel
 
     assert issubclass(BaseModel, abc.ABC)
     src = paired_train_source_factory(name="srmodel_src", n_samples=2, lq_h=16, lq_w=16, scale=2)
@@ -110,8 +110,8 @@ def test_t1_model_ema_fp32_update_warmup_and_state_roundtrip() -> None:
     import torch
     import torch.nn as nn
 
-    from srtrainer.archs import ToyModel
-    from srtrainer.models import ModelEMA
+    from archs import ToyModel
+    from models import ModelEMA
 
     torch.manual_seed(4)
     net = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
@@ -181,26 +181,26 @@ def test_t1_srmodel_named_loss_dict_raw_values_and_skip_nonpositive(
     import torch
     from accelerate import Accelerator
 
-    from srtrainer.models import SRModel
+    from models import SRModel
 
     # gt_size=64 so offline AlexNet LPIPS runs cleanly at 64x64.
     src = paired_train_source_factory(name="loss_src", n_samples=2, lq_h=32, lq_w=32, scale=2)
     loss_cfg = {
         "l1": {
             "weight": 1.0,
-            "criterion": {"_target_": "srtrainer.losses.L1Loss", "reduction": "mean"},
+            "criterion": {"_target_": "losses.L1Loss", "reduction": "mean"},
         },
         "lpips": {
             "weight": 0.5,
             "criterion": {
-                "_target_": "srtrainer.losses.LPIPSLoss",
+                "_target_": "losses.LPIPSLoss",
                 "net": "alex",
                 "pretrained": False,
             },
         },
         "l1_disabled": {
             "weight": 0.0,
-            "criterion": {"_target_": "srtrainer.losses.L1Loss", "reduction": "mean"},
+            "criterion": {"_target_": "losses.L1Loss", "reduction": "mean"},
         },
     }
     cfg = minimal_train_cfg_factory(
@@ -248,9 +248,9 @@ def test_t1_srmodel_pretrain_safetensors_and_basicsr_pth_cloned_to_ema(
     from accelerate import Accelerator
     from accelerate.state import AcceleratorState, GradientState
 
-    from srtrainer.archs import ToyModel
-    from srtrainer.models import SRModel
-    from srtrainer.utils.misc import save_safetensors
+    from archs import ToyModel
+    from models import SRModel
+    from utils.misc import save_safetensors
 
     torch.manual_seed(21)
     ref_net = ToyModel(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
@@ -330,7 +330,7 @@ def test_t1_srmodel_grad_accum_and_lr_scheduler_step_cadence(
     import torch
     from accelerate import Accelerator
 
-    from srtrainer.models import SRModel
+    from models import SRModel
 
     base_lr = 2.0e-4
     eta_min = 1.0e-6
@@ -458,12 +458,12 @@ def test_t1_train_state_and_checkpointer_dual_track_and_resolve(
     from accelerate import Accelerator
     from accelerate.utils import ProjectConfiguration
 
-    import srtrainer.engine as engine_pkg
-    from srtrainer.archs import ToyModel
-    from srtrainer.engine import Checkpointer, TrainState
+    import engine as engine_pkg
+    from archs import ToyModel
+    from engine import Checkpointer, TrainState
 
     for sym in ("Trainer", "TrainState", "Checkpointer", "TiledInferencer"):
-        assert hasattr(engine_pkg, sym), f"Missing srtrainer.engine.{sym} re-export"
+        assert hasattr(engine_pkg, sym), f"Missing engine.{sym} re-export"
 
     state = TrainState(global_step=7, best_metrics={"set5/psnr": 31.5})
     state_copy = TrainState()
@@ -523,7 +523,7 @@ def test_t1_trainer_fit_full_dir_layout_train_log_visuals_and_best(
     """F46, F48: Trainer.fit() produces full dir layout, train.log, Track 1/2 ckpts, visuals, best."""
     from PIL import Image
 
-    from srtrainer.engine import Trainer
+    from engine import Trainer
 
     gt_src = gt_only_train_source_factory(name="mix_gt", n_samples=4, gt_h=48, gt_w=48, ratio=0.5)
     pair_src = paired_train_source_factory(
@@ -539,12 +539,12 @@ def test_t1_trainer_fit_full_dir_layout_train_log_visuals_and_best(
             },
             "metrics": {
                 "psnr": {
-                    "_target_": "srtrainer.metrics.PSNRMetric",
+                    "_target_": "metrics.PSNRMetric",
                     "crop_border": 2,
                     "test_y_channel": True,
                 },
                 "ssim": {
-                    "_target_": "srtrainer.metrics.SSIMMetric",
+                    "_target_": "metrics.SSIMMetric",
                     "crop_border": 2,
                     "test_y_channel": True,
                 },
@@ -618,7 +618,7 @@ def test_t1_trainer_tensorboard_tracker_flat_hparams_and_images(
     minimal_train_cfg_factory: Callable[..., Any],
 ) -> None:
     """F46: TensorBoard tracker initializes with flattened hparams and writes event files."""
-    from srtrainer.engine import Trainer
+    from engine import Trainer
 
     pair_src = paired_train_source_factory(
         name="tb_pair", n_samples=2, lq_h=16, lq_w=16, scale=2, ratio=1.0
@@ -632,7 +632,7 @@ def test_t1_trainer_tensorboard_tracker_flat_hparams_and_images(
             },
             "metrics": {
                 "psnr": {
-                    "_target_": "srtrainer.metrics.PSNRMetric",
+                    "_target_": "metrics.PSNRMetric",
                     "crop_border": 2,
                     "test_y_channel": True,
                 },
@@ -687,7 +687,7 @@ def test_t1_tools_train_cli_subprocess_cwd_independent(
             },
             "metrics": {
                 "psnr": {
-                    "_target_": "srtrainer.metrics.PSNRMetric",
+                    "_target_": "metrics.PSNRMetric",
                     "crop_border": 2,
                     "test_y_channel": True,
                 },

@@ -8,7 +8,7 @@
 
 - **分层训练引擎 + Accelerate**：`Trainer` 统一管理 `Accelerator`、纯 Iteration 驱动循环、多验证集分布式精确评估（`gather_for_metrics`）、双轨 Checkpoint 与多 Tracker 日志；`BaseModel` / `SRModel` 封装网络、FP32 `ModelEMA`、任意可组合 Loss 字典与单步更新（`lr_scheduler` 不经 `prepare()`，避免多卡倍速步进）。
 - **纯 Hydra `_target_` 分级配置与多级继承**：按 `arch / loss / model / data / optim / metric / trainer / infer` 拆分原子配置组，在 `configs/experiment/` 中通过 `# @package _global_` 多级继承并快速覆写局部参数；包级 `__init__.py` 提供短路径重导出。
-- **内置网络与损失函数**：`src/srtrainer/archs/` 提供轻量占位网络 `srtrainer.archs.ToyModel` 与单步生成超分网络 `srtrainer.archs.VOSR2OneStep`（含冻结 Qwen-Image 2D VAE 与 DINOv2-ViT-L/14，权重与官方 VOSR2 checkpoint 键完全对齐）；`src/srtrainer/losses/` 内置 `L1Loss`、`LPIPSLoss`、基于冻结 PP-OCRv5 的 `OCRKLLoss` 与基于冻结 TextVerifier Stage-3 的 `GlyphLoss`，同时支持通过 Hydra `_target_` 直接接入任意自定义网络与损失函数。
+- **内置网络与损失函数**：`src/archs/` 提供轻量占位网络 `archs.ToyModel` 与单步生成超分网络 `archs.VOSR2OneStep`（含冻结 Qwen-Image 2D VAE 与 DINOv2-ViT-L/14，权重与官方 VOSR2 checkpoint 键完全对齐）；`src/losses/` 内置 `L1Loss`、`LPIPSLoss`、基于冻结 PP-OCRv5 的 `OCRKLLoss` 与基于冻结 TextVerifier Stage-3 的 `GlyphLoss`，同时支持通过 Hydra `_target_` 直接接入任意自定义网络与损失函数。
 - **统一 JSON 清单 + 样本级混合与 GPU 掩码 Real-ESRGAN 退化**：
   - 仅读取独立图像文件（`.jpg/.png/.jpeg/.webp`），`gt_only` 与 `paired` 统一使用字典列表 JSON，自动根据样本是否含有效 `lq` 判定模式（配置中无需 `mode`）；支持在清单内嵌 `text_lines` / `glyphs` 或在数据源上挂载 VOSR `glyphs_json` 以启用 `GlyphLoss`；
   - `MixedSRDataset` + `DistributedWeightedInfiniteSampler` 严格按 `ratio` 跨数据源采样并支持 O(1) 断点续训；
@@ -116,7 +116,7 @@ python tools/infer.py \
 ### 3. 扩展自定义组件
 
 - **自定义网络 / Loss**：编写普通 PyTorch `nn.Module`，在 `configs/arch/*.yaml` 或 `configs/loss/*.yaml` 中填写 `_target_` 即可。
-- **自定义指标（含附加标注输入，如 OCR-A）**：继承 `srtrainer.metrics.BaseMetric`，实现 `compute(self, pred, target=None, meta=None) -> float`，并在 `configs/metric/*.yaml` 对应验证套件的 `metrics` 中通过 `_target_` 挂载。
+- **自定义指标（含附加标注输入，如 OCR-A）**：继承 `metrics.BaseMetric`，实现 `compute(self, pred, target=None, meta=None) -> float`，并在 `configs/metric/*.yaml` 对应验证套件的 `metrics` 中通过 `_target_` 挂载。
 
 ## 测试与代码检查
 

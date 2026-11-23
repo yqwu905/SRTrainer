@@ -1,18 +1,18 @@
 l1:
   weight: 1.0
   criterion:
-    _target_: srtrainer.losses.L1Loss
+    _target_: losses.L1Loss
     reduction: mean
 lpips:
   weight: 0.02
   criterion:
-    _target_: srtrainer.losses.LPIPSLoss
+    _target_: losses.LPIPSLoss
     net: vgg
     pretrained: true
 ocr_kl:
   weight: 0.0005
   criterion:
-    _target_: srtrainer.losses.OCRKLLoss
+    _target_: losses.OCRKLLoss
     checkpoint: PaddlePaddle/PP-OCRv5_server_rec_safetensors
     strip_height: 64
     strip_stride: 32
@@ -22,7 +22,7 @@ ocr_kl:
 glyph:
   weight: 1.0
   criterion:
-    _target_: srtrainer.losses.GlyphLoss
+    _target_: losses.GlyphLoss
     model_dir: null
     repo_id: ATH-MaaS/TextVerifier-CJK-CLIP
     revision: adc233a117cbb039842b245b5acf84e0143a5f11

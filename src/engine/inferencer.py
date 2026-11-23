@@ -12,8 +12,8 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from torch import nn
 
-from srtrainer.utils.config import normalize_mixed_precision
-from srtrainer.utils.misc import pad_to_min_size, pad_to_multiple, unpad_tensor
+from utils.config import normalize_mixed_precision
+from utils.misc import pad_to_min_size, pad_to_multiple, unpad_tensor
 
 __all__ = [
     "TiledInferencer",

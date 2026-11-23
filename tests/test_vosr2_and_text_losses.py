@@ -16,19 +16,19 @@ from omegaconf import OmegaConf
 from PIL import Image
 from safetensors.torch import save_file
 
-from srtrainer.archs import VOSR2OneStep
-from srtrainer.archs.vosr2 import AutoencoderKLQwenImage2D, VOSR2DiT
-from srtrainer.data.mixed_dataset import MixedSRDataset, train_collate_fn
-from srtrainer.engine import TiledInferencer, Trainer
-from srtrainer.losses import GlyphLoss, OCRKLLoss
-from srtrainer.losses.glyph_loss import canonical_quad, rectify_text_roi
-from srtrainer.losses.ocr_kl_loss import (
+from archs import VOSR2OneStep
+from archs.vosr2 import AutoencoderKLQwenImage2D, VOSR2DiT
+from data.mixed_dataset import MixedSRDataset, train_collate_fn
+from engine import TiledInferencer, Trainer
+from losses import GlyphLoss, OCRKLLoss
+from losses.glyph_loss import canonical_quad, rectify_text_roi
+from losses.ocr_kl_loss import (
     PPOCRv5ServerRec,
     extract_text_strips,
     load_ppocr_recognizer,
 )
-from srtrainer.models import ModelEMA
-from srtrainer.utils.misc import load_weights, save_safetensors
+from models import ModelEMA
+from utils.misc import load_weights, save_safetensors
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIGS_DIR = str((REPO_ROOT / "configs").resolve())
@@ -465,15 +465,15 @@ def test_hydra_configs_vosr2_ocr_kl_and_glyph() -> None:
         cfg = hydra.compose(config_name="train", overrides=["experiment=exp02_vosr2_x4"])
 
     assert cfg.exp_name == "exp02_vosr2_onestep_text_x4"
-    assert cfg.arch._target_ == "srtrainer.archs.VOSR2OneStep"
+    assert cfg.arch._target_ == "archs.VOSR2OneStep"
     assert cfg.arch.hidden_size == 1536
     assert cfg.arch.depth == 36
     assert cfg.arch.num_heads == 24
     assert cfg.arch.input_size == 64
     assert cfg.arch.z_dims == 1024
     assert set(cfg.loss.keys()) == {"l1", "lpips", "ocr_kl", "glyph"}
-    assert cfg.loss.ocr_kl.criterion._target_ == "srtrainer.losses.OCRKLLoss"
-    assert cfg.loss.glyph.criterion._target_ == "srtrainer.losses.GlyphLoss"
+    assert cfg.loss.ocr_kl.criterion._target_ == "losses.OCRKLLoss"
+    assert cfg.loss.glyph.criterion._target_ == "losses.GlyphLoss"
     assert cfg.data.augment.hflip is False
     assert cfg.data.augment.vflip is False
     assert cfg.data.augment.rot90 is False
@@ -527,7 +527,7 @@ def test_end_to_end_trainer_vosr2_with_ocr_kl_and_glyph_losses(
             "seed": 42,
             "work_dir": str(work_dir),
             "arch": {
-                "_target_": "srtrainer.archs.VOSR2OneStep",
+                "_target_": "archs.VOSR2OneStep",
                 "scale": 4,
                 "input_size": 8,
                 "patch_size": 2,
@@ -552,12 +552,12 @@ def test_end_to_end_trainer_vosr2_with_ocr_kl_and_glyph_losses(
             "loss": {
                 "l1": {
                     "weight": 1.0,
-                    "criterion": {"_target_": "srtrainer.losses.L1Loss", "reduction": "mean"},
+                    "criterion": {"_target_": "losses.L1Loss", "reduction": "mean"},
                 },
                 "ocr_kl": {
                     "weight": 0.1,
                     "criterion": {
-                        "_target_": "srtrainer.losses.OCRKLLoss",
+                        "_target_": "losses.OCRKLLoss",
                         "pretrained": False,
                         "num_classes": 16,
                         "strip_height": 16,
@@ -568,14 +568,14 @@ def test_end_to_end_trainer_vosr2_with_ocr_kl_and_glyph_losses(
                 "glyph": {
                     "weight": 1.0,
                     "criterion": {
-                        "_target_": "srtrainer.losses.GlyphLoss",
+                        "_target_": "losses.GlyphLoss",
                         "pretrained": False,
                         "batch_size": 4,
                     },
                 },
             },
             "model": {
-                "_target_": "srtrainer.models.SRModel",
+                "_target_": "models.SRModel",
                 "ema": {"enabled": True, "decay": 0.99, "warmup_steps": 0},
                 "pretrain_path": None,
                 "pretrain_strict": True,
@@ -620,7 +620,7 @@ def test_end_to_end_trainer_vosr2_with_ocr_kl_and_glyph_losses(
                         },
                         "metrics": {
                             "psnr": {
-                                "_target_": "srtrainer.metrics.PSNRMetric",
+                                "_target_": "metrics.PSNRMetric",
                                 "crop_border": 0,
                                 "test_y_channel": False,
                             }

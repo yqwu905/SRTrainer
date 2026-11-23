@@ -11,7 +11,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from srtrainer.utils.misc import strip_state_dict_prefix
+from utils.misc import strip_state_dict_prefix
 
 __all__ = ["ModelEMA", "unwrap_model_for_ema"]
 

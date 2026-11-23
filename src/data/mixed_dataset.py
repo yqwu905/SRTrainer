@@ -17,14 +17,14 @@ from omegaconf import OmegaConf
 from omegaconf.errors import OmegaConfBaseException
 from torch.utils.data import Dataset, default_collate
 
-from srtrainer.data.degradation.kernels import KernelGenerator
-from srtrainer.data.manifest import SourceStats, TrainSample, validate_sources_config
-from srtrainer.data.transforms import (
+from data.degradation.kernels import KernelGenerator
+from data.manifest import SourceStats, TrainSample, validate_sources_config
+from data.transforms import (
     augment_tensors_with_flags,
     paired_random_crop_with_coords,
     random_crop_with_coords,
 )
-from srtrainer.utils.image import load_image
+from utils.image import load_image
 
 __all__ = ["MixedSRDataset", "train_collate_fn"]
 

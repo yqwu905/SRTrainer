@@ -18,11 +18,11 @@ from accelerate.state import AcceleratorState, GradientState, PartialState
 from omegaconf import DictConfig, OmegaConf
 from torch import nn
 
-from srtrainer.engine.inferencer import TiledInferencer
-from srtrainer.utils.config import load_resolved_config, normalize_mixed_precision
-from srtrainer.utils.image import IMAGE_EXTENSIONS, load_image, save_image
-from srtrainer.utils.logging import setup_logger
-from srtrainer.utils.misc import load_weights
+from engine.inferencer import TiledInferencer
+from utils.config import load_resolved_config, normalize_mixed_precision
+from utils.image import IMAGE_EXTENSIONS, load_image, save_image
+from utils.logging import setup_logger
+from utils.misc import load_weights
 
 __all__ = [
     "ALLOWED_SAVE_FORMATS",

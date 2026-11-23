@@ -68,8 +68,8 @@ def _reference_basicsr_ssim(
 
 
 def test_t1_d01_metrics_reexports_and_base_metric_protocol() -> None:
-    """F02, F30: srtrainer.metrics re-exports, ABC protocol, higher_is_better flags, .to()."""
-    from srtrainer.metrics import BaseMetric, LPIPSMetric, PSNRMetric, SSIMMetric
+    """F02, F30: metrics re-exports, ABC protocol, higher_is_better flags, .to()."""
+    from metrics import BaseMetric, LPIPSMetric, PSNRMetric, SSIMMetric
 
     assert issubclass(BaseMetric, abc.ABC)
     assert BaseMetric.higher_is_better is True
@@ -91,7 +91,7 @@ def test_t1_d02_val_dataset_and_collate_with_gt_and_meta_passthrough(
     import torch
     from torch.utils.data import DataLoader
 
-    from srtrainer.data import ValImageDataset, val_collate_fn
+    from data import ValImageDataset, val_collate_fn
 
     suite = val_suite_gt_label_factory(name="paired_meta", scale=2)
     ds = ValImageDataset(root_dir=suite["root_dir"], json_path=suite["json_path"])
@@ -129,7 +129,7 @@ def test_t1_d03_val_dataset_and_collate_gt_less_autodetect(
     import torch
     from torch.utils.data import DataLoader
 
-    from srtrainer.data import ValImageDataset, val_collate_fn
+    from data import ValImageDataset, val_collate_fn
 
     suite = val_suite_gt_less_meta_factory(name="nogt_meta")
     ds = ValImageDataset(root_dir=suite["root_dir"], json_path=suite["json_path"])
@@ -165,7 +165,7 @@ def test_t1_d04_psnr_metric_rgb_and_basicsr_bt601_y_channel_exact_oracle() -> No
     """F31: PSNRMetric exact parity with BasicSR/MATLAB RGB and ITU-R BT.601 Y-channel formulas."""
     import torch
 
-    from srtrainer.metrics import PSNRMetric
+    from metrics import PSNRMetric
 
     psnr_rgb = PSNRMetric(crop_border=0, test_y_channel=False)
     psnr_y = PSNRMetric(crop_border=0, test_y_channel=True)
@@ -212,7 +212,7 @@ def test_t1_d05_ssim_metric_rgb_and_basicsr_bt601_y_channel_exact_oracle() -> No
     """F32: SSIMMetric exact BasicSR/MATLAB BT.601 Y & RGB analytical + reference parity."""
     import torch
 
-    from srtrainer.metrics import SSIMMetric
+    from metrics import SSIMMetric
 
     ssim_rgb = SSIMMetric(crop_border=0, test_y_channel=False)
     ssim_y = SSIMMetric(crop_border=0, test_y_channel=True)
@@ -265,7 +265,7 @@ def test_t1_d06_lpips_metric_offline_cached_and_semantics() -> None:
     """F33: LPIPSMetric(pretrained=False) is offline-safe, lower-is-better, monotonic, cached."""
     import torch
 
-    from srtrainer.metrics import LPIPSMetric
+    from metrics import LPIPSMetric
 
     metric = LPIPSMetric(net="alex", pretrained=False).to("cpu")
     assert metric.higher_is_better is False
@@ -295,8 +295,8 @@ def test_t1_d07_custom_base_metric_via_hydra_target_with_meta_and_no_gt(
     import hydra.utils
     from torch.utils.data import DataLoader
 
-    from srtrainer.data import ValImageDataset, val_collate_fn
-    from srtrainer.metrics import BaseMetric
+    from data import ValImageDataset, val_collate_fn
+    from metrics import BaseMetric
 
     metric = hydra.utils.instantiate(
         {
@@ -336,7 +336,7 @@ def test_t1_d08_hydra_val_suites_config_structure_and_co_location(
     import hydra.utils
     from omegaconf import OmegaConf
 
-    from srtrainer.metrics import BaseMetric
+    from metrics import BaseMetric
 
     cfg = hydra_compose("train")
     assert "val_suites" in cfg.metric
@@ -357,12 +357,12 @@ def test_t1_d08_hydra_val_suites_config_structure_and_co_location(
                     },
                     "metrics": {
                         "psnr": {
-                            "_target_": "srtrainer.metrics.PSNRMetric",
+                            "_target_": "metrics.PSNRMetric",
                             "crop_border": 2,
                             "test_y_channel": True,
                         },
                         "ssim": {
-                            "_target_": "srtrainer.metrics.SSIMMetric",
+                            "_target_": "metrics.SSIMMetric",
                             "crop_border": 2,
                             "test_y_channel": True,
                         },
@@ -397,7 +397,7 @@ def test_t1_d09_custom_lower_is_better_metric_via_hydra_target() -> None:
     import hydra.utils
     import torch
 
-    from srtrainer.metrics import BaseMetric
+    from metrics import BaseMetric
 
     metric = hydra.utils.instantiate(
         {

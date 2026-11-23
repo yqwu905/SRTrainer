@@ -25,9 +25,9 @@ from PIL import Image
 from safetensors import safe_open
 from torch.nn import functional as F
 
-from srtrainer.archs import ToyModel
-from srtrainer.losses import L1Loss, LPIPSLoss
-from srtrainer.utils import (
+from archs import ToyModel
+from losses import L1Loss, LPIPSLoss
+from utils import (
     IMAGE_EXTENSIONS,
     flatten_config_for_tracker,
     format_eta,
@@ -288,7 +288,7 @@ import torch.distributed as dist
 from omegaconf import OmegaConf
 from accelerate import Accelerator
 from accelerate.utils import DistributedType
-from srtrainer.utils.config import resolve_work_dir
+from utils.config import resolve_work_dir
 
 if int(os.environ.get("RANK", "0")) == 1:
     time.sleep(1.2)
@@ -357,7 +357,7 @@ def test_setup_experiment_dirs_and_resolved_config_io(tmp_path: Path) -> None:
     loaded = load_resolved_config(cfg_path)
     assert loaded.exp_name == "exp01_toy_l1_lpips_x4"
     assert loaded.work_dir == "experiments/exp01_toy_l1_lpips_x4"
-    assert loaded.arch._target_ == "srtrainer.archs.ToyModel"
+    assert loaded.arch._target_ == "archs.ToyModel"
     assert loaded.arch.num_feat == 16
     assert loaded.optim.scheduler.T_max == 200000
     assert list(loaded.optim.optimizer.betas) == [0.9, 0.99]
@@ -415,7 +415,7 @@ def test_flatten_config_for_tracker_and_real_tensorboard_init(
         assert isinstance(k, str)
         assert type(v) in (bool, int, float, str), f"Unsafe type {type(v)} for {k}={v!r}"
     assert flat["exp_name"] == "exp01_toy_l1_lpips_x4"
-    assert flat["arch._target_"] == "srtrainer.archs.ToyModel"
+    assert flat["arch._target_"] == "archs.ToyModel"
     assert flat["arch.num_feat"] == 16
     assert flat["model.pretrain_path"] == "null"
     assert flat["data.sources.0.name"] == "df2k_gt"

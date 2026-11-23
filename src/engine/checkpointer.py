@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from srtrainer.utils.misc import save_safetensors
+from utils.misc import save_safetensors
 
 if TYPE_CHECKING:
     from accelerate import Accelerator

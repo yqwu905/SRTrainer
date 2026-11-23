@@ -40,7 +40,7 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["srtrainer*"]
+include = ["archs*", "data*", "engine*", "losses*", "metrics*", "models*", "utils*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

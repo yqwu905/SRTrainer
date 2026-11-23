@@ -56,7 +56,7 @@ def _collect_dict_keys_recursive(obj: Any) -> set[str]:
 
 def test_t2_a01_normalize_mixed_precision_coercions_and_rejections() -> None:
     """F16: normalize_mixed_precision handles YAML bool/null/case coercions and rejects bad inputs."""
-    from srtrainer.utils.config import normalize_mixed_precision
+    from utils.config import normalize_mixed_precision
 
     for no_val in (False, None, "", "none", "None", "NO", "No", "no"):
         assert normalize_mixed_precision(no_val) == "no", f"Expected 'no' for {no_val!r}"
@@ -75,7 +75,7 @@ def test_t2_a02_setup_experiment_dirs_non_main_noop_and_idempotency(
     e2e_workdir: dict[str, Path],
 ) -> None:
     """F16: setup_experiment_dirs is a filesystem no-op on non-main ranks and idempotent on main."""
-    from srtrainer.utils.config import setup_experiment_dirs
+    from utils.config import setup_experiment_dirs
 
     non_main_dir = e2e_workdir["work"] / "rank1_noop"
     dirs_nm = setup_experiment_dirs(non_main_dir, is_main_process=False)
@@ -107,7 +107,7 @@ def test_t2_a03_resolve_work_dir_timestamp_toggle(
     hydra_value_formatter: Callable[[Any], str],
 ) -> None:
     """F16: resolve_work_dir returns exact path when append_timestamp=False and suffix when True."""
-    from srtrainer.utils.config import resolve_work_dir
+    from utils.config import resolve_work_dir
 
     work_root = e2e_workdir["work"]
     cfg_bare = hydra_compose(
@@ -144,7 +144,7 @@ def test_t2_a04_load_resolved_config_missing_and_edge_roundtrip(
     hydra_value_formatter: Callable[[Any], str],
 ) -> None:
     """F16: load_resolved_config fails fast on missing files and preserves edge YAML types."""
-    from srtrainer.utils.config import load_resolved_config, save_resolved_config
+    from utils.config import load_resolved_config, save_resolved_config
 
     with pytest.raises(FileNotFoundError):
         load_resolved_config(e2e_workdir["work"] / "missing_resolved.yaml")
@@ -178,7 +178,7 @@ def test_t2_a05_flatten_config_for_tracker_edge_values() -> None:
     """F16: flatten_config_for_tracker sanitizes None, empty containers, lists, and interpolations."""
     from omegaconf import OmegaConf
 
-    from srtrainer.utils.config import flatten_config_for_tracker
+    from utils.config import flatten_config_for_tracker
 
     cfg = OmegaConf.create(
         {
@@ -254,7 +254,7 @@ def test_t2_a07_hydra_cli_edge_overrides_and_partial_loss_override(
     hydra_compose: Callable[..., Any],
 ) -> None:
     """F05, F10, F12, F16: Edge CLI overrides for trackers, mixed_precision, and partial loss weight."""
-    from srtrainer.utils.config import normalize_mixed_precision
+    from utils.config import normalize_mixed_precision
 
     cfg_null_log = hydra_compose("train", overrides=["trainer.log_with=null"])
     assert cfg_null_log.trainer.log_with is None
@@ -271,8 +271,8 @@ def test_t2_a07_hydra_cli_edge_overrides_and_partial_loss_override(
     )
     assert cfg_zero_lpips.loss.lpips.weight == pytest.approx(0.0)
     assert cfg_zero_lpips.loss.l1.weight == pytest.approx(1.0)
-    assert cfg_zero_lpips.loss.l1.criterion._target_ == "srtrainer.losses.L1Loss"
-    assert cfg_zero_lpips.loss.lpips.criterion._target_ == "srtrainer.losses.LPIPSLoss"
+    assert cfg_zero_lpips.loss.l1.criterion._target_ == "losses.L1Loss"
+    assert cfg_zero_lpips.loss.lpips.criterion._target_ == "losses.LPIPSLoss"
 
 
 def test_t2_a08_realesrgan_2nd_standalone_schema_and_bounds(configs_dir: Path) -> None:
@@ -282,7 +282,7 @@ def test_t2_a08_realesrgan_2nd_standalone_schema_and_bounds(configs_dir: Path) -
     deg_path = configs_dir / "data" / "degradation" / "realesrgan_2nd.yaml"
     raw = yaml.safe_load(deg_path.read_text(encoding="utf-8"))
     assert isinstance(raw, dict)
-    assert raw["_target_"] == "srtrainer.data.degradation.RealESRGANDegrader"
+    assert raw["_target_"] == "data.degradation.RealESRGANDegrader"
     assert raw["scale"] == "${scale}"
     assert isinstance(raw["use_usm"], bool)
     assert isinstance(raw["queue_size"], int) and raw["queue_size"] >= 0
@@ -382,8 +382,8 @@ def test_t2_a09_static_audit_all_configs_yaml_contracts(configs_dir: Path) -> No
         targets: list[Any] = []
         _collect_targets_recursive(parsed, targets)
         for target in targets:
-            assert isinstance(target, str) and (
-                target.startswith("srtrainer.") or target.startswith("torch.")
+            assert isinstance(target, str) and target.startswith(
+                ("archs.", "data.", "engine.", "losses.", "metrics.", "models.", "utils.", "torch.")
             ), f"Invalid _target_ {target!r} in {yaml_file}"
 
         for token_str in _iter_yaml_strings(parsed):

@@ -19,17 +19,16 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 from torch import nn
 from torch.nn import functional as F
 
-import srtrainer
-from srtrainer.archs import ToyModel
-from srtrainer.engine import inferencer as inferencer_mod
-from srtrainer.engine.inferencer import (
+from archs import ToyModel
+from engine import inferencer as inferencer_mod
+from engine.inferencer import (
     TiledInferencer,
     build_blend_window,
     compute_tile_starts,
 )
-from srtrainer.utils.config import save_resolved_config
-from srtrainer.utils.image import load_image, save_image
-from srtrainer.utils.misc import save_safetensors
+from utils.config import save_resolved_config
+from utils.image import load_image, save_image
+from utils.misc import save_safetensors
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIGS_DIR = str((REPO_ROOT / "configs").resolve())
@@ -200,7 +199,7 @@ def _make_exp_dir(
         cfg_dict: dict[str, Any] = {
             "scale": scale,
             "arch": {
-                "_target_": "srtrainer.archs.ToyModel",
+                "_target_": "archs.ToyModel",
                 "num_in_ch": 3,
                 "num_out_ch": 3,
                 "num_feat": num_feat,
@@ -1343,11 +1342,10 @@ def test_infer_cli_single_proc_exp_dir_from_tmp(tmp_path: Path) -> None:
 
 
 def test_no_srpredictor_anywhere() -> None:
-    assert not hasattr(srtrainer, "SRPredictor")
     assert not hasattr(inferencer_mod, "SRPredictor")
 
     scan_targets = [
-        *(REPO_ROOT / "src" / "srtrainer").rglob("*.py"),
+        *(REPO_ROOT / "src").rglob("*.py"),
         *(REPO_ROOT / "tools").rglob("*.py"),
         *(REPO_ROOT / "configs").rglob("*.yaml"),
     ]

@@ -1,4 +1,4 @@
-_target_: srtrainer.archs.VOSR2OneStep
+_target_: archs.VOSR2OneStep
 scale: ${scale}
 
 # VOSR2 1.4B single-step LightningDiT configuration (VOSR2/args.json exact parity)

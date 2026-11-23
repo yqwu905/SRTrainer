@@ -11,12 +11,11 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 from torch import nn
 
-import srtrainer
-import srtrainer.archs
-import srtrainer.losses
-from srtrainer.archs import ToyModel
-from srtrainer.losses import L1Loss, LPIPSLoss
-from srtrainer.utils import normalize_mixed_precision
+import archs
+import losses
+from archs import ToyModel
+from losses import L1Loss, LPIPSLoss
+from utils import normalize_mixed_precision
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIGS_DIR = str((REPO_ROOT / "configs").resolve())
@@ -45,7 +44,7 @@ def test_train_default_compose_and_interpolations() -> None:
     assert cfg.work_dir == "experiments/debug_sr_x4"
 
     # Arch & Loss & Model
-    assert cfg.arch._target_ == "srtrainer.archs.ToyModel"
+    assert cfg.arch._target_ == "archs.ToyModel"
     assert cfg.arch.num_in_ch == 3
     assert cfg.arch.num_out_ch == 3
     assert cfg.arch.num_feat == 32
@@ -53,15 +52,15 @@ def test_train_default_compose_and_interpolations() -> None:
     assert cfg.arch.scale == 4
     assert set(cfg.loss.keys()) == {"l1"}
     assert cfg.loss.l1.weight == 1.0
-    assert cfg.loss.l1.criterion._target_ == "srtrainer.losses.L1Loss"
-    assert cfg.model._target_ == "srtrainer.models.SRModel"
+    assert cfg.loss.l1.criterion._target_ == "losses.L1Loss"
+    assert cfg.model._target_ == "models.SRModel"
     assert cfg.model.ema.enabled is True
     assert cfg.model.pretrain_path is None
 
     # Data & Degradation
     assert cfg.data.gt_size == 256
     assert cfg.data.scale == 4
-    assert cfg.data.degradation._target_ == "srtrainer.data.degradation.RealESRGANDegrader"
+    assert cfg.data.degradation._target_ == "data.degradation.RealESRGANDegrader"
     assert cfg.data.degradation.scale == 4
 
     # Optim & Metric & Trainer
@@ -87,7 +86,7 @@ def test_base_sr_x4_experiment() -> None:
     cfg = _compose("train", overrides=["experiment=base_sr_x4"])
 
     assert cfg.scale == 4
-    assert cfg.arch._target_ == "srtrainer.archs.ToyModel"
+    assert cfg.arch._target_ == "archs.ToyModel"
     assert cfg.arch.num_feat == 32
     assert cfg.arch.num_block == 2
     assert cfg.trainer.total_iters == 300000
@@ -104,7 +103,7 @@ def test_multi_level_experiment_inheritance() -> None:
     assert cfg.exp_name == "exp01_toy_l1_lpips_x4"
     assert cfg.work_dir == "experiments/exp01_toy_l1_lpips_x4"
     assert cfg.scale == 4
-    assert cfg.arch._target_ == "srtrainer.archs.ToyModel"
+    assert cfg.arch._target_ == "archs.ToyModel"
     assert cfg.arch.num_feat == 16
     assert cfg.arch.num_block == 2
     assert cfg.arch.scale == 4
@@ -113,7 +112,7 @@ def test_multi_level_experiment_inheritance() -> None:
     assert set(cfg.loss.keys()) == {"l1", "lpips"}
     assert cfg.loss.l1.weight == 1.0
     assert cfg.loss.lpips.weight == 0.05
-    assert cfg.loss.lpips.criterion._target_ == "srtrainer.losses.LPIPSLoss"
+    assert cfg.loss.lpips.criterion._target_ == "losses.LPIPSLoss"
     assert cfg.loss.lpips.criterion.pretrained is True
 
     # Localized overrides & inherited values from base_sr_x4
@@ -146,7 +145,7 @@ def test_cli_overrides_precedence() -> None:
     assert cfg.trainer.total_iters == 50000
     assert cfg.optim.scheduler.T_max == 50000
     assert list(cfg.trainer.log_with) == ["tensorboard", "wandb"]
-    assert cfg.arch._target_ == "srtrainer.archs.ToyModel"
+    assert cfg.arch._target_ == "archs.ToyModel"
     assert cfg.arch.num_feat == 8
     assert cfg.arch.num_block == 1
     assert cfg.arch.scale == 2
@@ -159,7 +158,7 @@ def test_cli_overrides_precedence() -> None:
 
 def test_atomic_config_group_switches_and_disable_degradation() -> None:
     cfg = _compose("train", overrides=["arch=toy_x4", "loss=l1_lpips", "optim=adam_multistep"])
-    assert cfg.arch._target_ == "srtrainer.archs.ToyModel"
+    assert cfg.arch._target_ == "archs.ToyModel"
     assert set(cfg.loss.keys()) == {"l1", "lpips"}
     assert cfg.optim.optimizer._target_ == "torch.optim.Adam"
     assert cfg.optim.scheduler._target_ == "torch.optim.lr_scheduler.MultiStepLR"
@@ -200,7 +199,7 @@ def test_infer_yaml_dual_modes() -> None:
             "arch.num_block=1",
         ],
     )
-    assert cfg_standalone.arch._target_ == "srtrainer.archs.ToyModel"
+    assert cfg_standalone.arch._target_ == "archs.ToyModel"
     assert cfg_standalone.arch.scale == 4
     assert cfg_standalone.arch.num_feat == 16
     assert cfg_standalone.arch.num_block == 1
@@ -256,14 +255,14 @@ def test_hydra_instantiate_m1_components() -> None:
 
 def test_narrowed_scope_and_mandatory_user_requirements() -> None:
     # Registered built-in archs and losses
-    assert srtrainer.archs.__all__ == ["ToyModel", "VOSR2OneStep"]
-    assert srtrainer.losses.__all__ == ["L1Loss", "LPIPSLoss", "OCRKLLoss", "GlyphLoss"]
+    assert archs.__all__ == ["ToyModel", "VOSR2OneStep"]
+    assert losses.__all__ == ["L1Loss", "LPIPSLoss", "OCRKLLoss", "GlyphLoss"]
 
     arch_py_files = sorted(
-        p.name for p in (REPO_ROOT / "src" / "srtrainer" / "archs").glob("*.py")
+        p.name for p in (REPO_ROOT / "src" / "archs").glob("*.py")
     )
     assert arch_py_files == ["__init__.py", "toy_model.py"]
-    assert (REPO_ROOT / "src" / "srtrainer" / "archs" / "vosr2" / "__init__.py").is_file()
+    assert (REPO_ROOT / "src" / "archs" / "vosr2" / "__init__.py").is_file()
 
     arch_yaml_files = sorted(p.name for p in (REPO_ROOT / "configs" / "arch").glob("*.yaml"))
     assert arch_yaml_files == ["toy_x4.yaml", "vosr2_x4.yaml"]
@@ -300,7 +299,6 @@ def test_narrowed_scope_and_mandatory_user_requirements() -> None:
         assert "metrics" in suite_cfg and len(suite_cfg.metrics) >= 1
 
     # Requirement #4 + Follow-up scope narrowing: ZERO prohibited symbols anywhere in src/, configs/, pyproject.toml
-    assert not hasattr(srtrainer, "SRPredictor")
     prohibited_symbols = (
         "SRPredictor",
         "RRDBNet",
@@ -311,7 +309,7 @@ def test_narrowed_scope_and_mandatory_user_requirements() -> None:
     )
     scan_paths = [
         *(REPO_ROOT / "configs").rglob("*.yaml"),
-        *(REPO_ROOT / "src" / "srtrainer").rglob("*.py"),
+        *(REPO_ROOT / "src").rglob("*.py"),
         REPO_ROOT / "pyproject.toml",
     ]
     for file_path in scan_paths:

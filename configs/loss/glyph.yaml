@@ -1,7 +1,7 @@
 glyph:
   weight: 1.0
   criterion:
-    _target_: srtrainer.losses.GlyphLoss
+    _target_: losses.GlyphLoss
     model_dir: null
     repo_id: ATH-MaaS/TextVerifier-CJK-CLIP
     revision: adc233a117cbb039842b245b5acf84e0143a5f11

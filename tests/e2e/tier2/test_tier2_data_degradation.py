@@ -306,7 +306,7 @@ def test_t2_c07_diffjpeg_non_multiple_of_16_and_sub16_auto_pad_unpad() -> None:
     """F27: DiffJPEG auto-pads/unpads non-multiples of 16, sub-16 dims, and boundary qualities."""
     import torch
 
-    from srtrainer.data.degradation import DiffJPEG
+    from data.degradation import DiffJPEG
 
     torch.manual_seed(27)
     jpeg = DiffJPEG()
@@ -331,7 +331,7 @@ def test_t2_c08_realesrgan_degrader_all_false_passthrough_with_usm_and_all_true_
     """F28: RealESRGANDegrader handles all-False passthrough (even with USM) and all-True batches."""
     import torch
 
-    from srtrainer.data.degradation import RealESRGANDegrader
+    from data.degradation import RealESRGANDegrader
 
     torch.manual_seed(28)
     ys = torch.linspace(0.0, 6.0 * 3.14159, 64, dtype=torch.float32)
@@ -401,7 +401,7 @@ def test_t2_c09_realesrgan_degrader_no_grad_and_fp32_under_cpu_bf16_autocast() -
     """F28, Guardrail #4: RealESRGANDegrader forces torch.no_grad() and FP32 under bf16 autocast."""
     import torch
 
-    from srtrainer.data.degradation import RealESRGANDegrader
+    from data.degradation import RealESRGANDegrader
 
     torch.manual_seed(29)
     gt = torch.rand(2, 3, 64, 64, dtype=torch.float32, requires_grad=True)
@@ -447,7 +447,7 @@ def test_t2_c10_training_pool_invalid_queue_size_and_non_divisible_batch_rejecte
     """F28: TrainingPool rejects negative/indivisible queue sizes and works at queue_size == B."""
     import torch
 
-    from srtrainer.data.degradation import RealESRGANDegrader, TrainingPool
+    from data.degradation import RealESRGANDegrader, TrainingPool
 
     def _call_pool(pool: Any, lq_t: Any, gt_t: Any) -> tuple[Any, Any]:
         if callable(pool):

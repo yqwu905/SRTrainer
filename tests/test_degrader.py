@@ -13,9 +13,9 @@ import torch
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
-import srtrainer.data.degradation as deg_pkg
-import srtrainer.data.degradation.realesrgan as realesrgan_mod
-from srtrainer.data.degradation import (
+import data.degradation as deg_pkg
+import data.degradation.realesrgan as realesrgan_mod
+from data.degradation import (
     DiffJPEG,
     KernelGenerator,
     RealESRGANDegrader,
@@ -25,7 +25,7 @@ from srtrainer.data.degradation import (
     filter2d,
     random_mixed_kernels,
 )
-from srtrainer.data.degradation.kernels import VALID_KERNEL_TYPES
+from data.degradation.kernels import VALID_KERNEL_TYPES
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIGS_DIR = str((REPO_ROOT / "configs").resolve())
@@ -810,7 +810,7 @@ def test_end_to_end_mixed_dataset_loader_and_degrader(tmp_path: Path) -> None:
     from PIL import Image
     from torch.utils.data import DataLoader
 
-    from srtrainer.data import DistributedWeightedInfiniteSampler, MixedSRDataset
+    from data import DistributedWeightedInfiniteSampler, MixedSRDataset
 
     gt_root = tmp_path / "gt_only"
     paired_root = tmp_path / "paired"

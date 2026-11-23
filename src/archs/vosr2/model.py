@@ -12,9 +12,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import load_file
 
-from srtrainer.archs.vosr2.dit import VOSR2DiT
-from srtrainer.archs.vosr2.qwen_vae2d import AutoencoderKLQwenImage2D
-from srtrainer.utils.misc import pad_to_multiple, strip_state_dict_prefix, unpad_tensor
+from archs.vosr2.dit import VOSR2DiT
+from archs.vosr2.qwen_vae2d import AutoencoderKLQwenImage2D
+from utils.misc import pad_to_multiple, strip_state_dict_prefix, unpad_tensor
 
 __all__ = ["VOSR2OneStep"]
 
