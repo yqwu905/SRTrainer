@@ -1,4 +1,4 @@
-"""Perceptual loss modules backed by ``lpips``."""
+"""Perceptual loss modules backed by pretrained ``lpips``."""
 
 from __future__ import annotations
 
@@ -15,17 +15,15 @@ _VALID_VERSIONS = ("0.1", "0.0")
 class LPIPSLoss(nn.Module):
     """Learned Perceptual Image Patch Similarity (LPIPS) loss for RGB images in ``[0, 1]``.
 
-    Internally rescales inputs from ``[0, 1]`` to ``[-1, 1]``, freezes all LPIPS parameters,
-    and permanently locks the module in ``eval()`` mode so Dropout remains disabled.
-    When ``pretrained=False``, passes ``pnet_rand=True`` (zero network download) and constrains
-    random linear weights to be non-negative so distance semantics hold.
+    Loads calibrated pretrained LPIPS weights, internally rescales inputs from ``[0, 1]`` to
+    ``[-1, 1]``, freezes all LPIPS parameters, and permanently locks the module in ``eval()``
+    mode so Dropout remains disabled.
     """
 
     def __init__(
         self,
         net: str = "alex",
         version: str = "0.1",
-        pretrained: bool = True,
     ) -> None:
         super().__init__()
         if net not in _VALID_NETS:
@@ -37,7 +35,6 @@ class LPIPSLoss(nn.Module):
 
         self.net = net
         self.version = version
-        self.pretrained = bool(pretrained)
 
         with warnings.catch_warnings():
             warnings.filterwarnings(
@@ -53,17 +50,12 @@ class LPIPSLoss(nn.Module):
             self.lpips = lpips.LPIPS(
                 net=net,
                 version=version,
-                pretrained=self.pretrained,
-                pnet_rand=not self.pretrained,
+                pretrained=True,
+                pnet_rand=False,
                 pnet_tune=False,
                 eval_mode=True,
                 verbose=False,
             )
-
-        if not self.pretrained and hasattr(self.lpips, "lins"):
-            with torch.no_grad():
-                for param in self.lpips.lins.parameters():
-                    param.abs_()
 
         for param in self.lpips.parameters():
             param.requires_grad = False

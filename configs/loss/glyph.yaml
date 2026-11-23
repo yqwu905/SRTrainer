@@ -4,8 +4,8 @@ glyph:
     _target_: losses.GlyphLoss
     model_dir: null
     repo_id: ATH-MaaS/TextVerifier-CJK-CLIP
-    revision: adc233a117cbb039842b245b5acf84e0143a5f11
     batch_size: 8
-    pretrained: true
     input_range: "0_1"
     sync_ddp_counts: true
+    cache_dir: null
+    local_files_only: false

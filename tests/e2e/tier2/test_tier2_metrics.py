@@ -137,19 +137,23 @@ def test_t2_d03_val_dataset_rejects_invalid_and_missing_manifests(
         _ = ds[0]
 
 
-def test_t2_d04_full_reference_metrics_reject_none_target() -> None:
+def test_t2_d04_full_reference_metrics_reject_none_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """F31, F32, F33: Full-reference PSNR, SSIM, and LPIPS metrics reject target=None."""
     import torch
+    from tests.helpers.fake_backends import patch_lpips_offline
 
     from metrics import LPIPSMetric, PSNRMetric, SSIMMetric
 
+    patch_lpips_offline(monkeypatch)
     pred = torch.rand(1, 3, 64, 64, dtype=torch.float32)
     metrics = [
         PSNRMetric(crop_border=0, test_y_channel=False),
         PSNRMetric(crop_border=0, test_y_channel=True),
         SSIMMetric(crop_border=0, test_y_channel=False),
         SSIMMetric(crop_border=0, test_y_channel=True),
-        LPIPSMetric(net="alex", pretrained=False).to("cpu"),
+        LPIPSMetric(net="alex").to("cpu"),
     ]
     for metric in metrics:
         with pytest.raises(ValueError, match="."):
@@ -158,18 +162,22 @@ def test_t2_d04_full_reference_metrics_reject_none_target() -> None:
             metric.compute(pred, target=None, meta={"label": "ignored"})
 
 
-def test_t2_d05_full_reference_metrics_reject_shape_and_channel_mismatch() -> None:
+def test_t2_d05_full_reference_metrics_reject_shape_and_channel_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """F31, F32, F33: Full-reference metrics reject spatial and channel shape mismatches."""
     import torch
+    from tests.helpers.fake_backends import patch_lpips_offline
 
     from metrics import LPIPSMetric, PSNRMetric, SSIMMetric
 
+    patch_lpips_offline(monkeypatch)
     metrics = [
         PSNRMetric(crop_border=0, test_y_channel=False),
         PSNRMetric(crop_border=0, test_y_channel=True),
         SSIMMetric(crop_border=0, test_y_channel=False),
         SSIMMetric(crop_border=0, test_y_channel=True),
-        LPIPSMetric(net="alex", pretrained=False).to("cpu"),
+        LPIPSMetric(net="alex").to("cpu"),
     ]
     mismatched_pairs = [
         (torch.rand(1, 3, 64, 64, dtype=torch.float32), torch.rand(1, 3, 64, 68, dtype=torch.float32)),
@@ -267,13 +275,17 @@ def test_t2_d07_ssim_metric_11x11_window_and_crop_border_boundaries() -> None:
         assert m4.compute(img19_bad, img19) == pytest.approx(1.0, abs=1e-6)
 
 
-def test_t2_d08_lpips_metric_no_grad_fp32_under_bf16_autocast_and_invalid_net() -> None:
+def test_t2_d08_lpips_metric_no_grad_fp32_under_bf16_autocast_and_invalid_net(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """F33: LPIPSMetric enforces FP32+no_grad under CPU bf16 autocast and rejects invalid net."""
     import torch
+    from tests.helpers.fake_backends import patch_lpips_offline
 
     from metrics import LPIPSMetric
 
-    metric = LPIPSMetric(net="alex", pretrained=False).to("cpu")
+    patch_lpips_offline(monkeypatch)
+    metric = LPIPSMetric(net="alex").to("cpu")
     torch.manual_seed(17)
     pred_ref = torch.rand(1, 3, 64, 64, dtype=torch.float32)
     target_ref = (pred_ref + 0.1 * torch.randn_like(pred_ref)).clamp(0.0, 1.0)
@@ -292,7 +304,7 @@ def test_t2_d08_lpips_metric_no_grad_fp32_under_bf16_autocast_and_invalid_net() 
     assert torch.is_grad_enabled() is True
 
     with pytest.raises((ValueError, KeyError)):
-        bad_metric = LPIPSMetric(net="unknown_net", pretrained=False).to("cpu")
+        bad_metric = LPIPSMetric(net="unknown_net").to("cpu")
         bad_metric.compute(pred_ref, target_ref)
 
 

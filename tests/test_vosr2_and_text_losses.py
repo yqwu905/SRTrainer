@@ -28,6 +28,12 @@ from losses.ocr_kl_loss import (
     load_ppocr_recognizer,
 )
 from models import ModelEMA
+from tests.helpers.fake_backends import (
+    TinyRecognizer,
+    patch_ppocr_loader,
+    patch_textverifier_loader,
+    patch_vosr2_backends,
+)
 from utils.misc import load_weights, save_safetensors
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -45,18 +51,28 @@ def reset_accelerate_state():
     GradientState._reset_state()
 
 
-def _make_tiny_vosr2(**overrides: Any) -> VOSR2OneStep:
+def _make_tiny_vosr2(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> VOSR2OneStep:
+    out_ch = int(overrides.get("out_channels", 4))
+    z_dims = int(overrides.get("z_dims", 16))
+    patch_vosr2_backends(
+        monkeypatch,
+        z_dim=out_ch,
+        dino_dim=z_dims,
+        vae_base_dim=8,
+        vae_dim_mult=(1, 2, 2, 2),
+        vae_num_res_blocks=1,
+    )
     kwargs: dict[str, Any] = dict(
         scale=4,
         input_size=8,
         patch_size=2,
-        in_channels=8,
-        out_channels=4,
+        in_channels=out_ch * 2,
+        out_channels=out_ch,
         hidden_size=32,
         depth=2,
         num_heads=4,
         mlp_ratio=2.0,
-        z_dims=16,
+        z_dims=z_dims,
         encdim_ratio=2,
         use_qknorm=True,
         use_swiglu=True,
@@ -66,29 +82,11 @@ def _make_tiny_vosr2(**overrides: Any) -> VOSR2OneStep:
         use_checkpoint=False,
         noise_input="gaussian",
         eval_seed=42,
-        vae_pretrained=False,
-        vae_base_dim=8,
-        vae_dim_mult=(1, 2, 2, 2),
-        vae_num_res_blocks=1,
         dino_size=28,
         dino_layer=0,
-        dino_pretrained=False,
     )
     kwargs.update(overrides)
     return VOSR2OneStep(**kwargs)
-
-
-class _TinyRecognizer(nn.Module):
-    """Lightweight (N, 3, 16, W) -> (N, W // 4, 7) recognizer for fast CPU OCR-KL unit tests."""
-
-    input_height = 16
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.conv = nn.Conv2d(3, 7, (16, 4), stride=(16, 4))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(x).squeeze(2).transpose(1, 2) * 8.0
 
 
 # ---------------------------------------------------------------------------
@@ -122,11 +120,12 @@ def test_vosr2_official_meta_key_counts_and_no_vosr1_r_embedder() -> None:
 @pytest.mark.parametrize("rope_mode", ["interpolate", "extrapolate"])
 @pytest.mark.parametrize("in_hw", [(8, 8), (12, 16), (7, 9)])
 def test_vosr2_onestep_forward_shapes_rectangular_and_deterministic_eval(
+    monkeypatch: pytest.MonkeyPatch,
     rope_mode: str,
     in_hw: tuple[int, int],
 ) -> None:
     torch.manual_seed(0)
-    model = _make_tiny_vosr2(rope_mode=rope_mode).eval()
+    model = _make_tiny_vosr2(monkeypatch, rope_mode=rope_mode).eval()
     lq = torch.rand(1, 3, *in_hw)
 
     with torch.no_grad():
@@ -139,9 +138,12 @@ def test_vosr2_onestep_forward_shapes_rectangular_and_deterministic_eval(
     assert torch.equal(y1, y2)
 
 
-def test_vosr2_state_dict_exclusivity_ema_backend_sharing_and_tiled_infer(tmp_path: Path) -> None:
+def test_vosr2_state_dict_exclusivity_ema_backend_sharing_and_tiled_infer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     torch.manual_seed(1)
-    model = _make_tiny_vosr2()
+    model = _make_tiny_vosr2(monkeypatch)
 
     # state_dict() must contain ONLY DiT weights (never vae.* or dino.*)
     sd = model.state_dict()
@@ -150,7 +152,7 @@ def test_vosr2_state_dict_exclusivity_ema_backend_sharing_and_tiled_infer(tmp_pa
 
     # Strict safetensors save/load round-trip via SRTrainer's load_weights
     w_path = save_safetensors(sd, tmp_path / "vosr2_tiny.safetensors")
-    model2 = _make_tiny_vosr2()
+    model2 = _make_tiny_vosr2(monkeypatch)
     missing, unexpected = load_weights(model2, w_path, strict=True)
     assert missing == [] and unexpected == []
 
@@ -188,10 +190,12 @@ def test_vosr2_state_dict_exclusivity_ema_backend_sharing_and_tiled_infer(tmp_pa
 
 @pytest.mark.parametrize("use_checkpoint", [False, True])
 def test_vosr2_gradient_flow_through_frozen_vae_decoder_into_all_dit_blocks(
+    monkeypatch: pytest.MonkeyPatch,
     use_checkpoint: bool,
 ) -> None:
     torch.manual_seed(7)
     model = _make_tiny_vosr2(
+        monkeypatch,
         use_checkpoint=use_checkpoint,
         vae_gradient_checkpointing=use_checkpoint,
         clamp_decode_in_train=False,
@@ -262,11 +266,10 @@ def test_ppocr_layout_strict_load_and_text_strips(tmp_path: Path) -> None:
         assert torch.equal(loaded(probe), model(probe))
 
 
-def test_ocr_kl_loss_rescaling_frozen_eval_and_gradients() -> None:
+def test_ocr_kl_loss_rescaling_frozen_eval_and_gradients(monkeypatch: pytest.MonkeyPatch) -> None:
     torch.manual_seed(0)
+    patch_ppocr_loader(monkeypatch, recognizer=TinyRecognizer())
     criterion = OCRKLLoss(
-        recognizer=_TinyRecognizer(),
-        input_height=16,
         strip_height=16,
         strip_stride=8,
         temperature=2.0,
@@ -297,14 +300,19 @@ def test_ocr_kl_loss_rescaling_frozen_eval_and_gradients() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_glyph_loss_exact_score_parity_region_gradients_and_empty_batch() -> None:
+def test_glyph_loss_exact_score_parity_region_gradients_and_empty_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     torch.manual_seed(5)
     encoder = nn.Sequential(nn.Conv2d(3, 3, 1, bias=False), nn.AdaptiveAvgPool2d(1), nn.Flatten())
     prototypes = torch.randn(2, 3, 3)
-    loss_fn = GlyphLoss(
+    patch_textverifier_loader(
+        monkeypatch,
         encoder=encoder,
         prototypes=prototypes,
         char_to_index={"中": 0, "文": 1},
+    )
+    loss_fn = GlyphLoss(
         batch_size=2,
         input_range="0_1",
         sync_ddp_counts=False,
@@ -460,7 +468,7 @@ def test_mixed_dataset_inline_and_external_glyphs_and_collate(tmp_path: Path) ->
     assert [g["char"] for g in batch["text_lines"][1][0]["glyphs"]] == ["春"]
 
 
-def test_hydra_configs_vosr2_ocr_kl_and_glyph() -> None:
+def test_hydra_configs_vosr2_ocr_kl_and_glyph(monkeypatch: pytest.MonkeyPatch) -> None:
     with hydra.initialize_config_dir(config_dir=CONFIGS_DIR, version_base=None):
         cfg = hydra.compose(config_name="train", overrides=["experiment=vosr2_onestep_text"])
 
@@ -476,6 +484,8 @@ def test_hydra_configs_vosr2_ocr_kl_and_glyph() -> None:
     assert set(cfg.loss.keys()) == {"l1", "lpips", "ocr_kl", "glyph"}
     assert cfg.loss.ocr_kl.criterion._target_ == "losses.OCRKLLoss"
     assert cfg.loss.glyph.criterion._target_ == "losses.GlyphLoss"
+    assert "revision" not in cfg.loss.glyph.criterion
+    assert "pretrained" not in cfg.loss.glyph.criterion
     assert cfg.data.augment.hflip is False
     assert cfg.data.augment.vflip is False
     assert cfg.data.augment.rot90 is False
@@ -483,7 +493,7 @@ def test_hydra_configs_vosr2_ocr_kl_and_glyph() -> None:
     assert cfg.trainer.val_tile.pad_multiple == 16
 
     # Default VOSR2OneStep scale=1 (no upscale) produces same-resolution output
-    model_x1 = _make_tiny_vosr2(scale=1).eval()
+    model_x1 = _make_tiny_vosr2(monkeypatch, scale=1).eval()
     assert model_x1.scale == 1
     with torch.no_grad():
         out_x1 = model_x1(torch.rand(1, 3, 19, 23))
@@ -492,9 +502,13 @@ def test_hydra_configs_vosr2_ocr_kl_and_glyph() -> None:
 
 def test_end_to_end_trainer_vosr2_with_ocr_kl_and_glyph_losses(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     reset_accelerate_state,
 ) -> None:
-    """Full Trainer smoke test: VOSR2OneStep + L1 + OCRKLLoss + GlyphLoss + EMA + Val + Save."""
+    """Mocked-backend plumbing smoke: VOSR2OneStep + L1 + OCRKLLoss + GlyphLoss + EMA + Val + Save."""
+    patch_vosr2_backends(monkeypatch, z_dim=4, dino_dim=16)
+    patch_ppocr_loader(monkeypatch, recognizer=TinyRecognizer(num_classes=16))
+    patch_textverifier_loader(monkeypatch)
     hr_dir = tmp_path / "hr"
     lr_dir = tmp_path / "lr"
     for i in range(2):
@@ -552,13 +566,8 @@ def test_end_to_end_trainer_vosr2_with_ocr_kl_and_glyph_losses(
                 "encdim_ratio": 2,
                 "use_checkpoint": False,
                 "clamp_decode_in_train": False,
-                "vae_pretrained": False,
-                "vae_base_dim": 8,
-                "vae_dim_mult": [1, 2, 2, 2],
-                "vae_num_res_blocks": 1,
                 "dino_size": 28,
                 "dino_layer": 0,
-                "dino_pretrained": False,
             },
             "loss": {
                 "l1": {
@@ -569,8 +578,6 @@ def test_end_to_end_trainer_vosr2_with_ocr_kl_and_glyph_losses(
                     "weight": 0.1,
                     "criterion": {
                         "_target_": "losses.OCRKLLoss",
-                        "pretrained": False,
-                        "num_classes": 16,
                         "strip_height": 16,
                         "strip_stride": 16,
                         "temperature": 1.0,
@@ -580,7 +587,6 @@ def test_end_to_end_trainer_vosr2_with_ocr_kl_and_glyph_losses(
                     "weight": 1.0,
                     "criterion": {
                         "_target_": "losses.GlyphLoss",
-                        "pretrained": False,
                         "batch_size": 4,
                     },
                 },

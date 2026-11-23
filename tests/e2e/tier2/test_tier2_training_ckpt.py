@@ -39,7 +39,6 @@ def test_t2_e01_srmodel_empty_or_nonpositive_loss_fails_fast(
                 "criterion": {
                     "_target_": "losses.LPIPSLoss",
                     "net": "alex",
-                    "pretrained": False,
                 },
             },
         },

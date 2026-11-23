@@ -15,7 +15,7 @@ from typing import Any
 from omegaconf import ListConfig, OmegaConf
 from omegaconf.errors import OmegaConfBaseException
 
-from losses.glyph_loss import canonical_quad
+from utils.text_geometry import canonical_quad
 
 __all__ = [
     "TrainSample",

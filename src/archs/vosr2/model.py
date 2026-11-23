@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -31,31 +30,13 @@ def _is_non_negative_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
-class _OfflineDinoStub(nn.Module):
-    """Lightweight frozen patch-token extractor matching DINOv2 output shape for offline CPU tests."""
-
-    def __init__(self, embed_dim: int, patch_size: int = 14) -> None:
-        super().__init__()
-        self.patch_size = patch_size
-        self.proj = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size, bias=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.proj(x).flatten(2).transpose(1, 2)
-
-
 def _load_dinov2(
     *,
-    z_dims: int,
-    pretrained: bool,
     cache_dir: str | Path | None = None,
     local_repo: str | Path | None = None,
     checkpoint_path: str | Path | None = None,
 ) -> nn.Module:
-    """Load frozen DINOv2-ViT-L/14 (or lightweight offline stub when ``pretrained=False``)."""
-    if not pretrained:
-        stub = _OfflineDinoStub(embed_dim=z_dims, patch_size=14)
-        return stub.eval().requires_grad_(False)
-
+    """Load frozen real DINOv2-ViT-L/14 vision encoder."""
     if cache_dir is not None:
         torch.hub.set_dir(str(cache_dir))
 
@@ -144,9 +125,6 @@ class _VOSR2FrozenBackends:
         std = x.new_tensor(_IMAGENET_STD).view(1, 3, 1, 1)
         x = (x - mean) / std
 
-        if isinstance(self.dino, _OfflineDinoStub):
-            return [self.dino(x)]
-
         tokens = self.dino.prepare_tokens_with_masks(x)
         num_blocks = len(self.dino.blocks)
         if not (0 <= dino_layer < num_blocks):
@@ -228,20 +206,15 @@ class VOSR2OneStep(VOSR2DiT):
         clamp_decode_in_train: bool = True,
         eval_seed: int | None = 42,
         # Frozen Qwen-Image 2D VAE options
-        vae_path: str | Path | None = "CSWRY/VOSR",
+        vae_path: str | Path = "CSWRY/VOSR",
         vae_subfolder: str | None = "Qwen-Image-vae-2d",
-        vae_pretrained: bool = True,
         vae_gradient_checkpointing: bool = False,
-        vae_base_dim: int = 96,
-        vae_dim_mult: Sequence[int] = (1, 2, 4, 4),
-        vae_num_res_blocks: int = 2,
         # Frozen DINOv2-ViT-L/14 options
         dino_size: int = 448,
         dino_layer: int = 17,
         dino_cache_dir: str | Path | None = None,
         dino_local_repo: str | Path | None = None,
         dino_checkpoint: str | Path | None = None,
-        dino_pretrained: bool = True,
         # Optional direct DiT checkpoint loading (in addition to model.pretrain_path)
         dit_checkpoint: str | Path | None = None,
         dit_filename: str = "VOSR2/checkpoints/ema_model.safetensors",
@@ -294,22 +267,13 @@ class VOSR2OneStep(VOSR2DiT):
         self.dino_size = dino_size
         self.dino_layer = dino_layer
 
-        if vae_pretrained:
-            if vae_path is None:
-                raise ValueError("vae_path must be set when vae_pretrained=True.")
-            vae = AutoencoderKLQwenImage2D.from_pretrained(
-                vae_path,
-                subfolder=vae_subfolder,
-                gradient_checkpointing=vae_gradient_checkpointing,
-            )
-        else:
-            vae = AutoencoderKLQwenImage2D(
-                base_dim=vae_base_dim,
-                z_dim=out_channels,
-                dim_mult=vae_dim_mult,
-                num_res_blocks=vae_num_res_blocks,
-                gradient_checkpointing=vae_gradient_checkpointing,
-            )
+        if vae_path is None or (isinstance(vae_path, str) and not vae_path.strip()):
+            raise ValueError("vae_path must be a non-empty local path or HuggingFace repo id.")
+        vae = AutoencoderKLQwenImage2D.from_pretrained(
+            vae_path,
+            subfolder=vae_subfolder,
+            gradient_checkpointing=vae_gradient_checkpointing,
+        )
 
         if vae.z_dim != out_channels:
             raise ValueError(
@@ -319,8 +283,6 @@ class VOSR2OneStep(VOSR2DiT):
         dino: nn.Module | None = None
         if z_dims is not None:
             dino = _load_dinov2(
-                z_dims=z_dims,
-                pretrained=dino_pretrained,
                 cache_dir=dino_cache_dir,
                 local_repo=dino_local_repo,
                 checkpoint_path=dino_checkpoint,

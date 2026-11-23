@@ -162,7 +162,7 @@ def test_atomic_config_group_switches_and_disable_degradation() -> None:
     assert cfg_del_deg.data.get("degradation") is None
 
 
-def test_infer_yaml_dual_modes() -> None:
+def test_infer_yaml_dual_modes(monkeypatch: pytest.MonkeyPatch) -> None:
     # Mode 1: exp_dir auto-restore defaults
     cfg_default = _compose("infer", return_hydra_config=True)
     assert cfg_default.arch is None
@@ -178,7 +178,10 @@ def test_infer_yaml_dual_modes() -> None:
     assert cfg_default.hydra.run.dir == "outputs/infer"
     assert cfg_default.hydra.job_logging.disable_existing_loggers is True
 
-    # Mode 2: standalone arch=vosr2 + weights override (tiny offline params for fast CPU check)
+    # Mode 2: standalone arch=vosr2 + weights override (tiny mocked backends for fast CPU check)
+    from tests.helpers.fake_backends import patch_vosr2_backends
+
+    patch_vosr2_backends(monkeypatch, z_dim=4, dino_dim=16)
     cfg_standalone = _compose(
         "infer",
         overrides=[
@@ -194,13 +197,8 @@ def test_infer_yaml_dual_modes() -> None:
             "arch.mlp_ratio=2.0",
             "arch.z_dims=16",
             "arch.encdim_ratio=2",
-            "arch.vae_pretrained=false",
-            "+arch.vae_base_dim=8",
-            "+arch.vae_dim_mult=[1,2,2,2]",
-            "+arch.vae_num_res_blocks=1",
             "arch.dino_size=28",
             "arch.dino_layer=0",
-            "arch.dino_pretrained=false",
         ],
     )
     assert cfg_standalone.arch._target_ == "archs.VOSR2OneStep"
@@ -213,13 +211,16 @@ def test_infer_yaml_dual_modes() -> None:
     assert out.shape == (1, 3, 16, 16)
 
 
-def test_hydra_instantiate_components() -> None:
+def test_hydra_instantiate_components(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.helpers.fake_backends import patch_lpips_offline, patch_vosr2_backends
+
+    patch_vosr2_backends(monkeypatch, z_dim=4, dino_dim=16)
+    patch_lpips_offline(monkeypatch)
     cfg_exp = _compose(
         "train",
         overrides=[
             "experiment=vosr2_onestep_text",
             "loss=l1_lpips",
-            "loss.lpips.criterion.pretrained=false",
             "arch.input_size=8",
             "arch.in_channels=8",
             "arch.out_channels=4",
@@ -229,13 +230,8 @@ def test_hydra_instantiate_components() -> None:
             "arch.mlp_ratio=2.0",
             "arch.z_dims=16",
             "arch.encdim_ratio=2",
-            "arch.vae_pretrained=false",
-            "+arch.vae_base_dim=8",
-            "+arch.vae_dim_mult=[1,2,2,2]",
-            "+arch.vae_num_res_blocks=1",
             "arch.dino_size=28",
             "arch.dino_layer=0",
-            "arch.dino_pretrained=false",
         ],
     )
     net = instantiate(cfg_exp.arch).eval()
@@ -248,7 +244,6 @@ def test_hydra_instantiate_components() -> None:
     lpips_loss = instantiate(cfg_exp.loss.lpips.criterion)
     assert isinstance(l1, L1Loss)
     assert isinstance(lpips_loss, LPIPSLoss)
-    assert lpips_loss.pretrained is False
 
     dummy = nn.Linear(4, 4)
     opt_partial = instantiate(cfg_exp.optim.optimizer)
@@ -274,7 +269,7 @@ def test_narrowed_scope_and_mandatory_user_requirements() -> None:
     assert losses.__all__ == ["L1Loss", "LPIPSLoss", "OCRKLLoss", "GlyphLoss"]
 
     arch_py_files = sorted(p.name for p in (REPO_ROOT / "src" / "archs").glob("*.py"))
-    assert arch_py_files == ["__init__.py"]
+    assert arch_py_files == ["__init__.py", "textverifier.py"]
     assert (REPO_ROOT / "src" / "archs" / "vosr2" / "__init__.py").is_file()
 
     arch_yaml_files = sorted(p.name for p in (REPO_ROOT / "configs" / "arch").glob("*.yaml"))
@@ -320,6 +315,10 @@ def test_narrowed_scope_and_mandatory_user_requirements() -> None:
         "TinySRNet",
         "CharbonnierLoss",
         "FFTLoss",
+        "_build_offline_textverifier",
+        "_OFFLINE_TEST_CHARS",
+        "_OfflineDinoStub",
+        "DEFAULT_TEXTVERIFIER_REVISION",
     )
     scan_paths = [
         *(REPO_ROOT / "configs").rglob("*.yaml"),

@@ -19,15 +19,18 @@ import pytest
 
 def test_t3_hydra_experiment_inheritance_into_srmodel_lpips_and_cosine_t_max(
     hydra_compose: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Seam A x B x E (F03-F06, F08, F12-F15, F43): experiment -> SRModel + LPIPS + Cosine LR."""
     import hydra.utils
     import torch
     from accelerate import Accelerator
     from tests.dummy_arch import DummySRNet
+    from tests.helpers.fake_backends import patch_lpips_offline
 
     from models import SRModel
 
+    patch_lpips_offline(monkeypatch)
     cfg = hydra_compose(
         "train",
         overrides=[
@@ -37,7 +40,6 @@ def test_t3_hydra_experiment_inheritance_into_srmodel_lpips_and_cosine_t_max(
             "scale=2",
             "loss=l1_lpips",
             "loss.lpips.weight=0.05",
-            "loss.lpips.criterion.pretrained=false",
             "optim.optimizer.lr=1.0e-4",
             "data.gt_size=64",
             "trainer.total_iters=6",
@@ -57,7 +59,6 @@ def test_t3_hydra_experiment_inheritance_into_srmodel_lpips_and_cosine_t_max(
     assert cfg.optim.scheduler.T_max == 6
     assert cfg.loss.l1.weight == pytest.approx(1.0)
     assert cfg.loss.lpips.weight == pytest.approx(0.05)
-    assert cfg.loss.lpips.criterion.pretrained is False
 
     model = hydra.utils.instantiate(cfg.model, cfg=cfg, _recursive_=False)
     assert isinstance(model, SRModel)

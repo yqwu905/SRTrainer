@@ -27,6 +27,7 @@ from data.manifest import (
 from data.mixed_dataset import MixedSRDataset, train_collate_fn
 from losses import GlyphLoss
 from tests.e2e.conftest import REPO_ROOT, build_subprocess_env
+from tests.helpers.fake_backends import patch_textverifier_loader
 
 
 def _glyph(ch: str, bbox: list[int] | None = None) -> dict[str, Any]:
@@ -66,7 +67,7 @@ def _write_rgb_png(path: Path, size: tuple[int, int] = (32, 32), seed: int = 0) 
     return path
 
 
-def _make_stub_glyph_loss() -> GlyphLoss:
+def _make_stub_glyph_loss(monkeypatch: pytest.MonkeyPatch) -> GlyphLoss:
     torch.manual_seed(123)
     encoder = nn.Sequential(
         nn.Conv2d(3, 4, kernel_size=1, bias=False),
@@ -74,10 +75,13 @@ def _make_stub_glyph_loss() -> GlyphLoss:
         nn.Flatten(),
     )
     prototypes = torch.randn(3, 2, 4)
-    return GlyphLoss(
+    patch_textverifier_loader(
+        monkeypatch,
         encoder=encoder,
         prototypes=prototypes,
         char_to_index={"中": 0, "文": 1, "春": 2},
+    )
+    return GlyphLoss(
         batch_size=4,
         input_range="0_1",
         sync_ddp_counts=False,
@@ -484,7 +488,10 @@ def test_empty_exact_and_inline_empty_do_not_fallback(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_full_chain_alignment_invalid_zero_grad_and_mixed_batch(tmp_path: Path) -> None:
+def test_full_chain_alignment_invalid_zero_grad_and_mixed_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _write_rgb_png(tmp_path / "hr/bad.png", (32, 32), seed=1)
     _write_rgb_png(tmp_path / "lr/bad.png", (8, 8), seed=2)
     _write_rgb_png(tmp_path / "hr/good.png", (32, 32), seed=3)
@@ -536,7 +543,7 @@ def test_full_chain_alignment_invalid_zero_grad_and_mixed_batch(tmp_path: Path) 
     assert len(good_item["text_lines"]) == 1
     assert [g["char"] for g in good_item["text_lines"][0]["glyphs"]] == ["文"]
 
-    loss_fn = _make_stub_glyph_loss()
+    loss_fn = _make_stub_glyph_loss(monkeypatch)
 
     # Case A: Invalid-only batch -> scored=0, zero loss, backward succeeds with strictly zero grad
     bad_batch = train_collate_fn([bad_item])

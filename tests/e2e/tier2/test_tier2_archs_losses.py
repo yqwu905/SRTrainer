@@ -87,13 +87,17 @@ def test_t2_b02_l1_loss_zero_diff_large_residuals_and_invalid_reduction() -> Non
         L1Loss(reduction="invalid")
 
 
-def test_t2_b03_lpips_loss_train_toggle_frozen_vgg_offline_and_invalid_net() -> None:
-    """F15: LPIPSLoss stays frozen/eval across train(True), supports offline VGG, rejects bad net."""
+def test_t2_b03_lpips_loss_train_toggle_frozen_vgg_offline_and_invalid_net(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F15: LPIPSLoss stays frozen/eval across train(True), supports VGG, rejects bad net."""
     import torch
+    from tests.helpers.fake_backends import patch_lpips_offline
 
     from losses import LPIPSLoss
 
-    loss_fn = LPIPSLoss(net="alex", pretrained=False)
+    patch_lpips_offline(monkeypatch)
+    loss_fn = LPIPSLoss(net="alex")
     loss_fn.train(True)
     assert loss_fn.training is False, "LPIPSLoss.train(True) must preserve eval mode"
 
@@ -114,7 +118,7 @@ def test_t2_b03_lpips_loss_train_toggle_frozen_vgg_offline_and_invalid_net() -> 
     assert pred1.grad is not None and torch.isfinite(pred1.grad).all()
     assert all(p.grad is None for p in params)
 
-    vgg_loss = LPIPSLoss(net="vgg", pretrained=False)
+    vgg_loss = LPIPSLoss(net="vgg")
     v = vgg_loss(
         torch.rand(1, 3, 64, 64, dtype=torch.float32),
         torch.rand(1, 3, 64, 64, dtype=torch.float32),
@@ -122,7 +126,7 @@ def test_t2_b03_lpips_loss_train_toggle_frozen_vgg_offline_and_invalid_net() -> 
     assert v.ndim == 0 and torch.isfinite(v) and v.item() >= 0.0
 
     with pytest.raises(ValueError, match="."):
-        LPIPSLoss(net="invalid_net", pretrained=False)
+        LPIPSLoss(net="invalid_net")
 
 
 def test_t2_b04_image_utils_grayscale_rgba_clamp_4d_nested_and_missing(

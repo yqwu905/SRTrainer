@@ -178,7 +178,7 @@ def test_t4_scenario1_mixed_blind_paired_train_to_auto_restore_infer(
         extra_overrides=[
             "loss=l1_lpips",
             "loss.lpips.weight=0.05",
-            "loss.lpips.criterion.pretrained=false",
+            "loss.lpips.criterion._target_=tests.helpers.fake_backends.DummyLPIPSLoss",
             "optim.optimizer.lr=1.0e-4",
             "data.degradation.kernel_cfg.kernel_size=7",
             "data.degradation.kernel_cfg.kernel_range=[7]",
@@ -880,7 +880,7 @@ def test_t4_scenario6_two_stage_l1_to_l1_lpips_finetune_trackers_and_infer(
         log_with=["tensorboard"],
         extra_overrides=[
             "loss=l1_lpips",
-            "loss.lpips.criterion.pretrained=false",
+            "loss.lpips.criterion._target_=tests.helpers.fake_backends.DummyLPIPSLoss",
             "data.degradation.use_usm=true",
             "data.degradation.queue_size=4",
             "data.degradation.kernel_cfg.kernel_size=7",

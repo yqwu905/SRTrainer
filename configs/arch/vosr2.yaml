@@ -29,7 +29,6 @@ eval_seed: 42
 # Frozen Qwen-Image 2D VAE (local path or HuggingFace repo + subfolder)
 vae_path: CSWRY/VOSR
 vae_subfolder: Qwen-Image-vae-2d
-vae_pretrained: true
 vae_gradient_checkpointing: false
 
 # Frozen DINOv2-ViT-L/14 vision encoder
@@ -38,7 +37,6 @@ dino_layer: 17
 dino_cache_dir: null
 dino_local_repo: null
 dino_checkpoint: null
-dino_pretrained: true
 
 # Optional direct DiT checkpoint (alternatively use model.pretrain_path)
 dit_checkpoint: null

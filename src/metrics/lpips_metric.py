@@ -1,4 +1,4 @@
-"""Device-cached LPIPS perceptual evaluation metric."""
+"""Device-cached pretrained LPIPS perceptual evaluation metric."""
 
 from __future__ import annotations
 
@@ -20,18 +20,15 @@ _MIN_SPATIAL_SIZE: dict[str, int] = {"alex": 31, "vgg": 16, "squeeze": 17}
 class LPIPSMetric(BaseMetric):
     """Learned Perceptual Image Patch Similarity (LPIPS) evaluation metric for RGB images in ``[0, 1]``.
 
-    Loads the LPIPS backbone once at initialization, freezes all parameters, locks ``eval()``
-    mode, reuses weights in-place across ``to(device)`` and repeated ``compute()`` calls,
-    rescales inputs from ``[0, 1]`` to ``[-1, 1]``, and evaluates strictly in FP32 under
-    ``torch.no_grad()``. When ``pretrained=False``, sets ``pnet_rand=True`` (zero network
-    download) and constrains random linear weights to be non-negative.
+    Loads calibrated pretrained LPIPS weights once at initialization, freezes all parameters,
+    locks ``eval()`` mode, reuses weights in-place across ``to(device)`` and repeated
+    ``compute()`` calls, rescales inputs from ``[0, 1]`` to ``[-1, 1]``, and evaluates
+    strictly in FP32 under ``torch.no_grad()``.
 
     Args:
         net: Backbone architecture (``"alex"``, ``"vgg"``, or ``"squeeze"``).
         spatial: If ``True``, compute a spatial LPIPS map before averaging to a scalar.
         version: LPIPS calibration version (``"0.1"`` or ``"0.0"``).
-        pretrained: If ``True``, load pretrained ImageNet backbone and calibrated LPIPS weights.
-            If ``False``, initialize randomly offline without downloading any weights.
     """
 
     higher_is_better: bool = False
@@ -41,7 +38,6 @@ class LPIPSMetric(BaseMetric):
         net: str = "alex",
         spatial: bool = False,
         version: str = "0.1",
-        pretrained: bool = True,
     ) -> None:
         if not isinstance(net, str) or net not in _VALID_NETS:
             raise ValueError(f"Unsupported LPIPS net={net!r}; expected one of {_VALID_NETS}.")
@@ -51,13 +47,10 @@ class LPIPSMetric(BaseMetric):
             )
         if not isinstance(spatial, bool):
             raise ValueError(f"spatial must be a bool, got {spatial!r}.")
-        if not isinstance(pretrained, bool):
-            raise ValueError(f"pretrained must be a bool, got {pretrained!r}.")
 
         self.net = net
         self.spatial = spatial
         self.version = version
-        self.pretrained = pretrained
 
         with warnings.catch_warnings():
             warnings.filterwarnings(
@@ -74,17 +67,12 @@ class LPIPSMetric(BaseMetric):
                 net=net,
                 spatial=spatial,
                 version=version,
-                pretrained=pretrained,
-                pnet_rand=not pretrained,
+                pretrained=True,
+                pnet_rand=False,
                 pnet_tune=False,
                 eval_mode=True,
                 verbose=False,
             )
-
-        if not self.pretrained and hasattr(self.lpips, "lins"):
-            with torch.no_grad():
-                for param in self.lpips.lins.parameters():
-                    param.abs_()
 
         for param in self.lpips.parameters():
             param.requires_grad = False

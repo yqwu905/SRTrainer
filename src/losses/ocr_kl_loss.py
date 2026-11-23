@@ -335,11 +335,7 @@ class OCRKLLoss(nn.Module):
         strip_height: int = 64,
         strip_stride: int = 32,
         temperature: float = 1.0,
-        pretrained: bool = True,
-        num_classes: int = 18385,
         input_range: str = "0_1",
-        recognizer: nn.Module | None = None,
-        input_height: int | None = None,
     ) -> None:
         super().__init__()
         if not _is_positive_int(strip_height):
@@ -355,38 +351,19 @@ class OCRKLLoss(nn.Module):
             raise ValueError(
                 f"Unsupported input_range={input_range!r}; expected one of {sorted(_VALID_INPUT_RANGES)}."
             )
-        if not isinstance(pretrained, bool):
-            raise ValueError(f"pretrained must be a bool, got {type(pretrained).__name__}.")
 
         self.checkpoint = str(checkpoint)
         self.strip_height = int(strip_height)
         self.strip_stride = int(strip_stride)
         self.temperature = temp_f
-        self.pretrained = pretrained
         self.input_range = input_range
 
-        if recognizer is not None:
-            if not isinstance(recognizer, nn.Module):
-                raise TypeError(
-                    f"recognizer must be an nn.Module or None, got {type(recognizer).__name__}."
-                )
-            rec_model = recognizer
-            resolved_height = (
-                input_height
-                if input_height is not None
-                else int(getattr(recognizer, "input_height", PPOCRv5ServerRec.input_height))
-            )
-        elif pretrained:
-            rec_model = load_ppocr_recognizer(checkpoint)
-            resolved_height = PPOCRv5ServerRec.input_height
-        else:
-            rec_model = PPOCRv5ServerRec(num_classes=num_classes)
-            resolved_height = PPOCRv5ServerRec.input_height
-
+        rec_model = load_ppocr_recognizer(checkpoint)
+        resolved_height = int(getattr(rec_model, "input_height", PPOCRv5ServerRec.input_height))
         if not _is_positive_int(resolved_height):
             raise ValueError(f"input_height must be a positive integer, got {resolved_height!r}.")
 
-        self.input_height: int = int(resolved_height)
+        self.input_height: int = resolved_height
         self.recognizer: nn.Module = rec_model.eval().requires_grad_(False)
         self.eval()
 

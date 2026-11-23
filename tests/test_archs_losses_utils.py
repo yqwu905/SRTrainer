@@ -148,16 +148,20 @@ def test_l1_loss_numeric_grad_and_validation(reduction: str) -> None:
 
 
 @pytest.mark.parametrize("net", ["alex", "vgg", "squeeze"])
-def test_lpips_loss_offline_nonnegative_frozen_eval_lock_and_grad(net: str) -> None:
-    torch.manual_seed(123)
-    criterion = LPIPSLoss(net=net, version="0.1", pretrained=False)
+def test_lpips_loss_offline_nonnegative_frozen_eval_lock_and_grad(
+    net: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.helpers.fake_backends import patch_lpips_offline
 
-    # All internal parameters frozen & random linear weights non-negative
+    patch_lpips_offline(monkeypatch)
+    torch.manual_seed(123)
+    criterion = LPIPSLoss(net=net, version="0.1")
+
+    # All internal parameters frozen
     params = list(criterion.parameters())
     assert len(params) > 0
     assert all(not p.requires_grad for p in params)
-    for p in criterion.lpips.lins.parameters():
-        assert torch.all(p >= 0.0)
 
     # Permanently locked in eval mode even after .train(True)
     criterion.train(True)
@@ -204,13 +208,18 @@ def test_lpips_loss_offline_nonnegative_frozen_eval_lock_and_grad(net: str) -> N
     assert all(p.grad is None for p in criterion.parameters())
 
 
-def test_lpips_loss_validation_and_bundled_pth_weights_only_compat() -> None:
-    with pytest.raises(ValueError):
-        LPIPSLoss(net="resnet", pretrained=False)
-    with pytest.raises(ValueError):
-        LPIPSLoss(version="9.9", pretrained=False)
+def test_lpips_loss_validation_and_bundled_pth_weights_only_compat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.helpers.fake_backends import patch_lpips_offline
 
-    criterion = LPIPSLoss(net="alex", pretrained=False)
+    patch_lpips_offline(monkeypatch)
+    with pytest.raises(ValueError):
+        LPIPSLoss(net="resnet")
+    with pytest.raises(ValueError):
+        LPIPSLoss(version="9.9")
+
+    criterion = LPIPSLoss(net="alex")
     with pytest.raises(ValueError):
         criterion(torch.rand(3, 64, 64), torch.rand(3, 64, 64))
     with pytest.raises(ValueError):

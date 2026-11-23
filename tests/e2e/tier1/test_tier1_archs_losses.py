@@ -111,13 +111,17 @@ def test_t1_l1_loss_values_reductions_and_grads() -> None:
         assert pred.grad.abs().sum().item() > 0.0
 
 
-def test_t1_lpips_loss_offline_frozen_eval_and_range_scaling() -> None:
-    """F15: LPIPSLoss(pretrained=False) runs offline, stays frozen in eval, propagates input grad."""
+def test_t1_lpips_loss_offline_frozen_eval_and_range_scaling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F15: LPIPSLoss stays frozen in eval, propagates input grad (offline mocked factory)."""
     import torch
+    from tests.helpers.fake_backends import patch_lpips_offline
 
     from losses import LPIPSLoss
 
-    loss_fn = LPIPSLoss(net="alex", pretrained=False)
+    patch_lpips_offline(monkeypatch)
+    loss_fn = LPIPSLoss(net="alex")
     assert loss_fn.training is False
     params = list(loss_fn.parameters())
     assert len(params) > 0

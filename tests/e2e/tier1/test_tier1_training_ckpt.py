@@ -176,14 +176,17 @@ def test_t1_srmodel_named_loss_dict_raw_values_and_skip_nonpositive(
     e2e_workdir: dict[str, Path],
     paired_train_source_factory: Callable[..., dict[str, Any]],
     minimal_train_cfg_factory: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """F43: Named L1/LPIPS loss dict logs raw sub-losses, weighted total, skips weight <= 0."""
     import torch
     from accelerate import Accelerator
+    from tests.helpers.fake_backends import patch_lpips_offline
 
     from models import SRModel
 
-    # gt_size=64 so offline AlexNet LPIPS runs cleanly at 64x64.
+    patch_lpips_offline(monkeypatch)
+    # gt_size=64 so AlexNet LPIPS runs cleanly at 64x64.
     src = paired_train_source_factory(name="loss_src", n_samples=2, lq_h=32, lq_w=32, scale=2)
     loss_cfg = {
         "l1": {
@@ -195,7 +198,6 @@ def test_t1_srmodel_named_loss_dict_raw_values_and_skip_nonpositive(
             "criterion": {
                 "_target_": "losses.LPIPSLoss",
                 "net": "alex",
-                "pretrained": False,
             },
         },
         "l1_disabled": {

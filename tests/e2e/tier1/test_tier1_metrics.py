@@ -67,16 +67,21 @@ def _reference_basicsr_ssim(
     return float(ssim_map.mean().item())
 
 
-def test_t1_d01_metrics_reexports_and_base_metric_protocol() -> None:
+def test_t1_d01_metrics_reexports_and_base_metric_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """F02, F30: metrics re-exports, ABC protocol, higher_is_better flags, .to()."""
+    from tests.helpers.fake_backends import patch_lpips_offline
+
     from metrics import BaseMetric, LPIPSMetric, PSNRMetric, SSIMMetric
 
+    patch_lpips_offline(monkeypatch)
     assert issubclass(BaseMetric, abc.ABC)
     assert BaseMetric.higher_is_better is True
 
     psnr = PSNRMetric()
     ssim = SSIMMetric()
-    lpips_m = LPIPSMetric(net="alex", pretrained=False)
+    lpips_m = LPIPSMetric(net="alex")
 
     for metric, expected_higher in ((psnr, True), (ssim, True), (lpips_m, False)):
         assert isinstance(metric, BaseMetric)
@@ -261,13 +266,17 @@ def test_t1_d05_ssim_metric_rgb_and_basicsr_bt601_y_channel_exact_oracle() -> No
     ) == pytest.approx(1.0, abs=1e-6)
 
 
-def test_t1_d06_lpips_metric_offline_cached_and_semantics() -> None:
-    """F33: LPIPSMetric(pretrained=False) is offline-safe, lower-is-better, monotonic, cached."""
+def test_t1_d06_lpips_metric_offline_cached_and_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F33: LPIPSMetric is lower-is-better, monotonic, cached (offline mocked factory)."""
     import torch
+    from tests.helpers.fake_backends import patch_lpips_offline
 
     from metrics import LPIPSMetric
 
-    metric = LPIPSMetric(net="alex", pretrained=False).to("cpu")
+    patch_lpips_offline(monkeypatch)
+    metric = LPIPSMetric(net="alex").to("cpu")
     assert metric.higher_is_better is False
 
     torch.manual_seed(9)

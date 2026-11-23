@@ -20,7 +20,6 @@ val_suites:
       lpips:
         _target_: metrics.LPIPSMetric
         net: alex
-        pretrained: true
 
   urban100:
     dataset:

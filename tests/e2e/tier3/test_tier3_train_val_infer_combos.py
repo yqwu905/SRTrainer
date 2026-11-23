@@ -150,11 +150,15 @@ def test_t3_multi_suite_gt_and_gtless_custom_meta_metrics_and_visuals(
     val_suite_gt_label_factory: Callable[..., dict[str, Any]],
     val_suite_gt_less_meta_factory: Callable[..., dict[str, Any]],
     minimal_train_cfg_factory: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Seam D x E (F09, F17, F24, F30-F34, F46): Multi-suite GT + GT-less meta metrics & visuals."""
     from PIL import Image
+    from tests.helpers.fake_backends import patch_lpips_offline
 
     from engine import Trainer
+
+    patch_lpips_offline(monkeypatch)
 
     train_src = paired_train_source_factory(
         name="ms_train", n_samples=4, lq_h=16, lq_w=16, scale=2
@@ -180,7 +184,6 @@ def test_t3_multi_suite_gt_and_gtless_custom_meta_metrics_and_visuals(
                 "lpips": {
                     "_target_": "metrics.LPIPSMetric",
                     "net": "alex",
-                    "pretrained": False,
                 },
             },
         },

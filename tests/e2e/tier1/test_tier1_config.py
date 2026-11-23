@@ -192,14 +192,19 @@ def test_t1_train_yaml_default_composition_and_hydra_guards(
 
 def test_t1_atomic_arch_loss_optim_instantiation(
     hydra_compose: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """F04, F05, F08: Atomic vosr2 arch, l1/l1_lpips losses, and partial optims instantiate."""
     import hydra.utils
     import torch
     import torch.nn as nn
+    from tests.helpers.fake_backends import patch_lpips_offline, patch_vosr2_backends
 
     from archs import VOSR2OneStep
     from losses import L1Loss, LPIPSLoss
+
+    patch_vosr2_backends(monkeypatch, z_dim=4, dino_dim=16)
+    patch_lpips_offline(monkeypatch)
 
     cfg = hydra_compose(
         "train",
@@ -214,15 +219,9 @@ def test_t1_atomic_arch_loss_optim_instantiation(
             "arch.mlp_ratio=2.0",
             "arch.z_dims=16",
             "arch.encdim_ratio=2",
-            "arch.vae_pretrained=false",
-            "+arch.vae_base_dim=8",
-            "+arch.vae_dim_mult=[1,2,2,2]",
-            "+arch.vae_num_res_blocks=1",
             "arch.dino_size=28",
             "arch.dino_layer=0",
-            "arch.dino_pretrained=false",
             "loss=l1_lpips",
-            "++loss.lpips.criterion.pretrained=false",
             "optim=adamw_cosine",
             "trainer.total_iters=100",
         ],

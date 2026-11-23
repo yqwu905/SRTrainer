@@ -413,19 +413,21 @@ class AutoencoderKLQwenImage2D(nn.Module):
         )
 
         if latents_mean is None:
-            mean_vals = (
-                list(DEFAULT_QWEN_LATENTS_MEAN)
-                if self.z_dim == len(DEFAULT_QWEN_LATENTS_MEAN)
-                else [0.0] * self.z_dim
-            )
+            if self.z_dim != len(DEFAULT_QWEN_LATENTS_MEAN):
+                raise ValueError(
+                    f"latents_mean must be provided explicitly when z_dim={self.z_dim} != "
+                    f"{len(DEFAULT_QWEN_LATENTS_MEAN)}."
+                )
+            mean_vals = list(DEFAULT_QWEN_LATENTS_MEAN)
         else:
             mean_vals = [float(v) for v in latents_mean]
         if latents_std is None:
-            std_vals = (
-                list(DEFAULT_QWEN_LATENTS_STD)
-                if self.z_dim == len(DEFAULT_QWEN_LATENTS_STD)
-                else [1.0] * self.z_dim
-            )
+            if self.z_dim != len(DEFAULT_QWEN_LATENTS_STD):
+                raise ValueError(
+                    f"latents_std must be provided explicitly when z_dim={self.z_dim} != "
+                    f"{len(DEFAULT_QWEN_LATENTS_STD)}."
+                )
+            std_vals = list(DEFAULT_QWEN_LATENTS_STD)
         else:
             std_vals = [float(v) for v in latents_std]
 
@@ -495,7 +497,6 @@ class AutoencoderKLQwenImage2D(nn.Module):
         pretrained_path_or_repo: str | Path,
         *,
         subfolder: str | None = None,
-        revision: str | None = None,
         gradient_checkpointing: bool = False,
     ) -> AutoencoderKLQwenImage2D:
         """Load ``AutoencoderKLQwenImage2D`` from a local directory/file or HuggingFace Hub repo."""
@@ -532,22 +533,25 @@ class AutoencoderKLQwenImage2D(nn.Module):
                 raise FileNotFoundError(
                     f"Qwen VAE checkpoint path not found: {pretrained_path_or_repo}"
                 )
-            from huggingface_hub import hf_hub_download
+            from huggingface_hub import snapshot_download
 
-            cfg_file = hf_hub_download(
-                repo_id=repo_str,
-                filename="config.json",
-                subfolder=subfolder,
-                revision=revision,
+            prefix = f"{subfolder.strip('/')}/" if subfolder else ""
+            snapshot_dir = Path(
+                snapshot_download(
+                    repo_id=repo_str,
+                    allow_patterns=[
+                        f"{prefix}config.json",
+                        f"{prefix}diffusion_pytorch_model.safetensors",
+                    ],
+                )
             )
-            w_file = hf_hub_download(
-                repo_id=repo_str,
-                filename="diffusion_pytorch_model.safetensors",
-                subfolder=subfolder,
-                revision=revision,
-            )
-            config_path = Path(cfg_file)
-            weights_path = Path(w_file)
+            sub_dir = snapshot_dir / subfolder if subfolder else snapshot_dir
+            config_path = sub_dir / "config.json"
+            weights_path = sub_dir / "diffusion_pytorch_model.safetensors"
+            if not config_path.is_file() or not weights_path.is_file():
+                raise FileNotFoundError(
+                    f"Incomplete Qwen VAE snapshot under {sub_dir} from {repo_str}."
+                )
 
         kwargs: dict[str, Any] = {}
         if config_path is not None:

@@ -174,12 +174,15 @@ def cleanup_state():
 
 
 def _block_network_downloads(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.helpers.fake_backends import patch_lpips_offline
+
     def _deny(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("Unexpected network access during offline smoke test!")
 
     monkeypatch.setattr(socket, "create_connection", _deny)
     monkeypatch.setattr(urllib.request, "urlopen", _deny)
     monkeypatch.setattr(torch.hub, "load_state_dict_from_url", _deny)
+    patch_lpips_offline(monkeypatch)
 
 
 def _write_rgb_png(path: Path, h: int, w: int, seed: int) -> None:
@@ -341,7 +344,6 @@ def _make_base_train_cfg(
                 "criterion": {
                     "_target_": "losses.LPIPSLoss",
                     "net": "alex",
-                    "pretrained": False,
                 },
             }
         )
@@ -408,7 +410,6 @@ def _make_base_train_cfg(
                     "lpips": {
                         "_target_": "metrics.LPIPSMetric",
                         "net": "alex",
-                        "pretrained": False,
                     },
                 },
             }
@@ -944,7 +945,6 @@ def test_trainer_full_smoke_mixed_l1_lpips_multisuite_grad_accum_tb(
                 "lpips": {
                     "_target_": "metrics.LPIPSMetric",
                     "net": "alex",
-                    "pretrained": False,
                 },
             },
         },

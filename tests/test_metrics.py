@@ -677,12 +677,15 @@ def test_lpips_metric_offline_zero_download_rescaling_and_parity(
     net: str,
     spatial: bool,
 ) -> None:
+    from tests.helpers.fake_backends import patch_lpips_offline
+
     _block_network_downloads(monkeypatch)
+    patch_lpips_offline(monkeypatch)
     torch.manual_seed(1234)
 
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        metric = LPIPSMetric(net=net, spatial=spatial, version="0.1", pretrained=False)
+        metric = LPIPSMetric(net=net, spatial=spatial, version="0.1")
 
     captured_io = capsys.readouterr()
     assert captured_io.out == ""
@@ -692,11 +695,10 @@ def test_lpips_metric_offline_zero_download_rescaling_and_parity(
     assert metric.higher_is_better is False
     assert metric.device == torch.device("cpu")
 
-    # All params frozen, non-negative linear weights, eval mode locked
+    # All params frozen, eval mode locked
     params = list(metric.lpips.parameters())
     assert len(params) > 0
     assert all(not p.requires_grad for p in params)
-    assert all(torch.all(p >= 0.0) for p in metric.lpips.lins.parameters())
     assert metric.lpips.training is False
     assert all(not m.training for m in metric.lpips.modules())
 
@@ -749,9 +751,12 @@ def test_lpips_metric_offline_zero_download_rescaling_and_parity(
 
 
 def test_lpips_metric_version_0_0_offline(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.helpers.fake_backends import patch_lpips_offline
+
     _block_network_downloads(monkeypatch)
+    patch_lpips_offline(monkeypatch)
     torch.manual_seed(7)
-    metric = LPIPSMetric(net="alex", spatial=False, version="0.0", pretrained=False)
+    metric = LPIPSMetric(net="alex", spatial=False, version="0.0")
     x = torch.rand(1, 3, 64, 64)
     y = torch.rand(1, 3, 64, 64)
     assert metric.compute(x, x) == 0.0
@@ -762,9 +767,12 @@ def test_lpips_metric_version_0_0_offline(monkeypatch: pytest.MonkeyPatch) -> No
 def test_lpips_metric_single_load_reuse_eval_recovery_and_meta(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from tests.helpers.fake_backends import patch_lpips_offline
+
     _block_network_downloads(monkeypatch)
+    patch_lpips_offline(monkeypatch)
     torch.manual_seed(99)
-    metric = LPIPSMetric(net="alex", pretrained=False)
+    metric = LPIPSMetric(net="alex")
     orig_lpips = metric.lpips
 
     assert metric.to("cpu") is metric
@@ -800,9 +808,12 @@ def test_lpips_metric_single_load_reuse_eval_recovery_and_meta(
 def test_lpips_metric_no_grad_and_bf16_autocast_fp32_parity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from tests.helpers.fake_backends import patch_lpips_offline
+
     _block_network_downloads(monkeypatch)
+    patch_lpips_offline(monkeypatch)
     torch.manual_seed(55)
-    metric = LPIPSMetric(net="alex", pretrained=False)
+    metric = LPIPSMetric(net="alex")
 
     x = torch.rand(1, 3, 64, 64, dtype=torch.float32)
     y = torch.rand(1, 3, 64, 64, dtype=torch.float32)
@@ -846,23 +857,24 @@ def test_lpips_metric_no_grad_and_bf16_autocast_fp32_parity(
 def test_lpips_metric_validation_and_min_spatial_boundaries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from tests.helpers.fake_backends import patch_lpips_offline
+
     _block_network_downloads(monkeypatch)
+    patch_lpips_offline(monkeypatch)
 
     # Constructor validation
     for bad_net in ("resnet", "vgg16", 123, None):
         with pytest.raises(ValueError):
-            LPIPSMetric(net=bad_net, pretrained=False)  # type: ignore[arg-type]
+            LPIPSMetric(net=bad_net)  # type: ignore[arg-type]
     for bad_version in ("9.9", "v0.1", 0.1, None):
         with pytest.raises(ValueError):
-            LPIPSMetric(version=bad_version, pretrained=False)  # type: ignore[arg-type]
+            LPIPSMetric(version=bad_version)  # type: ignore[arg-type]
     for bad_bool in (0, 1, "false", "true", None):
         with pytest.raises(ValueError):
-            LPIPSMetric(spatial=bad_bool, pretrained=False)  # type: ignore[arg-type]
-        with pytest.raises(ValueError):
-            LPIPSMetric(pretrained=bad_bool)  # type: ignore[arg-type]
+            LPIPSMetric(spatial=bad_bool)  # type: ignore[arg-type]
 
     # Input validation
-    metric = LPIPSMetric(net="alex", pretrained=False)
+    metric = LPIPSMetric(net="alex")
     valid = torch.rand(1, 3, 64, 64)
 
     with pytest.raises(ValueError):
@@ -897,7 +909,7 @@ def test_lpips_metric_validation_and_min_spatial_boundaries(
 
     # Backbone-specific minimum spatial boundaries
     for net_name, min_sz in (("alex", 31), ("vgg", 16), ("squeeze", 17)):
-        m = LPIPSMetric(net=net_name, pretrained=False)
+        m = LPIPSMetric(net=net_name)
         for bad_hw in ((min_sz - 1, min_sz), (min_sz, min_sz - 1), (0, min_sz)):
             small = torch.rand(1, 3, *bad_hw)
             with pytest.raises(ValueError):
@@ -914,14 +926,17 @@ def test_lpips_metric_validation_and_min_spatial_boundaries(
 def test_hydra_sr_default_metric_instantiation_and_compute(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from tests.helpers.fake_backends import patch_lpips_offline
+
     _block_network_downloads(monkeypatch)
+    patch_lpips_offline(monkeypatch)
     torch.manual_seed(2026)
 
     pred = torch.rand(1, 3, 64, 64)
     target = (pred + 0.05 * torch.randn(1, 3, 64, 64)).clamp(0.0, 1.0)
 
-    # Default scale=1 composition with strict-mode offline LPIPS override (NO `+`)
-    cfg = _compose("train", overrides=["metric.val_suites.set5.metrics.lpips.pretrained=false"])
+    # Default scale=1 composition
+    cfg = _compose("train")
 
     set5_metrics = {
         name: instantiate(m_cfg).to("cpu")
@@ -938,7 +953,6 @@ def test_hydra_sr_default_metric_instantiation_and_compute(
     assert set5_metrics["ssim"].test_y_channel is True
     assert set5_metrics["ssim"].higher_is_better is True
     assert set5_metrics["lpips"].net == "alex"
-    assert set5_metrics["lpips"].pretrained is False
     assert set5_metrics["lpips"].higher_is_better is False
 
     urban_metrics = {
@@ -958,10 +972,7 @@ def test_hydra_sr_default_metric_instantiation_and_compute(
             assert math.isfinite(val), f"Expected finite score for {name}, got {val}"
 
     # Verify scale=2 interpolation propagates to crop_border across both suites
-    cfg_x2 = _compose(
-        "train",
-        overrides=["scale=2", "metric.val_suites.set5.metrics.lpips.pretrained=false"],
-    )
+    cfg_x2 = _compose("train", overrides=["scale=2"])
     for suite_name in ("set5", "urban100"):
         suite_cfg = cfg_x2.metric.val_suites[suite_name].metrics
         psnr_m = instantiate(suite_cfg.psnr)

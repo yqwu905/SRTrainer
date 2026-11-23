@@ -8,7 +8,6 @@ lpips:
   criterion:
     _target_: losses.LPIPSLoss
     net: vgg
-    pretrained: true
 ocr_kl:
   weight: 0.0005
   criterion:
@@ -17,7 +16,6 @@ ocr_kl:
     strip_height: 64
     strip_stride: 32
     temperature: 1.0
-    pretrained: true
     input_range: "0_1"
 glyph:
   weight: 1.0
@@ -25,8 +23,8 @@ glyph:
     _target_: losses.GlyphLoss
     model_dir: null
     repo_id: ATH-MaaS/TextVerifier-CJK-CLIP
-    revision: adc233a117cbb039842b245b5acf84e0143a5f11
     batch_size: 8
-    pretrained: true
     input_range: "0_1"
     sync_ddp_counts: true
+    cache_dir: null
+    local_files_only: false

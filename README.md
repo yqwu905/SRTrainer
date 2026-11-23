@@ -117,7 +117,29 @@ uv run python tools/infer.py \
   infer.tile.overlap=64
 ```
 
-### 3. 扩展自定义组件
+### 3. TextVerifier Stage-3 资产准备与迁移说明（`GlyphLoss`）
+
+`GlyphLoss` 仅支持真实的 TextVerifier Stage-3 视觉编码器（已纯 PyTorch 内置于 `src/archs/textverifier.py`，无需 `timm`）与校验通过的 4 文件资产包：
+
+- `textverifier_stage3.pth`
+- `textverifier_k10_q90.pt`
+- `prototype_metadata.json`
+- `manifest.sha256`
+
+默认在 `model_dir: null` 时通过单次 `huggingface_hub.snapshot_download` 从 `ATH-MaaS/TextVerifier-CJK-CLIP` 拉取完整 4 文件并校验 SHA-256 与 schema。若需离线或精确复现训练，请先将 4 个文件下载至本地目录并配置 `model_dir`（或使用已缓存目录并设置 `local_files_only: true`）：
+
+```bash
+huggingface-cli download ATH-MaaS/TextVerifier-CJK-CLIP \
+  textverifier_stage3.pth \
+  textverifier_k10_q90.pt \
+  prototype_metadata.json \
+  manifest.sha256 \
+  --local-dir /path/to/textverifier_assets
+```
+
+> **配置迁移说明**：已移除 `GlyphLoss` 的 `revision`、`pretrained` 与测试注入参数，以及 `VOSR2OneStep` / `OCRKLLoss` / `LPIPSLoss` / `LPIPSMetric` 的 `pretrained` 离线伪模式参数；若旧配置中包含上述字段，请直接删除并指向真实本地权重或默认仓库。
+
+### 4. 扩展自定义组件
 
 - **自定义网络 / Loss**：编写普通 PyTorch `nn.Module`，在 `configs/arch/*.yaml` 或 `configs/loss/*.yaml` 中填写 `_target_` 即可。
 - **自定义指标（含附加标注输入，如 OCR-A）**：继承 `metrics.BaseMetric`，实现 `compute(self, pred, target=None, meta=None) -> float`，并在 `configs/metric/*.yaml` 对应验证套件的 `metrics` 中通过 `_target_` 挂载。

@@ -6,5 +6,4 @@ ocr_kl:
     strip_height: 64
     strip_stride: 32
     temperature: 1.0
-    pretrained: true
     input_range: "0_1"
