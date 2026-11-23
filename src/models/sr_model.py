@@ -315,7 +315,7 @@ class SRModel(BaseModel):
         if not trainable_params:
             raise ValueError("Instantiated net_g has no trainable parameters (requires_grad=True).")
 
-        opt_factory = hydra.utils.instantiate(opt_cfg)
+        opt_factory = hydra.utils.instantiate(opt_cfg, _convert_="all")
         optimizer = opt_factory(trainable_params) if callable(opt_factory) else opt_factory
         if not isinstance(optimizer, torch.optim.Optimizer):
             raise TypeError(
@@ -327,7 +327,7 @@ class SRModel(BaseModel):
         lr_scheduler: Any = None
         if sched_cfg is not None:
             _validate_target_mapping(sched_cfg, "cfg.optim.scheduler")
-            sched_factory = hydra.utils.instantiate(sched_cfg)
+            sched_factory = hydra.utils.instantiate(sched_cfg, _convert_="all")
             lr_scheduler = sched_factory(optimizer) if callable(sched_factory) else sched_factory
             for required_attr in ("step", "state_dict", "load_state_dict"):
                 if not callable(getattr(lr_scheduler, required_attr, None)):
