@@ -680,7 +680,7 @@ class Trainer:
         results: dict[str, dict[str, float]] = {}
         tracker_metrics: dict[str, float] = {}
         metric_dtype = (
-            torch.float32 if self.accelerator.device.type == "mps" else torch.float64
+            torch.float32 if self.accelerator.device.type in {"mps", "npu"} else torch.float64
         )
 
         try:

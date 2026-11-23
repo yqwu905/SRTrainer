@@ -569,6 +569,100 @@ def test_ssim_window_cache_reuse_and_inference_mode_safety() -> None:
     assert fresh._window_cache[(torch.device("cpu"), 3)] is cached_win
 
 
+def test_psnr_ssim_float32_fallback_for_npu_and_mps_devices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import metrics.psnr_ssim as psnr_ssim_mod
+
+    # 1. Verify compute dtype selection across backends
+    assert psnr_ssim_mod._metric_compute_dtype(torch.device("cpu")) == torch.float64
+    assert psnr_ssim_mod._metric_compute_dtype(torch.device("cuda")) == torch.float64
+    assert psnr_ssim_mod._metric_compute_dtype(torch.device("cuda:0")) == torch.float64
+    assert psnr_ssim_mod._metric_compute_dtype(torch.device("mps")) == torch.float32
+    assert psnr_ssim_mod._metric_compute_dtype(torch.device("mps:0")) == torch.float32
+    # Use a lightweight stub for NPU since standard PyTorch builds without torch_npu
+    # do not register the privateuseone/npu device string.
+    assert psnr_ssim_mod._metric_compute_dtype(type("_Dev", (), {"type": "npu"})()) == torch.float32
+
+    gen = torch.Generator().manual_seed(314)
+    target = torch.rand(2, 3, 32, 36, generator=gen, dtype=torch.float32)
+    pred = (target + 0.06 * torch.randn(2, 3, 32, 36, generator=gen, dtype=torch.float32)).clamp(
+        0.0, 1.0
+    )
+
+    # 2. Simulate NPU/MPS float32 compute path on CPU and verify F.conv2d receives matching float32 tensors
+    orig_conv2d = psnr_ssim_mod.F.conv2d
+    conv_dtypes: list[tuple[torch.dtype, torch.dtype]] = []
+
+    def _recording_conv2d(inp: torch.Tensor, weight: torch.Tensor, *args: Any, **kwargs: Any):
+        conv_dtypes.append((inp.dtype, weight.dtype))
+        assert inp.dtype == weight.dtype
+        return orig_conv2d(inp, weight, *args, **kwargs)
+
+    monkeypatch.setattr(psnr_ssim_mod, "_metric_compute_dtype", lambda _dev: torch.float32)
+    monkeypatch.setattr(psnr_ssim_mod.F, "conv2d", _recording_conv2d)
+
+    y_out = rgb_to_y_bt601(pred)
+    assert y_out.dtype == torch.float32
+
+    for test_y in (False, True):
+        psnr_val = PSNRMetric(crop_border=2, test_y_channel=test_y).compute(pred, target)
+        ssim_metric = SSIMMetric(crop_border=2, test_y_channel=test_y)
+        ssim_val = ssim_metric.compute(pred, target)
+
+        expected_psnr = _ref_psnr_np(pred.numpy(), target.numpy(), 2, test_y)
+        expected_ssim = _ref_ssim_scipy(pred.numpy(), target.numpy(), 2, test_y)
+        assert psnr_val == pytest.approx(expected_psnr, abs=1e-4)
+        assert ssim_val == pytest.approx(expected_ssim, abs=1e-4)
+
+    assert len(conv_dtypes) > 0
+    assert all(d_in == torch.float32 and d_w == torch.float32 for d_in, d_w in conv_dtypes)
+
+    # 3. Defensive matching: even if a backend silently downgrades img1 to float32 while
+    # _metric_compute_dtype returns float64, SSIMMetric matches window.dtype to img1.dtype.
+    monkeypatch.undo()
+    monkeypatch.setattr(psnr_ssim_mod.F, "conv2d", _recording_conv2d)
+    monkeypatch.setattr(
+        psnr_ssim_mod,
+        "rgb_to_y_bt601",
+        lambda img: (
+            65.481 * img[:, 0:1].float()
+            + 128.553 * img[:, 1:2].float()
+            + 24.966 * img[:, 2:3].float()
+            + 16.0
+        ),
+    )
+    conv_dtypes.clear()
+    ssim_defensive = SSIMMetric(crop_border=0, test_y_channel=True)
+    # Pre-stage default float64 window on CPU to ensure cache does not serve mismatched float64 window
+    ssim_defensive.to("cpu")
+    score_def = ssim_defensive.compute(pred, target)
+    assert score_def == pytest.approx(
+        _ref_ssim_scipy(pred.numpy(), target.numpy(), 0, True), abs=1e-4
+    )
+    assert len(conv_dtypes) > 0
+    assert all(d_in == torch.float32 and d_w == torch.float32 for d_in, d_w in conv_dtypes)
+
+    # 4. Run directly on MPS when available
+    monkeypatch.undo()
+    if torch.backends.mps.is_available():
+        pred_mps = pred.to("mps")
+        target_mps = target.to("mps")
+        for test_y in (False, True):
+            p_mps = PSNRMetric(crop_border=2, test_y_channel=test_y).compute(pred_mps, target_mps)
+            s_mps = (
+                SSIMMetric(crop_border=2, test_y_channel=test_y)
+                .to("mps")
+                .compute(pred_mps, target_mps)
+            )
+            assert p_mps == pytest.approx(
+                _ref_psnr_np(pred.numpy(), target.numpy(), 2, test_y), abs=1e-4
+            )
+            assert s_mps == pytest.approx(
+                _ref_ssim_scipy(pred.numpy(), target.numpy(), 2, test_y), abs=1e-4
+            )
+
+
 def test_psnr_and_ssim_minimal_boundary_sizes_and_validation_matrix() -> None:
     # Minimal valid boundary sizes
     assert math.isinf(
