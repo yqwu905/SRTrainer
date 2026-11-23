@@ -116,11 +116,13 @@ sequenceDiagram
 
 ## 3. 工程目录结构
 
-采用扁平 `src` 源码根目录布局，配合 `pyproject.toml` 可编辑安装（`pip install -e .`），使任意路径下都能直接通过 `archs.*`、`models.*`、`losses.*` 等顶层包引用 `_target_`。
+采用扁平 `src` 源码根目录布局，配合 `pyproject.toml` + `uv sync` 可编辑安装，使任意路径下都能直接通过 `archs.*`、`models.*`、`losses.*` 等顶层包引用 `_target_`。
 
 ```text
 SRTrainer/
-├── pyproject.toml                       # 依赖声明、CLI 入口与工具配置 (ruff/pytest)
+├── pyproject.toml                       # 依赖声明、UV 配置与工具配置 (ruff/pytest)
+├── uv.lock                              # UV 锁定的跨平台依赖版本
+├── .python-version                      # UV 默认 Python 版本声明
 ├── docs/
 │   └── design.md                        # 本文档
 ├── configs/                             # Hydra 分级配置根目录

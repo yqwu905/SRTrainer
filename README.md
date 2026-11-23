@@ -19,10 +19,14 @@
 
 ## 安装
 
+本项目使用 [uv](https://docs.astral.sh/uv/) 管理依赖与虚拟环境（固定 `torch==2.9.0`）：
+
 ```bash
-pip install -e ".[dev]"
+# 同步项目及开发依赖（含 pytest / ruff）
+uv sync
+
 # 可选：安装额外实验看板依赖（wandb / mlflow / swanlab）
-pip install -e ".[trackers]"
+uv sync --extra trackers
 ```
 
 ## JSON 数据清单格式
@@ -70,14 +74,14 @@ pip install -e ".[trackers]"
 
 ```bash
 # 单卡或通过 accelerate launch 启动多卡训练（基于实验继承配置并临时覆写参数）
-accelerate launch tools/train.py \
+uv run accelerate launch tools/train.py \
   experiment=exp01_toy_mixed_x4 \
   optim.optimizer.lr=5e-5 \
   trainer.total_iters=50000 \
   trainer.log_with='[tensorboard]'
 
 # 自动从最近一次状态目录精确续训
-accelerate launch tools/train.py \
+uv run accelerate launch tools/train.py \
   experiment=exp01_toy_mixed_x4 \
   trainer.resume=auto
 ```
@@ -86,7 +90,7 @@ accelerate launch tools/train.py \
 
 ```bash
 # 实验目录自动还原模式（自动加载 config_resolved.yaml、最优/EMA 权重与训练输入尺寸 tile_size）
-python tools/infer.py \
+uv run python tools/infer.py \
   infer.exp_dir=experiments/exp01_toy_l1_lpips_x4 \
   infer.input=/data/test_imgs \
   infer.output_dir=outputs/exp01_test \
@@ -94,7 +98,7 @@ python tools/infer.py \
   infer.tile.overlap=16
 
 # 多卡分布式离线推理 JSON 清单
-accelerate launch --num_processes 4 tools/infer.py \
+uv run accelerate launch --num_processes 4 tools/infer.py \
   infer.exp_dir=experiments/exp01_toy_l1_lpips_x4 \
   infer.input=/data/manifests/large_test.json \
   infer.input_root=/data/large_test \
@@ -104,7 +108,7 @@ accelerate launch --num_processes 4 tools/infer.py \
   infer.tile.batch_size=8
 
 # 独立配置模式（不依赖训练实验目录）
-python tools/infer.py \
+uv run python tools/infer.py \
   arch=toy_x4 \
   scale=4 \
   infer.weights_path=/path/to/weights.safetensors \
@@ -121,6 +125,6 @@ python tools/infer.py \
 ## 测试与代码检查
 
 ```bash
-ruff check src tools tests
-OMP_NUM_THREADS=1 python -m pytest
+uv run ruff check src tools tests
+OMP_NUM_THREADS=1 uv run pytest
 ```
