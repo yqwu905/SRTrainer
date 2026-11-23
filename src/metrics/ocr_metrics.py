@@ -1,4 +1,4 @@
-"""PaddleOCR 3.x text recognition evaluation metrics: OCR-A, CER, and 1-NED.
+"""RapidOCR text recognition evaluation metrics: OCR-A, CER, and 1-NED.
 
 Aligned with ``yqwu905/VOSR`` ``evaluate.py`` (commit ``9fbcf8fe22b399a6fbb41e011748322363ae9ee0``)
 for NFKC/whitespace text normalization, unit-cost Unicode Levenshtein distance,
@@ -6,8 +6,8 @@ OpenCV ``INTER_CUBIC``/``BORDER_REPLICATE`` perspective cropping with 1.5x verti
 and exact dataset-level weighted reduction via :meth:`BaseMetric.compute_stats`.
 
 Differences documented by design:
-- ``ocr_device`` defaults to ``"cpu"`` (portable default instead of Paddle auto-selection).
-- OpenCV and PaddleOCR are optional dependencies imported and initialized lazily.
+- ``ocr_device`` defaults to ``"cpu"`` independently of the training device.
+- OpenCV, RapidOCR, and ONNX Runtime are optional dependencies imported lazily.
 - Same-process metrics sharing identical OCR configuration share one recognizer instance
   and a bounded 1-sample recognition cache keyed by image/annotation/config digest.
 """
@@ -17,7 +17,7 @@ from __future__ import annotations
 import hashlib
 import math
 import numbers
-import sys
+import os
 import threading
 import unicodedata
 from collections import OrderedDict
@@ -40,6 +40,7 @@ __all__ = [
     "edit_distance",
     "rectified_corners",
     "crop_text_region",
+    "RapidOCRTextRecognizer",
     "PaddleTextRecognizer",
     "clear_ocr_caches",
     "OCRAccuracyMetric",
@@ -134,16 +135,16 @@ def _import_cv2() -> Any:
     return cv2
 
 
-def _import_paddleocr_classes() -> tuple[Any, Any]:
+def _import_rapidocr() -> tuple[Any, Any]:
     try:
-        from paddleocr import TextLineOrientationClassification, TextRecognition
+        import onnxruntime
+        import rapidocr
     except ImportError as exc:
         raise ImportError(
-            "OCR metrics require PaddleOCR >= 3.0 and PaddlePaddle. Install optional OCR "
-            "dependencies with `uv sync --extra ocr` (or `pip install 'paddleocr>=3.0' paddlepaddle`; "
-            "use `paddlepaddle-gpu` for CUDA)."
+            "OCR metrics require RapidOCR and ONNX Runtime. Install optional OCR dependencies "
+            "with `uv sync --extra ocr`."
         ) from exc
-    return TextRecognition, TextLineOrientationClassification
+    return rapidocr, onnxruntime
 
 
 def _contains_bool(obj: Any) -> bool:
@@ -563,25 +564,79 @@ def _extract_ocr_instances(
     )
 
 
-def _build_paddle_init_kwargs(
+_REC_MODELS = {
+    "PP-OCRv4_server_rec": ("PP-OCRv4", "server"),
+    "PP-OCRv4_mobile_rec": ("PP-OCRv4", "mobile"),
+    DEFAULT_OCR_MODEL: ("PP-OCRv5", "server"),
+    "PP-OCRv5_mobile_rec": ("PP-OCRv5", "mobile"),
+}
+_CLS_MODELS = {
+    "PP-LCNet_x1_0_textline_ori": ("PP-OCRv5", "server"),
+    "PP-LCNet_x0_25_textline_ori": ("PP-OCRv5", "mobile"),
+}
+
+
+def _resolve_onnx_model(
     model_name: str,
     model_dir: str | Path | None,
-    device: str | None,
     role_label: str,
-) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {"model_name": model_name.strip()}
-    if model_dir is not None:
-        resolved_dir = Path(model_dir)
-        if not resolved_dir.is_dir():
-            raise FileNotFoundError(f"OCR {role_label} model directory not found: {resolved_dir}")
-        kwargs["model_dir"] = str(resolved_dir)
-    if device is not None:
-        kwargs["device"] = device
-    return kwargs
+    known_models: Mapping[str, tuple[str, str]],
+) -> tuple[str, str, Path | None]:
+    if model_dir is None:
+        if model_name not in known_models:
+            raise ValueError(
+                f"Unknown OCR {role_label} model {model_name!r}. Available for automatic "
+                f"download: {', '.join(known_models)}. To use other weights, supply an ONNX model."
+            )
+        version, model_type = known_models[model_name]
+        return version, model_type, None
+
+    path = Path(model_dir).expanduser()
+    if path.is_dir():
+        named_model = path / f"{model_name}.onnx"
+        candidates = sorted(candidate for candidate in path.glob("*.onnx") if candidate.is_file())
+        if named_model in candidates:
+            path = named_model
+        elif len(candidates) == 1:
+            path = candidates[0]
+        elif candidates:
+            raise ValueError(f"Multiple ONNX models in {path}. Specify the {role_label} ONNX file.")
+    if path.suffix.lower() != ".onnx" or not path.is_file():
+        raise FileNotFoundError(
+            f"OCR {role_label} ONNX model not found at {path}. Supply an .onnx file or "
+            "a directory containing the ONNX export of your model."
+        )
+    version, model_type = known_models.get(model_name, ("PP-OCRv5", "server"))
+    return version, model_type, path
 
 
-class PaddleTextRecognizer:
-    """PaddleOCR 3.x text-line recognizer for BGR crops with optional 0/180-deg orientation cls."""
+def _onnx_device_params(device: str | None, onnxruntime: Any) -> dict[str, Any]:
+    name, separator, device_id = (device or "cpu").partition(":")
+    if name == "cpu" and not separator:
+        return {}
+    providers = {
+        "gpu": ("cuda", "CUDAExecutionProvider"),
+        "cuda": ("cuda", "CUDAExecutionProvider"),
+        "npu": ("cann", "CANNExecutionProvider"),
+    }
+    if name not in providers or (separator and not device_id.isdecimal()):
+        raise ValueError(
+            f"Unsupported OCR device {device!r}. Use cpu, gpu[:ID], cuda[:ID], or npu[:ID]."
+        )
+    flag, provider = providers[name]
+    if provider not in onnxruntime.get_available_providers():
+        raise ValueError(
+            f"OCR device {device!r} requires {provider}. Install an ONNX Runtime build with "
+            'that provider or set ocr_device="cpu".'
+        )
+    return {
+        f"EngineConfig.onnxruntime.use_{flag}": True,
+        f"EngineConfig.onnxruntime.{flag}_ep_cfg.device_id": int(device_id or 0),
+    }
+
+
+class RapidOCRTextRecognizer:
+    """Batched RapidOCR text recognition on BGR crops with optional 0/180-deg orientation."""
 
     def __init__(
         self,
@@ -593,71 +648,99 @@ class PaddleTextRecognizer:
         device: str | None = "cpu",
         batch_size: int = 1,
     ) -> None:
-        self.batch_size: int = _require_positive_int(batch_size, "batch_size")
+        self.batch_size = _require_positive_int(batch_size, "batch_size")
         clean_model_name = _validate_str_option(model_name, "model_name", required=True)
         assert clean_model_name is not None
         if cls_model_dir is not None and cls_model_name is None:
             raise ValueError("cls_model_dir requires cls_model_name to be specified.")
 
-        text_rec_cls, line_ori_cls = _import_paddleocr_classes()
-        rec_kwargs = _build_paddle_init_kwargs(clean_model_name, model_dir, device, "recognition")
-        cls_kwargs = (
-            _build_paddle_init_kwargs(cls_model_name, cls_model_dir, device, "orientation")
+        rec_version, rec_type, rec_path = _resolve_onnx_model(
+            clean_model_name, model_dir, "recognition", _REC_MODELS
+        )
+        cls_model = (
+            _resolve_onnx_model(cls_model_name, cls_model_dir, "orientation", _CLS_MODELS)
             if cls_model_name is not None
             else None
         )
-        self.rec = text_rec_cls(**rec_kwargs)
-        self.cls: Any | None = line_ori_cls(**cls_kwargs) if cls_kwargs is not None else None
+        self.use_cls = cls_model is not None
+        rapidocr, onnxruntime = _import_rapidocr()
+        cache_root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+        model_root = cache_root / "srtrainer" / "rapidocr"
+        params: dict[str, Any] = {
+            "Global.use_det": False,
+            "Global.use_cls": self.use_cls,
+            "Global.model_root_dir": str(model_root),
+            "Rec.engine_type": rapidocr.EngineType.ONNXRUNTIME,
+            "Rec.ocr_version": rapidocr.OCRVersion(rec_version),
+            "Rec.model_type": rapidocr.ModelType(rec_type),
+            "Rec.lang_type": "ch",
+            "Rec.model_path": str(rec_path) if rec_path is not None else None,
+            "Rec.rec_batch_num": self.batch_size,
+            **_onnx_device_params(device, onnxruntime),
+        }
+        if rec_path is not None:
+            dict_path = rec_path.with_name("dict.txt")
+            if dict_path.is_file():
+                params["Rec.rec_keys_path"] = str(dict_path)
+        needs_download = rec_path is None
+        if cls_model is not None:
+            cls_version, cls_type, cls_path = cls_model
+            needs_download |= cls_path is None
+            params.update(
+                {
+                    "Cls.engine_type": rapidocr.EngineType.ONNXRUNTIME,
+                    "Cls.ocr_version": rapidocr.OCRVersion(cls_version),
+                    "Cls.model_type": rapidocr.ModelType(cls_type),
+                    "Cls.model_path": str(cls_path) if cls_path is not None else None,
+                    "Cls.cls_batch_num": self.batch_size,
+                    # Apply the classifier's top label regardless of its confidence.
+                    "Cls.cls_thresh": -1.0,
+                }
+            )
+        self.engine = rapidocr.RapidOCR(params=params)
+        # RapidOCR downloads directly to the final path. Serialize the first call across ranks.
+        self._download_lock = model_root / ".download.lock" if needs_download else None
 
     def __call__(self, crops: Sequence[np.ndarray]) -> list[tuple[str, float]]:
         crop_list = list(crops)
         if not crop_list:
             return []
 
-        if self.cls is not None:
-            cls_results = list(self.cls.predict(crop_list, batch_size=self.batch_size))
-            if len(cls_results) != len(crop_list):
-                raise RuntimeError(
-                    f"OCR orientation classifier returned {len(cls_results)} results "
-                    f"for {len(crop_list)} crops."
-                )
-            oriented: list[np.ndarray] = []
-            for idx, (crop, cls_res) in enumerate(zip(crop_list, cls_results, strict=True)):
-                if not isinstance(cls_res, Mapping) or "class_ids" not in cls_res:
-                    raise RuntimeError(
-                        f"OCR orientation result at index {idx} is missing 'class_ids'."
-                    )
-                class_ids = np.ravel(cls_res["class_ids"])
-                if class_ids.size < 1:
-                    raise RuntimeError(
-                        f"OCR orientation result at index {idx} has empty 'class_ids'."
-                    )
-                oriented.append(
-                    np.ascontiguousarray(crop[::-1, ::-1]) if int(class_ids[0]) == 1 else crop
-                )
-            crop_list = oriented
+        lock_path = self._download_lock
+        if lock_path is not None:
+            from huggingface_hub.utils import WeakFileLock
 
-        rec_results = list(self.rec.predict(crop_list, batch_size=self.batch_size))
-        if len(rec_results) != len(crop_list):
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with WeakFileLock(lock_path):
+                outputs = self._recognize(crop_list)
+            self._download_lock = None
+            return outputs
+        return self._recognize(crop_list)
+
+    def _recognize(self, crops: list[np.ndarray]) -> list[tuple[str, float]]:
+        # Use the individual RapidOCR stages to keep the project's crop geometry, raw text,
+        # and batching. A crop that decodes to an empty string still contributes to the metrics.
+        expected_count = len(crops)
+        if self.use_cls:
+            crops, result = self.engine.cls_and_rotate(crops)
+            if len(crops) != expected_count or len(result.cls_res) != expected_count:
+                raise RuntimeError(
+                    f"OCR orientation classifier returned {len(result.cls_res)} predictions "
+                    f"and {len(crops)} images for {expected_count} crops."
+                )
+        result = self.engine.recognize_txt(crops)
+        if len(result.txts) != expected_count or len(result.scores) != expected_count:
             raise RuntimeError(
-                f"OCR recognizer returned {len(rec_results)} results for {len(crop_list)} crops."
+                f"OCR recognizer returned {len(result.txts)} texts and {len(result.scores)} scores "
+                f"for {expected_count} crops."
             )
+        return [
+            (text, float(score)) for text, score in zip(result.txts, result.scores, strict=True)
+        ]
 
-        outputs: list[tuple[str, float]] = []
-        for idx, rec_res in enumerate(rec_results):
-            if not isinstance(rec_res, Mapping) or "rec_text" not in rec_res:
-                raise RuntimeError(
-                    f"OCR recognition result at index {idx} is missing 'rec_text'."
-                )
-            rec_text = rec_res["rec_text"]
-            if not isinstance(rec_text, str):
-                raise RuntimeError(
-                    f"OCR recognition result 'rec_text' at index {idx} must be str, "
-                    f"got {type(rec_text).__name__}."
-                )
-            score = float(rec_res["rec_score"]) if "rec_score" in rec_res else 0.0
-            outputs.append((rec_text, score))
-        return outputs
+
+# Preserve the import used by callers of the former adapter.
+PaddleTextRecognizer = RapidOCRTextRecognizer
 
 
 @dataclass(frozen=True)
@@ -727,8 +810,8 @@ _RUNTIME_CACHE_LOCK = threading.Lock()
 _RUNTIME_CACHE: OrderedDict[tuple[Any, ...], _SharedOCRRuntime] = OrderedDict()
 
 
-def _build_recognizer(config: _RecognizerConfig) -> PaddleTextRecognizer:
-    return PaddleTextRecognizer(
+def _build_recognizer(config: _RecognizerConfig) -> RapidOCRTextRecognizer:
+    return RapidOCRTextRecognizer(
         model_name=config.ocr_model,
         model_dir=config.ocr_model_dir,
         cls_model_name=config.ocr_cls_model,
@@ -739,14 +822,7 @@ def _build_recognizer(config: _RecognizerConfig) -> PaddleTextRecognizer:
 
 
 def _runtime_cache_key(config: _RecognizerConfig) -> tuple[Any, ...]:
-    paddle_mod = sys.modules.get("paddleocr")
-    rec_cls = getattr(paddle_mod, "TextRecognition", None) if paddle_mod is not None else None
-    cls_cls = (
-        getattr(paddle_mod, "TextLineOrientationClassification", None)
-        if paddle_mod is not None
-        else None
-    )
-    return (config, _build_recognizer, PaddleTextRecognizer, rec_cls, cls_cls)
+    return (config, RapidOCRTextRecognizer)
 
 
 def _get_shared_runtime(config: _RecognizerConfig) -> _SharedOCRRuntime:
@@ -759,13 +835,12 @@ def _get_shared_runtime(config: _RecognizerConfig) -> _SharedOCRRuntime:
 
     recognizer = _build_recognizer(config)
     runtime = _SharedOCRRuntime(recognizer)
-    resolved_key = _runtime_cache_key(config)
     with _RUNTIME_CACHE_LOCK:
-        existing = _RUNTIME_CACHE.get(resolved_key)
+        existing = _RUNTIME_CACHE.get(lookup_key)
         if existing is not None:
-            _RUNTIME_CACHE.move_to_end(resolved_key)
+            _RUNTIME_CACHE.move_to_end(lookup_key)
             return existing
-        _RUNTIME_CACHE[resolved_key] = runtime
+        _RUNTIME_CACHE[lookup_key] = runtime
         while len(_RUNTIME_CACHE) > _MAX_RUNTIME_CACHE_ENTRIES:
             _RUNTIME_CACHE.popitem(last=False)
         return runtime
@@ -780,7 +855,7 @@ def clear_ocr_caches() -> None:
 
 
 class _BaseOCRMetric(BaseMetric):
-    """Shared base class for PaddleOCR-backed text recognition metrics (OCR-A, CER, 1-NED)."""
+    """Shared base class for RapidOCR-backed text recognition metrics (OCR-A, CER, 1-NED)."""
 
     def __init__(
         self,
@@ -825,7 +900,7 @@ class _BaseOCRMetric(BaseMetric):
         )
 
     def to(self, device: torch.device | str) -> _BaseOCRMetric:
-        """No-op preserving the explicit Paddle ``ocr_device`` without triggering lazy init."""
+        """Preserve the explicit ``ocr_device`` without triggering lazy initialization."""
         del device
         return self
 

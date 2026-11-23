@@ -35,8 +35,10 @@ trackers = [
 ]
 ocr = [
     "opencv-python-headless>=4.8.0",
-    "paddleocr>=3.0.0",
-    "paddlepaddle>=3.0.0",
+    "rapidocr>=3.10.0,<4",
+    # ONNX Runtime 1.24 stopped publishing Python 3.10 wheels.
+    "onnxruntime>=1.20.0,<1.24; python_version < '3.11'",
+    "onnxruntime>=1.20.0; python_version >= '3.11'",
 ]
 npu = [
     "torch-npu==2.9.0; sys_platform == 'linux'",
