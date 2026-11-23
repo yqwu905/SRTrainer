@@ -37,6 +37,6 @@ trainer:
     enabled: true
     size: auto
     overlap: 64
-    batch_size: 1
+    batch_size: 4
     blend_mode: cosine
     pad_multiple: 16

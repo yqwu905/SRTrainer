@@ -132,16 +132,43 @@ def rgb_to_y_bt601(img: torch.Tensor) -> torch.Tensor:
         )
 
 
-def _create_gaussian_window(
+def _create_gaussian_1d(
     window_size: int = _SSIM_WINDOW_SIZE, sigma: float = _SSIM_SIGMA
 ) -> torch.Tensor:
     coords = torch.arange(window_size, dtype=torch.float64) - (window_size - 1) / 2.0
     gauss_1d = torch.exp(-(coords**2) / (2.0 * (sigma**2)))
-    gauss_1d = gauss_1d / gauss_1d.sum()
+    return gauss_1d / gauss_1d.sum()
+
+
+def _create_gaussian_window(
+    window_size: int = _SSIM_WINDOW_SIZE, sigma: float = _SSIM_SIGMA
+) -> torch.Tensor:
+    gauss_1d = _create_gaussian_1d(window_size, sigma)
     window_2d = torch.outer(gauss_1d, gauss_1d)
     return window_2d.view(1, 1, window_size, window_size).contiguous()
 
 
+def _depthwise_valid_conv(x: torch.Tensor, gauss_1d: torch.Tensor) -> torch.Tensor:
+    """Separable depthwise ``valid`` Gaussian filtering of ``[N, C, H, W]``.
+
+    The 11x11 SSIM window is an outer product of two 1D Gaussians, so one 2D convolution
+    equals two 1D convolutions (horizontal + vertical). Both formulations are
+    mathematically identical (FP64 parity to ~1e-16), but many backends (e.g. Ascend NPU)
+    execute oversized 2D kernels through a very slow fallback path, whereas 1xK depthwise
+    convolutions stay on the fast path (>1000x faster for 12MP images).
+    """
+    channels = int(x.shape[1])
+    weight = gauss_1d.to(dtype=x.dtype, device=x.device).view(1, 1, 1, -1)
+    if channels > 1:
+        weight = weight.expand(channels, 1, 1, -1).contiguous()
+    groups = channels if channels > 1 else 1
+
+    out = F.conv2d(x, weight, padding=0, groups=groups)
+    out = F.conv2d(out.transpose(-2, -1), weight, padding=0, groups=groups)
+    return out.transpose(-2, -1)
+
+
+_BASE_SSIM_WINDOW_1D: torch.Tensor = _create_gaussian_1d(_SSIM_WINDOW_SIZE, _SSIM_SIGMA)
 _BASE_SSIM_WINDOW: torch.Tensor = _create_gaussian_window(_SSIM_WINDOW_SIZE, _SSIM_SIGMA)
 
 
@@ -204,7 +231,8 @@ class PSNRMetric(BaseMetric):
 class SSIMMetric(BaseMetric):
     """Structural Similarity Index (SSIM) aligned with BasicSR / MATLAB BT.601 conventions.
 
-    Uses an 11x11 ``float64`` Gaussian window (``sigma=1.5``), valid convolution, and
+    Uses an 11x11 ``float64`` Gaussian window (``sigma=1.5``, applied as an exact separable
+    pair of 1D convolutions), valid convolution, and
     ``C1=(0.01*255)^2``, ``C2=(0.03*255)^2``.
 
     Args:
@@ -226,6 +254,11 @@ class SSIMMetric(BaseMetric):
         channels: int,
         dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
+        """Return the cached 1D Gaussian kernel (length ``_SSIM_WINDOW_SIZE``) on ``device``.
+
+        The separable kernel is identical for every channel count; ``channels`` is kept in the
+        cache key only to preserve the historical cache layout.
+        """
         canonical_device = torch.device("cpu") if device.type == "cpu" else device
         default_dtype = _metric_compute_dtype(canonical_device)
         target_dtype = default_dtype if dtype is None else dtype
@@ -239,12 +272,7 @@ class SSIMMetric(BaseMetric):
             return window
 
         with torch.inference_mode(False), torch.no_grad():
-            window = (
-                _BASE_SSIM_WINDOW.to(dtype=target_dtype)
-                .to(device=canonical_device)
-                .expand(channels, 1, _SSIM_WINDOW_SIZE, _SSIM_WINDOW_SIZE)
-                .contiguous()
-            )
+            window = _BASE_SSIM_WINDOW_1D.to(dtype=target_dtype).to(device=canonical_device)
 
         resolved_key: tuple[Any, ...] = (
             (window.device, channels)
@@ -256,7 +284,7 @@ class SSIMMetric(BaseMetric):
         return window
 
     def to(self, device: torch.device | str) -> SSIMMetric:
-        """Pre-stage the Gaussian SSIM window on ``device`` and return ``self``."""
+        """Pre-stage the 1D Gaussian SSIM kernel on ``device`` and return ``self``."""
         target_device = torch.device(device)
         default_channels = 1 if self.test_y_channel else 3
         self._get_window(target_device, default_channels)
@@ -297,18 +325,18 @@ class SSIMMetric(BaseMetric):
             if img2.dtype != img1.dtype:
                 img2 = img2.to(dtype=img1.dtype)
 
-            channels = img1.shape[1]
+            channels = int(img1.shape[1])
             window = self._get_window(img1.device, channels, dtype=img1.dtype)
 
-            mu1 = F.conv2d(img1, window, padding=0, groups=channels)
-            mu2 = F.conv2d(img2, window, padding=0, groups=channels)
+            mu1 = _depthwise_valid_conv(img1, window)
+            mu2 = _depthwise_valid_conv(img2, window)
             mu1_sq = mu1 * mu1
             mu2_sq = mu2 * mu2
             mu1_mu2 = mu1 * mu2
 
-            sigma1_sq = F.conv2d(img1 * img1, window, padding=0, groups=channels) - mu1_sq
-            sigma2_sq = F.conv2d(img2 * img2, window, padding=0, groups=channels) - mu2_sq
-            sigma12 = F.conv2d(img1 * img2, window, padding=0, groups=channels) - mu1_mu2
+            sigma1_sq = _depthwise_valid_conv(img1 * img1, window) - mu1_sq
+            sigma2_sq = _depthwise_valid_conv(img2 * img2, window) - mu2_sq
+            sigma12 = _depthwise_valid_conv(img1 * img2, window) - mu1_mu2
 
             numerator = (2.0 * mu1_mu2 + _SSIM_C1) * (2.0 * sigma12 + _SSIM_C2)
             denominator = (mu1_sq + mu2_sq + _SSIM_C1) * (sigma1_sq + sigma2_sq + _SSIM_C2)

@@ -1,36 +1,23 @@
 # Validation datasets and metrics are co-located exclusively under metric.val_suites
 # (never in configs/data/), supporting per-suite metrics and extra JSON fields via meta.
-primary_dataset: set5          # Benchmark suite used to select best checkpoint
-primary_metric: psnr           # Metric name within primary_dataset for best checkpoint
+primary_dataset: realce          # Benchmark suite used to select best checkpoint
+primary_metric: lpips           # Metric name within primary_dataset for best checkpoint
 
 val_suites:
-  set5:
+  realce:
     dataset:
-      root_dir: /data/benchmarks/Set5
-      json_path: /data/manifests/set5_x4.json
+      # RealCE 实拍文字对：LQ=13mm（等效低倍），GT=52mm（等效 4x 光学解析力）
+      root_dir: /home/dataset/train/RealCE/val
+      json_path: /home/dataset/train/RealCE/val/realce_val_x4.json
     metrics:
       psnr:
         _target_: metrics.PSNRMetric
-        crop_border: ${scale}
+        crop_border: 0
         test_y_channel: true
       ssim:
         _target_: metrics.SSIMMetric
-        crop_border: ${scale}
+        crop_border: 0
         test_y_channel: true
       lpips:
         _target_: metrics.LPIPSMetric
         net: alex
-
-  urban100:
-    dataset:
-      root_dir: /data/benchmarks/Urban100
-      json_path: /data/manifests/urban100_x4.json
-    metrics:
-      psnr:
-        _target_: metrics.PSNRMetric
-        crop_border: ${scale}
-        test_y_channel: true
-      ssim:
-        _target_: metrics.SSIMMetric
-        crop_border: ${scale}
-        test_y_channel: true

@@ -33,6 +33,11 @@ trackers = [
     "mlflow",
     "swanlab",
 ]
+npu = [
+    "torch-npu==2.9.0; sys_platform == 'linux'",
+    "setuptools>=65",
+    "decorator", "psutil", "scipy", "attrs"
+]
 
 [dependency-groups]
 dev = [

@@ -13,6 +13,8 @@ from accelerate.state import AcceleratorState, GradientState, PartialState
 from omegaconf import DictConfig, OmegaConf
 
 from engine import Trainer
+from utils.npu import setup_npu
+IS_NPU = setup_npu()
 
 __all__ = ["main", "run_train"]
 
