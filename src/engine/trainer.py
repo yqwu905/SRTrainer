@@ -509,6 +509,7 @@ class Trainer:
                 kernel_cfg=kernel_cfg,
                 is_main_process=self.accelerator.is_main_process,
                 logger=self.logger,
+                text_crop_prob=float(OmegaConf.select(self.cfg, "data.text_crop_prob", default=0.0)),
             )
             self.train_sampler = DistributedWeightedInfiniteSampler(
                 source_sizes=self.train_dataset.source_sizes,
@@ -529,6 +530,8 @@ class Trainer:
             )
             train_dl_gen = torch.Generator()
             train_dl_gen.manual_seed(self.seed + self.accelerator.process_index)
+            from data.mixed_dataset import train_collate_fn
+
             self.train_loader = DataLoader(
                 self.train_dataset,
                 batch_size=batch_size_per_gpu,
@@ -536,6 +539,7 @@ class Trainer:
                 num_workers=num_workers,
                 pin_memory=pin_memory,
                 persistent_workers=persistent_workers,
+                collate_fn=train_collate_fn if self.train_dataset.has_text_annotations else None,
                 generator=train_dl_gen,
             )
 

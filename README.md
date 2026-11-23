@@ -8,9 +8,9 @@
 
 - **分层训练引擎 + Accelerate**：`Trainer` 统一管理 `Accelerator`、纯 Iteration 驱动循环、多验证集分布式精确评估（`gather_for_metrics`）、双轨 Checkpoint 与多 Tracker 日志；`BaseModel` / `SRModel` 封装网络、FP32 `ModelEMA`、任意可组合 Loss 字典与单步更新（`lr_scheduler` 不经 `prepare()`，避免多卡倍速步进）。
 - **纯 Hydra `_target_` 分级配置与多级继承**：按 `arch / loss / model / data / optim / metric / trainer / infer` 拆分原子配置组，在 `configs/experiment/` 中通过 `# @package _global_` 多级继承并快速覆写局部参数；包级 `__init__.py` 提供短路径重导出。
-- **框架优先，精简占位**：内置轻量占位网络 `archs.ToyModel` 以及 `L1Loss` / `LPIPSLoss`，用户可通过 Hydra `_target_` 直接接入任意自定义网络与损失函数。
+- **内置网络与损失函数**：`src/archs/` 提供轻量占位网络 `archs.ToyModel` 与单步生成超分网络 `archs.VOSR2OneStep`（含冻结 Qwen-Image 2D VAE 与 DINOv2-ViT-L/14，权重与官方 VOSR2 checkpoint 键完全对齐）；`src/losses/` 内置 `L1Loss`、`LPIPSLoss`、基于冻结 PP-OCRv5 的 `OCRKLLoss` 与基于冻结 TextVerifier Stage-3 的 `GlyphLoss`，同时支持通过 Hydra `_target_` 直接接入任意自定义网络与损失函数。
 - **统一 JSON 清单 + 样本级混合与 GPU 掩码 Real-ESRGAN 退化**：
-  - 仅读取独立图像文件（`.jpg/.png/.jpeg/.webp`），`gt_only` 与 `paired` 统一使用字典列表 JSON，自动根据样本是否含有效 `lq` 判定模式（配置中无需 `mode`）；
+  - 仅读取独立图像文件（`.jpg/.png/.jpeg/.webp`），`gt_only` 与 `paired` 统一使用字典列表 JSON，自动根据样本是否含有效 `lq` 判定模式（配置中无需 `mode`）；支持在清单内嵌 `text_lines` / `glyphs` 或在数据源上挂载 VOSR `glyphs_json` 以启用 `GlyphLoss`；
   - `MixedSRDataset` + `DistributedWeightedInfiniteSampler` 严格按 `ratio` 跨数据源采样并支持 O(1) 断点续训；
   - `RealESRGANDegrader` 在 GPU FP32 下仅对 `gt_only` 子集执行二阶模糊/缩放/噪声/DiffJPEG/Sinc 退化，与真实 `paired` 样本在同 Batch 平滑混合。
 - **验证集内聚于 `metric` 配置组**：每个验证套件在 `configs/metric/` 中独立绑定数据集与所需指标，并将 JSON 附加字段（如 OCR-A 的 `label`）完整透传到 `BaseMetric.compute(pred, target, meta)`；内置 BasicSR/MATLAB BT.601 对齐的 `PSNRMetric`、`SSIMMetric` 与 `LPIPSMetric`。
@@ -36,10 +36,23 @@ pip install -e ".[trackers]"
     {"gt": "DIV2K_train_HR/0002.png"}
   ]
   ```
-- **训练 `paired`（含 `lq` 字段，自动跳过退化）**：
+- **训练 `paired`（含 `lq` 字段，自动跳过退化；可选 `text_lines` / `glyphs` 用于 `GlyphLoss`）**：
   ```json
   [
-    {"gt": "hr/0001.png", "lq": "lr_x4/0001.png"},
+    {
+      "gt": "hr/0001.png",
+      "lq": "lr_x4/0001.png",
+      "text_lines": [
+        {
+          "transcript": "中文",
+          "bbox": [12, 16, 75, 48],
+          "glyphs": [
+            {"char": "中", "bbox": [13, 16, 41, 47]},
+            {"char": "文", "bbox": [46, 17, 75, 48]}
+          ]
+        }
+      ]
+    },
     {"gt": "hr/0002.png", "lq": "lr_x4/0002.png"}
   ]
   ```

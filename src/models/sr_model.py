@@ -197,7 +197,8 @@ class SRModel(BaseModel):
         arch_cfg = _validate_target_mapping(
             OmegaConf.select(self.cfg, "arch", default=None), "cfg.arch"
         )
-        raw_net_g = hydra.utils.instantiate(arch_cfg)
+        with accelerator.main_process_first():
+            raw_net_g = hydra.utils.instantiate(arch_cfg)
         if not isinstance(raw_net_g, nn.Module):
             raise TypeError(f"Instantiated cfg.arch must be an nn.Module, got {type(raw_net_g).__name__}.")
 
@@ -395,7 +396,10 @@ class SRModel(BaseModel):
                     total_loss: torch.Tensor | None = None
                     step_raw_losses: dict[str, float] = {}
                     for name, (weight, criterion) in self.losses.items():
-                        raw_loss = criterion(pred, gt)
+                        if getattr(criterion, "needs_batch", False):
+                            raw_loss = criterion(pred, gt, batch=batch)
+                        else:
+                            raw_loss = criterion(pred, gt)
                         if not isinstance(raw_loss, torch.Tensor):
                             raise TypeError(
                                 f"Loss {name!r} must return a torch.Tensor, got {type(raw_loss).__name__}."

@@ -1,0 +1,32 @@
+l1:
+  weight: 1.0
+  criterion:
+    _target_: losses.L1Loss
+    reduction: mean
+lpips:
+  weight: 0.02
+  criterion:
+    _target_: losses.LPIPSLoss
+    net: vgg
+    pretrained: true
+ocr_kl:
+  weight: 0.0005
+  criterion:
+    _target_: losses.OCRKLLoss
+    checkpoint: PaddlePaddle/PP-OCRv5_server_rec_safetensors
+    strip_height: 64
+    strip_stride: 32
+    temperature: 1.0
+    pretrained: true
+    input_range: "0_1"
+glyph:
+  weight: 1.0
+  criterion:
+    _target_: losses.GlyphLoss
+    model_dir: null
+    repo_id: ATH-MaaS/TextVerifier-CJK-CLIP
+    revision: adc233a117cbb039842b245b5acf84e0143a5f11
+    batch_size: 8
+    pretrained: true
+    input_range: "0_1"
+    sync_ddp_counts: true

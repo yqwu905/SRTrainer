@@ -414,9 +414,11 @@ def test_t2_a09_static_audit_all_configs_yaml_contracts(configs_dir: Path) -> No
             assert "mode" not in all_keys, f"Legacy 'mode' key forbidden in {data_yaml}"
 
     arch_files = {p.name for p in (configs_dir / "arch").glob("*.yaml")}
-    assert arch_files == {"toy_x4.yaml"}, f"Unexpected arch configs: {sorted(arch_files)}"
+    assert arch_files == {"toy_x4.yaml", "vosr2_x4.yaml"}, (
+        f"Unexpected arch configs: {sorted(arch_files)}"
+    )
 
     loss_files = {p.name for p in (configs_dir / "loss").glob("*.yaml")}
-    assert loss_files == {"l1.yaml", "l1_lpips.yaml"}, (
+    assert loss_files == {"glyph.yaml", "l1.yaml", "l1_lpips.yaml", "ocr_kl.yaml", "vosr2_text.yaml"}, (
         f"Unexpected loss configs: {sorted(loss_files)}"
     )

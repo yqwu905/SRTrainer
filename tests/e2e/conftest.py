@@ -60,8 +60,9 @@ CPU_MIXED_PRECISION: str = "no"
 CPU_TOTAL_ITERS: int = 4
 CPU_LPIPS_PRETRAINED: bool = False
 
-# Ensure PEP 420 namespace package ``tests.e2e.custom_metrics`` is importable
-# in-process by Hydra ``_target_`` without creating ``tests/__init__.py``.
+# Ensure regular package ``tests`` (via ``tests/__init__.py``) resolves to this
+# repository ahead of any third-party ``tests`` package in ``site-packages`` so
+# Hydra ``_target_`` imports such as ``tests.e2e.custom_metrics`` stay isolated.
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 

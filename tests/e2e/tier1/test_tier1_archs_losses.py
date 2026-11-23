@@ -66,20 +66,21 @@ def test_t1_archs_and_losses_export_exclusivity() -> None:
     import losses as losses_pkg
 
     assert hasattr(archs_pkg, "__all__")
-    assert set(archs_pkg.__all__) == {"ToyModel"}, (
-        f"Expected ONLY ToyModel in archs.__all__, got {archs_pkg.__all__!r}"
+    assert set(archs_pkg.__all__) == {"ToyModel", "VOSR2OneStep"}, (
+        f"Unexpected archs.__all__: {archs_pkg.__all__!r}"
     )
-    assert hydra.utils.get_class("archs.ToyModel") is archs_pkg.ToyModel
+    for sym in ("ToyModel", "VOSR2OneStep"):
+        assert hydra.utils.get_class(f"archs.{sym}") is getattr(archs_pkg, sym)
     for forbidden_arch in ("RRDBNet", "SwinIR", "TinySRNet"):
         assert not hasattr(archs_pkg, forbidden_arch), (
             f"Forbidden architecture {forbidden_arch!r} exposed in archs"
         )
 
     assert hasattr(losses_pkg, "__all__")
-    assert set(losses_pkg.__all__) == {"L1Loss", "LPIPSLoss"}, (
-        f"Expected ONLY L1Loss & LPIPSLoss in losses.__all__, got {losses_pkg.__all__!r}"
+    assert set(losses_pkg.__all__) == {"L1Loss", "LPIPSLoss", "OCRKLLoss", "GlyphLoss"}, (
+        f"Unexpected losses.__all__: {losses_pkg.__all__!r}"
     )
-    for sym in ("L1Loss", "LPIPSLoss"):
+    for sym in ("L1Loss", "LPIPSLoss", "OCRKLLoss", "GlyphLoss"):
         assert hydra.utils.get_class(f"losses.{sym}") is getattr(losses_pkg, sym)
     for forbidden_loss in ("CharbonnierLoss", "FFTLoss"):
         assert not hasattr(losses_pkg, forbidden_loss), (
