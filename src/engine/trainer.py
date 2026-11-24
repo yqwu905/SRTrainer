@@ -204,7 +204,7 @@ def _validate_resume_early(raw_resume: Any) -> None:
     if not explicit.is_dir():
         raise ValueError(
             f"Resume path must be a checkpoint state directory, got file: {explicit} "
-            "(use model.pretrain_path for weight files)."
+            "(use model.pretrain.<arch>.path for weight files)."
         )
 
 
@@ -523,8 +523,8 @@ class Trainer:
 
             # Step 7: Instantiate & setup model, TrainState, Checkpointer, and deterministic registration.
             # NOTE: Never wrap model.setup() in main_process_first() because setup() invokes
-            # collective accelerator.prepare() (DDP sync). Pretrained loss downloads are guarded
-            # inside SRModel.setup() Step 1 before prepare().
+            # collective accelerator.prepare() (DDP sync). Pretrained loss/arch downloads are guarded
+            # inside VOSRModel.setup() Step 1 before prepare().
             model_obj = hydra.utils.instantiate(self.cfg.model, cfg=self.cfg, _recursive_=False)
             if not isinstance(model_obj, BaseModel):
                 raise TypeError(
@@ -969,28 +969,26 @@ class Trainer:
                     higher_is_better=higher_is_better,
                 )
                 if is_new_best:
-                    exported = self.model.export_weights(self.accelerator)
-                    best_sd = (
-                        exported["net_g_ema"]
-                        if (self.val_use_ema and "net_g_ema" in exported)
-                        else exported["net_g"]
-                    )
-                    self.checkpointer.save_best(
+                    best_weights = self.model.export_infer_weights(
                         self.accelerator,
-                        best_sd,
+                        use_ema=self.val_use_ema,
+                    )
+                    saved_best = self.checkpointer.save_best_weights(
+                        self.accelerator,
+                        best_weights,
                         self.primary_dataset,
                         self.primary_metric,
                         step=step,
                         metric_value=current_val,
                     )
                     prev_str = "None" if prev_best is None else f"{prev_best:.4f}"
+                    saved_names = ", ".join(p.name for p in saved_best.values())
                     self.logger.info(
-                        "[Best] Updated %s: %s -> %.4f (saved best_%s_%s.safetensors)",
+                        "[Best] Updated %s: %s -> %.4f (saved %s)",
                         best_key,
                         prev_str,
                         current_val,
-                        self.primary_dataset,
-                        self.primary_metric,
+                        saved_names or f"best_{self.primary_dataset}_{self.primary_metric}.safetensors",
                     )
         finally:
             if was_training:

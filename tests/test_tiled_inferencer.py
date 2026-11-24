@@ -333,14 +333,18 @@ def test_tiled_inferencer_tile_size_modes_and_validation(caplog: pytest.LogCaptu
     assert inf_from_infer.blend_mode == "cosine"
 
     with hydra.initialize_config_dir(config_dir=CONFIGS_DIR, version_base=None):
-        train_cfg = hydra.compose(config_name="train")
+        train_cfg = hydra.compose(
+            config_name="train",
+            overrides=["~experiment", "arch/vae=qwen_vae2d", "arch/dit=vosr2_dit", "loss=l1"],
+        )
     inf_from_train = TiledInferencer.from_config(
         model=model,
         scale=4,
         tile_cfg=train_cfg.trainer.val_tile,
         gt_size=train_cfg.data.gt_size,
     )
-    assert inf_from_train.tile_size == (64, 64)
+    expected_tile = int(train_cfg.data.gt_size) // 4
+    assert inf_from_train.tile_size == (expected_tile, expected_tile)
 
     inf_from_dict = TiledInferencer.from_config(
         model=model,
@@ -775,7 +779,9 @@ def test_infer_mode1_exp_dir_auto_restore_and_weight_priority(tmp_path: Path) ->
     handler = _ListHandler(level=logging.WARNING)
     warn_logger.addHandler(handler)
     try:
-        cfg_with_arch = _compose_infer([f"infer.exp_dir={exp_val_no_ema}", "arch=vosr2"])
+        cfg_with_arch = _compose_infer(
+            [f"infer.exp_dir={exp_val_no_ema}", "arch/vae=qwen_vae2d", "arch/dit=vosr2_dit"]
+        )
         resolved_with_arch = infer_mod.resolve_infer_config(cfg_with_arch, logger=warn_logger)
     finally:
         warn_logger.removeHandler(handler)
@@ -915,7 +921,8 @@ def test_infer_mode2_standalone_safetensors_pth_and_errors(tmp_path: Path) -> No
         infer_mod.run_infer(
             _compose_infer(
                 [
-                    "arch=vosr2",
+                    "arch/vae=qwen_vae2d",
+                    "arch/dit=vosr2_dit",
                     f"infer.input={in_img}",
                     f"infer.output_dir={tmp_path / 'e_no_w'}",
                 ]
@@ -926,8 +933,9 @@ def test_infer_mode2_standalone_safetensors_pth_and_errors(tmp_path: Path) -> No
         infer_mod.run_infer(
             _compose_infer(
                 [
-                    "arch=vosr2",
-                    f"infer.weights_path={tmp_path / 'missing.safetensors'}",
+                    "arch/vae=qwen_vae2d",
+                    "arch/dit=vosr2_dit",
+                    f"++infer.weights_path={{dit:{tmp_path / 'missing.safetensors'}}}",
                     f"infer.input={in_img}",
                     f"infer.output_dir={tmp_path / 'e_missing_w'}",
                 ]
@@ -962,6 +970,215 @@ def test_infer_mode2_standalone_safetensors_pth_and_errors(tmp_path: Path) -> No
                 ]
             )
         )
+
+
+def test_infer_vosr_multi_arch_exp_dir_and_standalone(tmp_path: Path) -> None:
+    """Verify Mode 1 (exp_dir) and Mode 2 (standalone) multi-arch VOSR weight resolution."""
+    from models import VOSRPipeline
+    from tests.dummy_arch import DummyDino, DummyDiT, DummyVAE, get_dummy_vosr_arch_dict
+
+    infer_mod = _load_infer_module()
+    in_img = tmp_path / "vosr_in.png"
+    lq_tensor = _make_rgb_image(in_img, h=16, w=16, rgb=(0.5, 0.5, 0.5))
+
+    def _make_vosr_state_dicts(seed: int) -> tuple[VOSRPipeline, dict[str, dict[str, torch.Tensor]]]:
+        torch.manual_seed(seed)
+        vae = DummyVAE(z_dim=4, spatial_compression_ratio=2).eval()
+        dit = DummyDiT(in_channels=8, out_channels=4, patch_size=2, hidden_ch=8, z_dims=8).eval()
+        dino = DummyDino(embed_dim=8, image_size=16, patch_size=4).eval()
+        pipe = VOSRPipeline(vae=vae, dit=dit, dino=dino, scale=2, eval_seed=42).eval()
+        sds = {
+            "vae": {k: v.detach().cpu().clone() for k, v in vae.state_dict().items()},
+            "dit": {k: v.detach().cpu().clone() for k, v in dit.state_dict().items()},
+            "dino": {k: v.detach().cpu().clone() for k, v in dino.state_dict().items()},
+        }
+        return pipe, sds
+
+    pipe_best, sd_best = _make_vosr_state_dicts(101)
+    pipe_ema, sd_ema = _make_vosr_state_dicts(202)
+    pipe_latest, sd_latest = _make_vosr_state_dicts(303)
+
+    exp_dir = tmp_path / "exp_vosr_multi"
+    weights_dir = exp_dir / "weights"
+    weights_dir.mkdir(parents=True, exist_ok=True)
+    save_resolved_config(
+        OmegaConf.create(
+            {
+                "scale": 2,
+                "arch": get_dummy_vosr_arch_dict(),
+                "model": {
+                    "_target_": "models.VOSRModel",
+                    "scale": 2,
+                    "trainable": {"vae": False, "dit": True, "dino": False},
+                    "noise_input": "gaussian",
+                    "posterior_mode": True,
+                    "eval_seed": 42,
+                },
+                "data": {"gt_size": 32},
+                "metric": {"primary_dataset": "val_text", "primary_metric": "psnr"},
+                "trainer": {"val_use_ema": True},
+            }
+        ),
+        exp_dir / "config_resolved.yaml",
+    )
+    for comp in ("vae", "dit", "dino"):
+        save_safetensors(sd_best[comp], weights_dir / f"best_val_text_psnr_{comp}.safetensors")
+        save_safetensors(sd_latest[comp], weights_dir / f"latest_{comp}.safetensors")
+    save_safetensors(sd_ema["dit"], weights_dir / "latest_dit_ema.safetensors")
+    # Also ensure latest_vae and latest_dino match pipe_ema when testing latest_ema fallback
+    ref_inf_best = TiledInferencer(
+        model=pipe_best, scale=2, tile_size="auto", tile_overlap=4, gt_size=32, mixed_precision="no"
+    )
+    expected_best = ref_inf_best.infer_tensor(lq_tensor)
+
+    # 1. Mode 1 default (use_ema=True): selects consistent best_val_text_psnr_{vae,dit,dino}
+    out_best = tmp_path / "vosr_out_best"
+    sum_best = infer_mod.run_infer(
+        _compose_infer(
+            [
+                f"infer.exp_dir={exp_dir}",
+                f"infer.input={in_img}",
+                f"infer.output_dir={out_best}",
+                "infer.mixed_precision=no",
+                "infer.tile.overlap=4",
+            ]
+        )
+    )
+    assert sum_best.mode == "exp_dir"
+    assert sum_best.weights_path.name == "best_val_text_psnr_dit.safetensors"
+    actual_best = load_image(out_best / "vosr_in.png")
+    assert tuple(actual_best.shape) == (3, 32, 32)
+    assert (actual_best - expected_best).abs().max().item() <= (1.0 / 255.0) + 1e-5
+
+    # 2. Mode 1 use_ema=False (val_use_ema=True): skips best_* & latest_dit_ema, selects latest_{comp}
+    out_no_ema = tmp_path / "vosr_out_no_ema"
+    sum_no_ema = infer_mod.run_infer(
+        _compose_infer(
+            [
+                f"infer.exp_dir={exp_dir}",
+                f"infer.input={in_img}",
+                f"infer.output_dir={out_no_ema}",
+                "infer.use_ema=false",
+                "infer.mixed_precision=no",
+                "infer.tile.overlap=4",
+            ]
+        )
+    )
+    assert sum_no_ema.weights_path.name == "latest_dit.safetensors"
+    ref_inf_latest = TiledInferencer(
+        model=pipe_latest, scale=2, tile_size="auto", tile_overlap=4, gt_size=32, mixed_precision="no"
+    )
+    assert (load_image(out_no_ema / "vosr_in.png") - ref_inf_latest.infer_tensor(lq_tensor)).abs().max().item() <= (1.0 / 255.0) + 1e-5
+
+    # 3. Remove best_* -> Mode 1 use_ema=True picks latest_dit_ema + latest_{vae,dino}
+    for comp in ("vae", "dit", "dino"):
+        (weights_dir / f"best_val_text_psnr_{comp}.safetensors").unlink()
+    out_ema = tmp_path / "vosr_out_ema"
+    sum_ema = infer_mod.run_infer(
+        _compose_infer(
+            [
+                f"infer.exp_dir={exp_dir}",
+                f"infer.input={in_img}",
+                f"infer.output_dir={out_ema}",
+                "infer.use_ema=true",
+                "infer.mixed_precision=no",
+                "infer.tile.overlap=4",
+            ]
+        )
+    )
+    assert sum_ema.weights_path.name == "latest_dit_ema.safetensors"
+    pipe_mixed = VOSRPipeline(
+        vae=DummyVAE(z_dim=4, spatial_compression_ratio=2).eval(),
+        dit=DummyDiT(in_channels=8, out_channels=4, patch_size=2, hidden_ch=8, z_dims=8).eval(),
+        dino=DummyDino(embed_dim=8, image_size=16, patch_size=4).eval(),
+        scale=2,
+        eval_seed=42,
+    ).eval()
+    pipe_mixed.vae.load_state_dict(sd_latest["vae"])
+    pipe_mixed.dit.load_state_dict(sd_ema["dit"])
+    assert pipe_mixed.dino is not None
+    pipe_mixed.dino.load_state_dict(sd_latest["dino"])
+    ref_inf_mixed = TiledInferencer(
+        model=pipe_mixed, scale=2, tile_size="auto", tile_overlap=4, gt_size=32, mixed_precision="no"
+    )
+    assert (load_image(out_ema / "vosr_in.png") - ref_inf_mixed.infer_tensor(lq_tensor)).abs().max().item() <= (1.0 / 255.0) + 1e-5
+
+    # 4. Mode 1 save_frozen_weights=False fallback to model.pretrain.{vae,dino}.path
+    pretrain_dir = tmp_path / "frozen_pretrains"
+    pretrain_dir.mkdir()
+    vae_pt = save_safetensors(sd_best["vae"], pretrain_dir / "vae_base.safetensors")
+    dino_pt = save_safetensors(sd_best["dino"], pretrain_dir / "dino_base.safetensors")
+    exp_frozen_fallback = tmp_path / "exp_vosr_frozen_fallback"
+    (exp_frozen_fallback / "weights").mkdir(parents=True)
+    save_safetensors(sd_best["dit"], exp_frozen_fallback / "weights" / "best_val_text_psnr_dit.safetensors")
+    save_resolved_config(
+        OmegaConf.create(
+            {
+                "scale": 2,
+                "arch": get_dummy_vosr_arch_dict(),
+                "model": {
+                    "_target_": "models.VOSRModel",
+                    "scale": 2,
+                    "trainable": {"vae": False, "dit": True, "dino": False},
+                    "save_frozen_weights": False,
+                    "pretrain": {
+                        "vae": {"path": str(vae_pt), "strict": True, "key": None},
+                        "dit": {"path": None, "strict": True, "key": None},
+                        "dino": {"path": str(dino_pt), "strict": True, "key": None},
+                    },
+                    "eval_seed": 42,
+                },
+                "data": {"gt_size": 32},
+                "metric": {"primary_dataset": "val_text", "primary_metric": "psnr"},
+                "trainer": {"val_use_ema": True},
+            }
+        ),
+        exp_frozen_fallback / "config_resolved.yaml",
+    )
+    out_fb = tmp_path / "vosr_out_fb"
+    infer_mod.run_infer(
+        _compose_infer(
+            [
+                f"infer.exp_dir={exp_frozen_fallback}",
+                f"infer.input={in_img}",
+                f"infer.output_dir={out_fb}",
+                "infer.mixed_precision=no",
+                "infer.tile.overlap=4",
+            ]
+        )
+    )
+    assert (load_image(out_fb / "vosr_in.png") - expected_best).abs().max().item() <= (1.0 / 255.0) + 1e-5
+
+    # 5. Mode 2 standalone multi-arch VOSR without DINO (dino=null)
+    torch.manual_seed(404)
+    vae_nd = DummyVAE(z_dim=4, spatial_compression_ratio=2).eval()
+    dit_nd = DummyDiT(in_channels=8, out_channels=4, patch_size=2, hidden_ch=8, z_dims=None).eval()
+    vae_nd_path = save_safetensors(vae_nd.state_dict(), tmp_path / "standalone_vae.safetensors")
+    dit_nd_path = save_safetensors(dit_nd.state_dict(), tmp_path / "standalone_dit.safetensors")
+    pipe_nd = VOSRPipeline(vae=vae_nd, dit=dit_nd, dino=None, scale=2, eval_seed=42).eval()
+    ref_nd = TiledInferencer(
+        model=pipe_nd, scale=2, tile_enabled=False, pad_multiple=4, mixed_precision="no"
+    ).infer_tensor(lq_tensor)
+
+    out_standalone = tmp_path / "vosr_out_standalone"
+    cfg_standalone = _compose_infer(
+        [
+            "scale=2",
+            "++arch={vae:{_target_:tests.dummy_arch.DummyVAE,z_dim:4,spatial_compression_ratio:2},"
+            "dit:{_target_:tests.dummy_arch.DummyDiT,in_channels:8,out_channels:4,patch_size:2,hidden_ch:8,z_dims:null},"
+            "dino:null}",
+            f"++infer.weights_path={{vae:{vae_nd_path},dit:{dit_nd_path}}}",
+            f"infer.input={in_img}",
+            f"infer.output_dir={out_standalone}",
+            "infer.mixed_precision=no",
+            "infer.tile.enabled=false",
+            "infer.tile.pad_multiple=4",
+        ]
+    )
+    sum_nd = infer_mod.run_infer(cfg_standalone)
+    assert sum_nd.mode == "standalone"
+    assert sum_nd.weights_path == dit_nd_path
+    assert (load_image(out_standalone / "vosr_in.png") - ref_nd).abs().max().item() <= (1.0 / 255.0) + 1e-5
 
 
 def test_infer_input_output_modes_single_dir_recursive_and_json(tmp_path: Path) -> None:
@@ -1189,12 +1406,22 @@ def test_infer_input_output_modes_single_dir_recursive_and_json(tmp_path: Path) 
 # ---------------------------------------------------------------------------
 
 
+def _free_port() -> int:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 def _run_subprocess(cmd: list[str], cwd: str = "/tmp") -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["ACCELERATE_USE_CPU"] = "true"
     env["OMP_NUM_THREADS"] = "1"
+    if sys.platform == "darwin" and "GLOO_SOCKET_IFNAME" not in env:
+        env["GLOO_SOCKET_IFNAME"] = "lo0"
     existing_pp = env.get("PYTHONPATH", "")
-    extra_pp = f"{REPO_ROOT}:{REPO_ROOT / 'src'}"
+    extra_pp = f"{REPO_ROOT / 'src'}:{REPO_ROOT}"
     env["PYTHONPATH"] = f"{extra_pp}:{existing_pp}" if existing_pp else extra_pp
     return subprocess.run(
         cmd,
@@ -1227,9 +1454,12 @@ def test_infer_cli_distributed_2proc_cpu_5_images_from_tmp(tmp_path: Path) -> No
 
     out_dir = tmp_path / "dist_out_5"
     cmd = [
-        "torchrun",
-        "--standalone",
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
         "--nproc_per_node=2",
+        "--master_addr=127.0.0.1",
+        f"--master_port={_free_port()}",
         str(INFER_SCRIPT),
         f"infer.exp_dir={exp_dir}",
         f"infer.input={in_dir}",
@@ -1282,9 +1512,12 @@ def test_infer_cli_distributed_2proc_cpu_single_image_lt_world_size(tmp_path: Pa
 
     # Uses default mixed_precision=bf16 on CPU across 2 ranks with only 1 image
     cmd = [
-        "torchrun",
-        "--standalone",
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
         "--nproc_per_node=2",
+        "--master_addr=127.0.0.1",
+        f"--master_port={_free_port()}",
         str(INFER_SCRIPT),
         f"infer.exp_dir={exp_dir}",
         f"infer.input={in_img}",

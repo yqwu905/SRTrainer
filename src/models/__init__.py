@@ -4,6 +4,6 @@ from __future__ import annotations
 
 from .base_model import BaseModel
 from .ema import ModelEMA
-from .sr_model import SRModel
+from .vosr_model import VOSRModel, VOSRPipeline
 
-__all__ = ["BaseModel", "SRModel", "ModelEMA"]
+__all__ = ["BaseModel", "VOSRModel", "VOSRPipeline", "ModelEMA"]

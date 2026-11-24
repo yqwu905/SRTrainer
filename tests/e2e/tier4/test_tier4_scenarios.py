@@ -195,7 +195,9 @@ def test_t4_scenario1_mixed_blind_paired_train_to_auto_restore_infer(
     assert resolved_cfg.data.gt_size == 64
     assert resolved_cfg.loss.lpips.weight == pytest.approx(0.05)
     assert resolved_cfg.optim.optimizer.lr == pytest.approx(1.0e-4)
-    assert resolved_cfg.arch._target_ == "tests.dummy_arch.DummySRNet"
+    assert resolved_cfg.arch.vae._target_ == "tests.dummy_arch.DummyVAE"
+    assert resolved_cfg.arch.dit._target_ == "tests.dummy_arch.DummyDiT"
+    assert resolved_cfg.arch.dino._target_ == "tests.dummy_arch.DummyDino"
 
     log_text = (exp_dir / "train.log").read_text(encoding="utf-8")
     assert _CANONICAL_ITER_LOG_RE.search(log_text), (
@@ -206,11 +208,17 @@ def test_t4_scenario1_mixed_blind_paired_train_to_auto_restore_infer(
 
     assert (exp_dir / "checkpoints" / "state_iter_000002").is_dir()
     for wname in (
-        "iter_000002.safetensors",
-        "iter_000002_ema.safetensors",
-        "latest.safetensors",
-        "latest_ema.safetensors",
-        "best_set5_psnr.safetensors",
+        "iter_000002_vae.safetensors",
+        "iter_000002_dit.safetensors",
+        "iter_000002_dit_ema.safetensors",
+        "iter_000002_dino.safetensors",
+        "latest_vae.safetensors",
+        "latest_dit.safetensors",
+        "latest_dit_ema.safetensors",
+        "latest_dino.safetensors",
+        "best_set5_psnr_vae.safetensors",
+        "best_set5_psnr_dit.safetensors",
+        "best_set5_psnr_dino.safetensors",
     ):
         assert (exp_dir / "weights" / wname).is_file(), f"Missing weight artifact {wname}"
 
@@ -246,8 +254,15 @@ def test_t4_scenario1_mixed_blind_paired_train_to_auto_restore_infer(
     assert torch.isfinite(sr_cli).all()
     assert float(sr_cli.min()) >= 0.0 and float(sr_cli.max()) <= 1.0
 
-    net_ref = hydra.utils.instantiate(resolved_cfg.arch)
-    load_weights(net_ref, exp_dir / "weights" / "best_set5_psnr.safetensors", strict=True)
+    from models import VOSRPipeline
+
+    ref_vae = hydra.utils.instantiate(resolved_cfg.arch.vae)
+    ref_dit = hydra.utils.instantiate(resolved_cfg.arch.dit)
+    ref_dino = hydra.utils.instantiate(resolved_cfg.arch.dino)
+    load_weights(ref_vae, exp_dir / "weights" / "best_set5_psnr_vae.safetensors", strict=True)
+    load_weights(ref_dit, exp_dir / "weights" / "best_set5_psnr_dit.safetensors", strict=True)
+    load_weights(ref_dino, exp_dir / "weights" / "best_set5_psnr_dino.safetensors", strict=True)
+    net_ref = VOSRPipeline(vae=ref_vae, dit=ref_dit, dino=ref_dino, scale=4, eval_seed=42)
     inf_ref = TiledInferencer(
         model=net_ref,
         scale=4,
@@ -349,7 +364,13 @@ def test_t4_scenario2_preempted_run_resume_auto_consistency(
     lr_b = _extract_lr_from_line(_extract_iter_lines(log_b, 4, 4)[-1])
     assert lr_b == pytest.approx(lr_a, rel=1e-4)
 
-    for wname in ("latest.safetensors", "latest_ema.safetensors", "best_set5_psnr.safetensors"):
+    for wname in (
+        "latest_vae.safetensors",
+        "latest_dit.safetensors",
+        "latest_dit_ema.safetensors",
+        "latest_dino.safetensors",
+        "best_set5_psnr_dit.safetensors",
+    ):
         sd_a = load_file(str(dir_a / "weights" / wname))
         sd_b = load_file(str(dir_b / "weights" / wname))
         assert set(sd_b.keys()) == set(sd_a.keys())
@@ -358,21 +379,21 @@ def test_t4_scenario2_preempted_run_resume_auto_consistency(
                 f"Weight mismatch in {wname} key {k!r} between baseline and resumed run"
             )
 
-    # Non-vacuity: steps 3-4 genuinely updated weights beyond step 2
-    sd_b2 = load_file(str(dir_b / "weights" / "iter_000002.safetensors"))
-    sd_b4 = load_file(str(dir_b / "weights" / "iter_000004.safetensors"))
+    # Non-vacuity: steps 3-4 genuinely updated DiT weights beyond step 2
+    sd_b2 = load_file(str(dir_b / "weights" / "iter_000002_dit.safetensors"))
+    sd_b4 = load_file(str(dir_b / "weights" / "iter_000004_dit.safetensors"))
     assert any(not torch.equal(sd_b2[k], sd_b4[k]) for k in sd_b2)
 
-    snap_latest = load_file(str(dir_b / "weights" / "latest.safetensors"))
-    snap_ema = load_file(str(dir_b / "weights" / "latest_ema.safetensors"))
+    snap_latest = load_file(str(dir_b / "weights" / "latest_dit.safetensors"))
+    snap_ema = load_file(str(dir_b / "weights" / "latest_dit_ema.safetensors"))
 
     # 4. Run B Part 3: Idempotent re-launch at total_iters=4
     _run("s2_preempted", total_iters=4, resume_auto=True)
     log_b_after = (dir_b / "train.log").read_text(encoding="utf-8")
     assert not re.search(r"\[Iter\s+0*5/", log_b_after)
 
-    after_latest = load_file(str(dir_b / "weights" / "latest.safetensors"))
-    after_ema = load_file(str(dir_b / "weights" / "latest_ema.safetensors"))
+    after_latest = load_file(str(dir_b / "weights" / "latest_dit.safetensors"))
+    after_ema = load_file(str(dir_b / "weights" / "latest_dit_ema.safetensors"))
     assert all(torch.equal(after_latest[k], snap_latest[k]) for k in snap_latest)
     assert all(torch.equal(after_ema[k], snap_ema[k]) for k in snap_ema)
 
@@ -497,11 +518,11 @@ def test_t4_scenario3_text_sr_custom_meta_ocr_and_gtless_suites(
                 )
 
     # 4. higher_is_better=False best-selection proof: step 2 (0.2) beats step 1 (0.8) & step 3 (0.6)
-    best_path = work_dir / "weights" / "best_real_nogt_err_score.safetensors"
+    best_path = work_dir / "weights" / "best_real_nogt_err_score_dit.safetensors"
     assert best_path.is_file()
     sd_best = load_file(str(best_path))
-    sd_iter2 = load_file(str(work_dir / "weights" / "iter_000002_ema.safetensors"))
-    sd_iter3 = load_file(str(work_dir / "weights" / "iter_000003_ema.safetensors"))
+    sd_iter2 = load_file(str(work_dir / "weights" / "iter_000002_dit_ema.safetensors"))
+    sd_iter3 = load_file(str(work_dir / "weights" / "iter_000003_dit_ema.safetensors"))
 
     assert any(not torch.allclose(sd_iter2[k], sd_iter3[k], atol=1e-6) for k in sd_iter2)
     assert all(torch.allclose(sd_best[k], sd_iter2[k], atol=1e-6) for k in sd_best)
@@ -714,11 +735,17 @@ def test_t4_scenario5_distributed_2proc_train_val_and_offline_infer(
     assert (work_dir / "train.log").is_file()
     assert (work_dir / "checkpoints" / "state_iter_000004").is_dir()
     for wname in (
-        "iter_000004.safetensors",
-        "iter_000004_ema.safetensors",
-        "latest.safetensors",
-        "latest_ema.safetensors",
-        "best_odd5_psnr.safetensors",
+        "iter_000004_vae.safetensors",
+        "iter_000004_dit.safetensors",
+        "iter_000004_dit_ema.safetensors",
+        "iter_000004_dino.safetensors",
+        "latest_vae.safetensors",
+        "latest_dit.safetensors",
+        "latest_dit_ema.safetensors",
+        "latest_dino.safetensors",
+        "best_odd5_psnr_vae.safetensors",
+        "best_odd5_psnr_dit.safetensors",
+        "best_odd5_psnr_dino.safetensors",
     ):
         assert (work_dir / "weights" / wname).is_file(), f"Missing weight artifact {wname}"
 
@@ -807,7 +834,7 @@ def test_t4_scenario6_two_stage_l1_to_l1_lpips_finetune_trackers_and_infer(
 
     import archs as archs_pkg
     import losses as losses_pkg
-    from models import SRModel
+    from models import VOSRModel
     from utils.config import load_resolved_config
     from utils.image import load_image
 
@@ -851,11 +878,11 @@ def test_t4_scenario6_two_stage_l1_to_l1_lpips_finetune_trackers_and_infer(
         log_with=None,
     )
     train_cli_runner(ovs_s1, check=True)
-    stage1_ema = stage1_dir / "weights" / "latest_ema.safetensors"
-    assert stage1_ema.is_file()
-    stage1_ema_sd = load_file(str(stage1_ema))
+    stage1_dit_ema = stage1_dir / "weights" / "latest_dit_ema.safetensors"
+    assert stage1_dit_ema.is_file()
+    stage1_ema_sd = load_file(str(stage1_dit_ema))
 
-    # Stage 2: Fine-tuning from pretrain_path + l1_lpips + USMSharp + TrainingPool(4) + TensorBoard
+    # Stage 2: Fine-tuning from model.pretrain.dit + l1_lpips + USMSharp + TrainingPool(4) + TensorBoard
     s2_gt = gt_only_train_source_factory(name="s6_s2_gt", n_samples=4, gt_h=80, gt_w=80, ratio=0.5)
     s2_pair = paired_train_source_factory(
         name="s6_s2_pair", n_samples=4, lq_h=40, lq_w=40, scale=2, ratio=0.5
@@ -885,9 +912,9 @@ def test_t4_scenario6_two_stage_l1_to_l1_lpips_finetune_trackers_and_infer(
             "data.degradation.queue_size=4",
             "data.degradation.kernel_cfg.kernel_size=7",
             "data.degradation.kernel_cfg.kernel_range=[7]",
-            f"model.pretrain_path={fmt(str(stage1_ema))}",
-            "model.pretrain_strict=true",
-            "model.pretrain_key=null",
+            f"model.pretrain.dit.path={fmt(str(stage1_dit_ema))}",
+            "model.pretrain.dit.strict=true",
+            "model.pretrain.dit.key=null",
             "trainer.resume=null",
         ],
     )
@@ -900,13 +927,13 @@ def test_t4_scenario6_two_stage_l1_to_l1_lpips_finetune_trackers_and_infer(
         assert token in s2_log, f"Missing {token!r} in stage2 train.log:\n{s2_log}"
     assert not re.search(r"\bnan\b", s2_log.lower())
 
-    # 2. Pretrained weights cloned into BOTH net_g and EMA prior to step 0
+    # 2. Pretrained weights cloned into BOTH live DiT and DiT EMA prior to step 0
     s2_resolved = load_resolved_config(stage2_dir / "config_resolved.yaml")
     accelerate_state_resetter()
-    probe_model = SRModel(s2_resolved)
+    probe_model = VOSRModel(s2_resolved)
     probe_model.setup(Accelerator(cpu=True, mixed_precision="no"))
-    probe_main_sd = probe_model.get_infer_network(use_ema=False).state_dict()
-    probe_ema_sd = probe_model.get_infer_network(use_ema=True).state_dict()
+    probe_main_sd = probe_model.get_infer_network(use_ema=False).dit.state_dict()
+    probe_ema_sd = probe_model.get_infer_network(use_ema=True).dit.state_dict()
     for k, ref_tensor in stage1_ema_sd.items():
         assert torch.allclose(probe_main_sd[k].detach().cpu(), ref_tensor, atol=1e-6)
         assert torch.allclose(probe_ema_sd[k].detach().cpu(), ref_tensor, atol=1e-6)
@@ -970,9 +997,11 @@ def test_t4_scenario6_two_stage_l1_to_l1_lpips_finetune_trackers_and_infer(
         if isinstance(parsed, dict) and isinstance(parsed.get("sources"), list):
             assert all("mode" not in s for s in parsed["sources"] if isinstance(s, dict))
 
-    # Req #4 & #5: Zero SRPredictor/ToyModel across src/tools/configs & strict VOSR2OneStep scope
+    # Req #4 & #5: Zero SRPredictor/VOSR2OneStep/SRModel/ToyModel across src/tools/configs
     forbidden_tokens = (
         "SRPredictor",
+        "VOSR2OneStep",
+        "models.SRModel",
         "ToyModel",
         "RRDBNet",
         "SwinIR",
@@ -1001,5 +1030,5 @@ def test_t4_scenario6_two_stage_l1_to_l1_lpips_finetune_trackers_and_infer(
                             f"Forbidden token {forbidden!r} found in {path}: {token_str!r}"
                         )
 
-    assert set(archs_pkg.__all__) == {"VOSR2OneStep"}
+    assert set(archs_pkg.__all__) == {"AutoencoderKLQwenImage2D", "VOSR2DiT", "DINOv2Encoder"}
     assert set(losses_pkg.__all__) == {"L1Loss", "LPIPSLoss", "OCRKLLoss", "GlyphLoss"}

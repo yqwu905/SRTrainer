@@ -7,13 +7,16 @@ defaults:
 exp_name: vosr2_onestep_text_local
 
 arch:
-  vae_path: /home/w00906749/02_TextSR/VOSR2/preset/ckpts/Qwen-Image-vae-2d/
-  vae_subfolder: null
-  # 必须指向 hub 仓库根目录（含 hubconf.py），不能指到 dinov2/ 包目录
-  dino_local_repo: /home/w00906749/02_TextSR/VOSR2/preset/ckpts/torch_cache/facebookresearch_dinov2_main
-  dino_checkpoint: /home/w00906749/02_TextSR/VOSR2/preset/ckpts/torch_cache/checkpoints/dinov2_vitl14_pretrain.pth
-  dino_cache_dir: /home/w00906749/02_TextSR/VOSR2/preset/ckpts/torch_cache/
-  dit_checkpoint: /home/w00906749/02_TextSR/VOSR2/preset/ckpts/VOSR2/checkpoints/ema_model.safetensors
+  vae:
+    pretrained_path: /home/w00906749/02_TextSR/VOSR2/preset/ckpts/Qwen-Image-vae-2d/
+    subfolder: null
+  dino:
+    # 必须指向 hub 仓库根目录（含 hubconf.py），不能指到 dinov2/ 包目录
+    local_repo: /home/w00906749/02_TextSR/VOSR2/preset/ckpts/torch_cache/facebookresearch_dinov2_main
+    pretrained_path: /home/w00906749/02_TextSR/VOSR2/preset/ckpts/torch_cache/checkpoints/dinov2_vitl14_pretrain.pth
+    cache_dir: /home/w00906749/02_TextSR/VOSR2/preset/ckpts/torch_cache/
+  dit:
+    pretrained_path: /home/w00906749/02_TextSR/VOSR2/preset/ckpts/VOSR2/checkpoints/ema_model.safetensors
 
 trainer:
   total_iters: 1000

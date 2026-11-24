@@ -1,7 +1,7 @@
 # Inference settings for tools/infer.py backed by shared TiledInferencer
-exp_dir: null                  # Non-null: auto-restore config_resolved.yaml & weights from exp_dir
-weights_path: null             # Optional weight override (required in standalone mode when exp_dir is null)
-weights_key: null              # Optional nested dict key for external .pth checkpoints (e.g., params_ema)
+exp_dir: null                  # Non-null: auto-restore config_resolved.yaml & per-arch weights from exp_dir
+weights_path: null             # Per-component mapping {vae: ..., dit: ..., dino: ...} (or single file for single-arch)
+weights_key: null              # Optional nested dict key for external .pth checkpoints (str or per-component mapping)
 use_ema: true                  # Prefer EMA weights when weights_path is null
 
 input: null                    # Single image path | directory | JSON manifest (lq or fallback gt)

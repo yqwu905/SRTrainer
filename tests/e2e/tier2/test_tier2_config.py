@@ -113,6 +113,7 @@ def test_t2_a03_resolve_work_dir_timestamp_toggle(
     cfg_bare = hydra_compose(
         "train",
         overrides=[
+            "experiment=vosr2_onestep_text",
             f"output_root={hydra_value_formatter(str(work_root))}",
             "exp_name=ts_exp",
             "++trainer.append_timestamp=false",
@@ -125,6 +126,7 @@ def test_t2_a03_resolve_work_dir_timestamp_toggle(
     cfg_ts = hydra_compose(
         "train",
         overrides=[
+            "experiment=vosr2_onestep_text",
             f"output_root={hydra_value_formatter(str(work_root))}",
             "exp_name=ts_exp",
             "++trainer.append_timestamp=true",
@@ -152,6 +154,7 @@ def test_t2_a04_load_resolved_config_missing_and_edge_roundtrip(
     cfg = hydra_compose(
         "train",
         overrides=[
+            "experiment=vosr2_onestep_text",
             f"output_root={hydra_value_formatter(str(e2e_workdir['work']))}",
             "exp_name=rt_edge",
             "trainer.mixed_precision='no'",
@@ -242,9 +245,11 @@ def test_t2_a06_hydra_composition_invalid_overrides_fail_fast(
         ["experiment=nonexistent_exp_xyz"],
         ["experiment=base_sr_x4"],
         ["experiment=exp01_toy_mixed_x4"],
+        ["arch=vosr2"],
         ["arch=toy_x4"],
         ["arch=rrdbnet_x4"],
         ["arch=swinir_x4"],
+        ["model=sr"],
         ["loss=charbonnier"],
         ["nonexistent_group=foo"],
     ]
@@ -259,13 +264,20 @@ def test_t2_a07_hydra_cli_edge_overrides_and_partial_loss_override(
     """F05, F10, F12, F16: Edge CLI overrides for trackers, mixed_precision, and partial loss weight."""
     from utils.config import normalize_mixed_precision
 
-    cfg_null_log = hydra_compose("train", overrides=["trainer.log_with=null"])
+    cfg_null_log = hydra_compose(
+        "train", overrides=["experiment=vosr2_onestep_text", "trainer.log_with=null"]
+    )
     assert cfg_null_log.trainer.log_with is None
 
-    cfg_multi_log = hydra_compose("train", overrides=["trainer.log_with=[tensorboard,wandb]"])
+    cfg_multi_log = hydra_compose(
+        "train",
+        overrides=["experiment=vosr2_onestep_text", "trainer.log_with=[tensorboard,wandb]"],
+    )
     assert list(cfg_multi_log.trainer.log_with) == ["tensorboard", "wandb"]
 
-    cfg_mp_no = hydra_compose("train", overrides=["trainer.mixed_precision=no"])
+    cfg_mp_no = hydra_compose(
+        "train", overrides=["experiment=vosr2_onestep_text", "trainer.mixed_precision=no"]
+    )
     assert normalize_mixed_precision(cfg_mp_no.trainer.mixed_precision) == "no"
 
     cfg_zero_lpips = hydra_compose(
@@ -417,10 +429,15 @@ def test_t2_a09_static_audit_all_configs_yaml_contracts(configs_dir: Path) -> No
         if "degradation" not in data_yaml.relative_to(data_dir).parts:
             assert "mode" not in all_keys, f"Legacy 'mode' key forbidden in {data_yaml}"
 
-    arch_files = {p.name for p in (configs_dir / "arch").glob("*.yaml")}
-    assert arch_files == {"vosr2.yaml"}, (
-        f"Unexpected arch configs: {sorted(arch_files)}"
-    )
+    arch_files = {
+        p.relative_to(configs_dir / "arch").as_posix()
+        for p in (configs_dir / "arch").rglob("*.yaml")
+    }
+    assert arch_files == {
+        "vae/qwen_vae2d.yaml",
+        "dit/vosr2_dit.yaml",
+        "dino/dinov2_vitl14.yaml",
+    }, f"Unexpected arch configs: {sorted(arch_files)}"
 
     loss_files = {p.name for p in (configs_dir / "loss").glob("*.yaml")}
     assert loss_files == {"glyph.yaml", "l1.yaml", "l1_lpips.yaml", "ocr_kl.yaml", "vosr2_text.yaml"}, (

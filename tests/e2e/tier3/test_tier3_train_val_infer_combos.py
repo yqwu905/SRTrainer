@@ -90,11 +90,13 @@ def test_t3_trainer_validation_and_tools_infer_tiled_output_parity(
     cfg.trainer.val_tile.blend_mode = "cosine"
     Trainer(cfg).fit()
 
-    best_st = work_dir / "weights" / "best_set5_psnr.safetensors"
-    latest_ema_st = work_dir / "weights" / "latest_ema.safetensors"
-    assert best_st.is_file() and latest_ema_st.is_file()
-    sd_best = load_file(str(best_st))
-    sd_ema = load_file(str(latest_ema_st))
+    best_vae = work_dir / "weights" / "best_set5_psnr_vae.safetensors"
+    best_dit = work_dir / "weights" / "best_set5_psnr_dit.safetensors"
+    best_dino = work_dir / "weights" / "best_set5_psnr_dino.safetensors"
+    latest_dit_ema = work_dir / "weights" / "latest_dit_ema.safetensors"
+    assert best_vae.is_file() and best_dit.is_file() and best_dino.is_file() and latest_dit_ema.is_file()
+    sd_best = load_file(str(best_dit))
+    sd_ema = load_file(str(latest_dit_ema))
     assert set(sd_best.keys()) == set(sd_ema.keys())
     assert all(torch.equal(sd_best[k], sd_ema[k]) for k in sd_best)
 
@@ -121,9 +123,16 @@ def test_t3_trainer_validation_and_tools_infer_tiled_output_parity(
         check=True,
     )
 
+    from models import VOSRPipeline
+
     resolved = load_resolved_config(work_dir / "config_resolved.yaml")
-    net = hydra.utils.instantiate(resolved.arch)
-    load_weights(net, best_st, strict=True)
+    ref_vae = hydra.utils.instantiate(resolved.arch.vae)
+    ref_dit = hydra.utils.instantiate(resolved.arch.dit)
+    ref_dino = hydra.utils.instantiate(resolved.arch.dino)
+    load_weights(ref_vae, best_vae, strict=True)
+    load_weights(ref_dit, best_dit, strict=True)
+    load_weights(ref_dino, best_dino, strict=True)
+    net = VOSRPipeline(vae=ref_vae, dit=ref_dit, dino=ref_dino, scale=2, eval_seed=42)
     inferencer = TiledInferencer(
         model=net,
         scale=2,
@@ -219,7 +228,8 @@ def test_t3_multi_suite_gt_and_gtless_custom_meta_metrics_and_visuals(
     )
     Trainer(cfg).fit()
 
-    assert (work_dir / "weights" / "best_gt_suite_psnr.safetensors").is_file()
+    for comp in ("vae", "dit", "dino"):
+        assert (work_dir / "weights" / f"best_gt_suite_psnr_{comp}.safetensors").is_file()
 
     log_text = (work_dir / "train.log").read_text(encoding="utf-8")
     log_lower = log_text.lower()
@@ -264,19 +274,28 @@ def test_t3_2proc_distributed_validation_odd_suite_exact_gather_parity(
     import torch
     from omegaconf import OmegaConf
     from safetensors.torch import load_file
-    from tests.dummy_arch import DummySRNet
+    from tests.dummy_arch import DummyDino, DummyDiT, DummyVAE
 
     from engine.inferencer import TiledInferencer
     from metrics import PSNRMetric
+    from models import VOSRPipeline
     from utils.image import load_image
     from utils.misc import load_weights, save_safetensors
 
     torch.manual_seed(909)
-    frozen_net = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
-    frozen_st = save_safetensors(
-        frozen_net.state_dict(), e2e_workdir["work"] / "frozen_toy.safetensors"
+    frozen_vae = DummyVAE(z_dim=4, spatial_compression_ratio=2)
+    frozen_dit = DummyDiT(in_channels=8, out_channels=4, patch_size=2, hidden_ch=8, z_dims=8)
+    frozen_dino = DummyDino(embed_dim=8, image_size=16, patch_size=4)
+    frozen_vae_st = save_safetensors(
+        frozen_vae.state_dict(), e2e_workdir["work"] / "frozen_vae.safetensors"
     )
-    frozen_sd = load_file(str(frozen_st))
+    frozen_dit_st = save_safetensors(
+        frozen_dit.state_dict(), e2e_workdir["work"] / "frozen_dit.safetensors"
+    )
+    frozen_dino_st = save_safetensors(
+        frozen_dino.state_dict(), e2e_workdir["work"] / "frozen_dino.safetensors"
+    )
+    frozen_dit_sd = load_file(str(frozen_dit_st))
 
     # Build non-vacuous odd 5-image validation suite (5 % 2 == 1) where sample 0 and sample 4
     # have distinctly lower PSNR so any duplicated padding sample shifts the mean by > 0.3 dB.
@@ -311,8 +330,15 @@ def test_t3_2proc_distributed_validation_odd_suite_exact_gather_parity(
     val_json.write_text(json.dumps(entries, indent=2), encoding="utf-8")
 
     # Compute exact analytical oracle in-process with identical TiledInferencer & PSNRMetric.
-    oracle_net = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
-    load_weights(oracle_net, frozen_st, strict=True)
+    oracle_vae = DummyVAE(z_dim=4, spatial_compression_ratio=2)
+    oracle_dit = DummyDiT(in_channels=8, out_channels=4, patch_size=2, hidden_ch=8, z_dims=8)
+    oracle_dino = DummyDino(embed_dim=8, image_size=16, patch_size=4)
+    load_weights(oracle_vae, frozen_vae_st, strict=True)
+    load_weights(oracle_dit, frozen_dit_st, strict=True)
+    load_weights(oracle_dino, frozen_dino_st, strict=True)
+    oracle_net = VOSRPipeline(
+        vae=oracle_vae, dit=oracle_dit, dino=oracle_dino, scale=2, eval_seed=42
+    )
     oracle_inf = TiledInferencer(
         model=oracle_net,
         scale=2,
@@ -379,9 +405,9 @@ def test_t3_2proc_distributed_validation_odd_suite_exact_gather_parity(
             val_max_save_images=10,
             log_with=None,
         )
-        cfg.model.pretrain_path = str(frozen_st)
-        cfg.model.pretrain_strict = True
-        cfg.model.pretrain_key = None
+        cfg.model.pretrain.vae.path = str(frozen_vae_st)
+        cfg.model.pretrain.dit.path = str(frozen_dit_st)
+        cfg.model.pretrain.dino.path = str(frozen_dino_st)
         cfg.optim.optimizer.lr = 0.0
         cfg.optim.optimizer.weight_decay = 0.0
         cfg.optim.scheduler.eta_min = 0.0
@@ -486,9 +512,9 @@ def test_t3_2proc_distributed_validation_odd_suite_exact_gather_parity(
 
     # Confirm lr=0, wd=0 preserved exact frozen weights across both 1-proc and 2-proc runs.
     for run_work in (work_1p, work_2p):
-        run_sd = load_file(str(run_work / "weights" / "latest.safetensors"))
-        assert set(run_sd.keys()) == set(frozen_sd.keys())
-        assert all(torch.equal(run_sd[k], frozen_sd[k]) for k in frozen_sd)
+        run_sd = load_file(str(run_work / "weights" / "latest_dit.safetensors"))
+        assert set(run_sd.keys()) == set(frozen_dit_sd.keys())
+        assert all(torch.equal(run_sd[k], frozen_dit_sd[k]) for k in frozen_dit_sd)
 
     res_1p = json.loads(res_1p_path.read_text(encoding="utf-8"))
     res_2p = json.loads(res_2p_path.read_text(encoding="utf-8"))
@@ -689,7 +715,8 @@ def test_t3_tensorboard_tracker_with_resume_auto_rolling_pruning_and_best(
 
     ckpts_p1 = {p.name for p in (work_dir / "checkpoints").iterdir() if p.is_dir()}
     assert ckpts_p1 == {"state_iter_000001", "state_iter_000002"}
-    assert (work_dir / "weights" / "best_set5_psnr.safetensors").is_file()
+    for comp in ("vae", "dit", "dino"):
+        assert (work_dir / "weights" / f"best_set5_psnr_{comp}.safetensors").is_file()
     log_p1 = (work_dir / "train.log").read_text(encoding="utf-8")
     assert _extract_iter_lines(log_p1, 1, 2) and _extract_iter_lines(log_p1, 2, 2)
     tfevents_p1 = sorted((work_dir / "trackers").rglob("events.out.tfevents.*"))
@@ -726,11 +753,17 @@ def test_t3_tensorboard_tracker_with_resume_auto_rolling_pruning_and_best(
     assert _extract_iter_lines(log_p2, 3, 4) and _extract_iter_lines(log_p2, 4, 4)
 
     for wname in (
-        "best_set5_psnr.safetensors",
-        "latest.safetensors",
-        "latest_ema.safetensors",
-        "iter_000004.safetensors",
-        "iter_000004_ema.safetensors",
+        "best_set5_psnr_vae.safetensors",
+        "best_set5_psnr_dit.safetensors",
+        "best_set5_psnr_dino.safetensors",
+        "latest_vae.safetensors",
+        "latest_dit.safetensors",
+        "latest_dit_ema.safetensors",
+        "latest_dino.safetensors",
+        "iter_000004_vae.safetensors",
+        "iter_000004_dit.safetensors",
+        "iter_000004_dit_ema.safetensors",
+        "iter_000004_dino.safetensors",
     ):
         wpath = work_dir / "weights" / wname
         assert wpath.is_file(), f"Missing weight file {wpath}"

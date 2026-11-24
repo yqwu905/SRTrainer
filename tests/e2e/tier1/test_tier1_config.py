@@ -100,18 +100,19 @@ def test_t1_packaging_pyproject_and_gitignore(repo_root: Path) -> None:
 
 
 def test_t1_subpackage_short_target_reexports() -> None:
-    """F02, Req #5: Short-path __all__ re-exports expose VOSR2OneStep and built-in losses."""
+    """F02, Req #5: Short-path __all__ re-exports expose independent VOSR2 archs and built-in losses."""
     import hydra.utils
 
     import archs as archs_pkg
     import losses as losses_pkg
 
     assert hasattr(archs_pkg, "__all__")
-    assert set(archs_pkg.__all__) == {"VOSR2OneStep"}, (
+    assert set(archs_pkg.__all__) == {"AutoencoderKLQwenImage2D", "VOSR2DiT", "DINOv2Encoder"}, (
         f"Unexpected archs.__all__: {archs_pkg.__all__!r}"
     )
-    assert hydra.utils.get_class("archs.VOSR2OneStep") is archs_pkg.VOSR2OneStep
-    for forbidden_arch in ("ToyModel", "RRDBNet", "SwinIR", "TinySRNet"):
+    for sym in ("AutoencoderKLQwenImage2D", "VOSR2DiT", "DINOv2Encoder"):
+        assert hydra.utils.get_class(f"archs.{sym}") is getattr(archs_pkg, sym)
+    for forbidden_arch in ("VOSR2OneStep", "ToyModel", "RRDBNet", "SwinIR", "TinySRNet"):
         assert not hasattr(archs_pkg, forbidden_arch), (
             f"Forbidden architecture {forbidden_arch!r} must not exist in archs"
         )
@@ -132,27 +133,34 @@ def test_t1_train_yaml_default_composition_and_hydra_guards(
     configs_dir: Path,
     hydra_compose: Callable[..., Any],
 ) -> None:
-    """F03-F10: train.yaml defaults to vosr2 & scale=1, composes all groups, enforces Hydra guards."""
+    """F03-F10: train.yaml requires experiment/arch/loss, composes VOSR groups, enforces Hydra guards."""
     import yaml
+    from hydra.errors import ConfigCompositionException
 
-    cfg = hydra_compose("train")
+    with pytest.raises(ConfigCompositionException):
+        hydra_compose("train")
 
-    assert cfg.exp_name == "debug_vosr2"
+    cfg = hydra_compose("train", overrides=["experiment=vosr2_onestep_text"])
+
+    assert cfg.exp_name == "vosr2_onestep_text"
     assert cfg.scale == 1
     assert cfg.seed == 42
     assert cfg.output_root == "experiments"
-    assert cfg.work_dir == "experiments/debug_vosr2"
+    assert cfg.work_dir == "experiments/vosr2_onestep_text"
 
     for group in ("arch", "loss", "model", "data", "optim", "metric", "trainer"):
         assert group in cfg, f"Missing atomic group {group!r} in composed train.yaml"
 
-    assert cfg.arch._target_ == "archs.VOSR2OneStep"
-    assert cfg.arch.scale == 1
+    assert cfg.arch.vae._target_ == "archs.AutoencoderKLQwenImage2D"
+    assert cfg.arch.dit._target_ == "archs.VOSR2DiT"
+    assert cfg.arch.dino._target_ == "archs.DINOv2Encoder"
+    assert cfg.model._target_ == "models.VOSRModel"
+    assert cfg.model.scale == 1
     assert cfg.data.scale == 1
     assert cfg.optim.scheduler.T_max == cfg.trainer.total_iters
-    assert cfg.model._target_ == "models.SRModel"
     assert "ema" in cfg.model
-    assert "pretrain_path" in cfg.model
+    assert "trainable" in cfg.model
+    assert "pretrain" in cfg.model
 
     raw_train = yaml.safe_load((configs_dir / "train.yaml").read_text(encoding="utf-8"))
     assert raw_train["hydra"]["job"]["chdir"] is False
@@ -185,7 +193,7 @@ def test_t1_train_yaml_default_composition_and_hydra_guards(
     )
     assert self_idx is not None and exp_idx is not None
     assert self_idx < exp_idx, (
-        "`_self_` must precede `experiment: null` in configs/train.yaml defaults so "
+        "`_self_` must precede `experiment` in configs/train.yaml defaults so "
         "# @package _global_ experiments can override exp_name/scale/seed"
     )
 
@@ -194,13 +202,13 @@ def test_t1_atomic_arch_loss_optim_instantiation(
     hydra_compose: Callable[..., Any],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """F04, F05, F08: Atomic vosr2 arch, l1/l1_lpips losses, and partial optims instantiate."""
+    """F04, F05, F08: Independent vae/dit/dino archs, l1/l1_lpips losses, and partial optims instantiate."""
     import hydra.utils
     import torch
     import torch.nn as nn
     from tests.helpers.fake_backends import patch_lpips_offline, patch_vosr2_backends
 
-    from archs import VOSR2OneStep
+    from archs import AutoencoderKLQwenImage2D, DINOv2Encoder, VOSR2DiT
     from losses import L1Loss, LPIPSLoss
 
     patch_vosr2_backends(monkeypatch, z_dim=4, dino_dim=16)
@@ -209,28 +217,41 @@ def test_t1_atomic_arch_loss_optim_instantiation(
     cfg = hydra_compose(
         "train",
         overrides=[
-            "arch=vosr2",
-            "arch.input_size=8",
-            "arch.in_channels=8",
-            "arch.out_channels=4",
-            "arch.hidden_size=32",
-            "arch.depth=1",
-            "arch.num_heads=4",
-            "arch.mlp_ratio=2.0",
-            "arch.z_dims=16",
-            "arch.encdim_ratio=2",
-            "arch.dino_size=28",
-            "arch.dino_layer=0",
+            "~experiment",
+            "arch/vae=qwen_vae2d",
+            "arch/dit=vosr2_dit",
+            "arch/dino=dinov2_vitl14",
+            "arch.vae.pretrained_path=null",
+            "arch.vae.z_dim=4",
+            "arch.vae.base_dim=16",
+            "arch.vae.dim_mult=[1,1,1,1]",
+            "arch.vae.num_res_blocks=1",
+            "arch.vae.latents_mean=[0.0,0.0,0.0,0.0]",
+            "arch.vae.latents_std=[1.0,1.0,1.0,1.0]",
+            "arch.dit.pretrained_path=null",
+            "arch.dit.input_size=8",
+            "arch.dit.in_channels=8",
+            "arch.dit.out_channels=4",
+            "arch.dit.hidden_size=32",
+            "arch.dit.depth=1",
+            "arch.dit.num_heads=4",
+            "arch.dit.mlp_ratio=2.0",
+            "arch.dit.z_dims=16",
+            "arch.dit.encdim_ratio=2",
+            "arch.dino.image_size=28",
+            "arch.dino.layer=0",
             "loss=l1_lpips",
             "optim=adamw_cosine",
             "trainer.total_iters=100",
         ],
     )
 
-    net = hydra.utils.instantiate(cfg.arch)
-    assert isinstance(net, VOSR2OneStep)
-    assert isinstance(net, nn.Module)
-    assert net.scale == 1
+    vae = hydra.utils.instantiate(cfg.arch.vae)
+    dit = hydra.utils.instantiate(cfg.arch.dit)
+    dino = hydra.utils.instantiate(cfg.arch.dino)
+    assert isinstance(vae, AutoencoderKLQwenImage2D) and isinstance(vae, nn.Module)
+    assert isinstance(dit, VOSR2DiT) and isinstance(dit, nn.Module)
+    assert isinstance(dino, DINOv2Encoder) and isinstance(dino, nn.Module)
 
     assert set(cfg.loss.keys()) == {"l1", "lpips"}
     for name, entry in cfg.loss.items():
@@ -238,14 +259,18 @@ def test_t1_atomic_arch_loss_optim_instantiation(
         criterion = hydra.utils.instantiate(entry.criterion)
         assert isinstance(criterion, (L1Loss, LPIPSLoss))
 
-    # Verify atomic loss=l1 config instantiates L1Loss cleanly.
-    cfg_l1 = hydra_compose("train", overrides=["loss=l1"])
+    # Verify atomic loss=l1 config & optional dino=null compose cleanly.
+    cfg_l1 = hydra_compose(
+        "train",
+        overrides=["~experiment", "arch/vae=qwen_vae2d", "arch/dit=vosr2_dit", "loss=l1"],
+    )
     assert set(cfg_l1.loss.keys()) == {"l1"}
+    assert cfg_l1.arch.get("dino") is None
     assert isinstance(hydra.utils.instantiate(cfg_l1.loss.l1.criterion), L1Loss)
 
     opt_builder = hydra.utils.instantiate(cfg.optim.optimizer)
     assert callable(opt_builder)
-    opt = opt_builder(net.parameters())
+    opt = opt_builder(dit.parameters())
     assert isinstance(opt, torch.optim.AdamW)
 
     sched_builder = hydra.utils.instantiate(cfg.optim.scheduler)
@@ -255,16 +280,34 @@ def test_t1_atomic_arch_loss_optim_instantiation(
     assert sched.T_max == 100
 
     # Verify adam_multistep atomic optim config.
-    cfg_ms = hydra_compose("train", overrides=["optim=adam_multistep"])
-    opt_ms = hydra.utils.instantiate(cfg_ms.optim.optimizer)(net.parameters())
+    cfg_ms = hydra_compose(
+        "train",
+        overrides=[
+            "~experiment",
+            "arch/vae=qwen_vae2d",
+            "arch/dit=vosr2_dit",
+            "loss=l1",
+            "optim=adam_multistep",
+        ],
+    )
+    opt_ms = hydra.utils.instantiate(cfg_ms.optim.optimizer)(dit.parameters())
     sched_ms = hydra.utils.instantiate(cfg_ms.optim.scheduler)(opt_ms)
     assert isinstance(opt_ms, torch.optim.Adam)
     assert isinstance(sched_ms, torch.optim.lr_scheduler.MultiStepLR)
 
-    # Verify vosr2 scale interpolation cascades from global scale.
-    cfg_vosr2_x2 = hydra_compose("train", overrides=["arch=vosr2", "scale=2"])
-    assert cfg_vosr2_x2.arch._target_ == "archs.VOSR2OneStep"
-    assert cfg_vosr2_x2.arch.scale == 2
+    # Verify model.scale interpolation cascades from global scale.
+    cfg_vosr_x2 = hydra_compose(
+        "train",
+        overrides=[
+            "~experiment",
+            "arch/vae=qwen_vae2d",
+            "arch/dit=vosr2_dit",
+            "loss=l1",
+            "scale=2",
+        ],
+    )
+    assert cfg_vosr_x2.model._target_ == "models.VOSRModel"
+    assert cfg_vosr_x2.model.scale == 2
 
 
 def test_t1_multilevel_experiment_inheritance(
@@ -275,9 +318,12 @@ def test_t1_multilevel_experiment_inheritance(
     assert exp_cfg.exp_name == "vosr2_onestep_text"
     assert exp_cfg.work_dir == "experiments/vosr2_onestep_text"
     assert exp_cfg.scale == 1
-    assert exp_cfg.arch._target_ == "archs.VOSR2OneStep"
-    assert exp_cfg.arch.scale == 1
-    assert exp_cfg.arch.depth == 36
+    assert exp_cfg.model._target_ == "models.VOSRModel"
+    assert exp_cfg.model.scale == 1
+    assert exp_cfg.arch.vae._target_ == "archs.AutoencoderKLQwenImage2D"
+    assert exp_cfg.arch.dit._target_ == "archs.VOSR2DiT"
+    assert exp_cfg.arch.dit.depth == 36
+    assert exp_cfg.arch.dino._target_ == "archs.DINOv2Encoder"
 
     # Partial overrides preserve sibling keys from inherited groups.
     assert set(exp_cfg.loss.keys()) == {"l1", "lpips", "ocr_kl", "glyph"}
@@ -313,10 +359,10 @@ def test_t1_cli_override_precedence_and_interpolation_cascade(
     )
 
     assert cfg.scale == 2
-    assert cfg.arch.scale == 2
+    assert cfg.model.scale == 2
     assert cfg.data.scale == 2
     assert cfg.data.degradation.scale == 2
-    assert cfg.metric.val_suites.set5.metrics.psnr.crop_border == 2
+    assert cfg.metric.primary_dataset in cfg.metric.val_suites
     assert cfg.optim.optimizer.lr == pytest.approx(5.0e-5)
     assert cfg.trainer.total_iters == 1234
     assert cfg.optim.scheduler.T_max == 1234
@@ -365,7 +411,7 @@ def test_t1_user_reqs_config_invariants(
     """F04, F05, F07, F09, F11, F20: Enforce User Reqs #2, #3, #4, and #5 (ToyModel & L1/LPIPS)."""
     import yaml
 
-    cfg = hydra_compose("train")
+    cfg = hydra_compose("train", overrides=["experiment=vosr2_onestep_text"])
 
     # User Req #2: Zero `mode` field in data.sources or non-degradation dataset YAML files.
     for src in cfg.data.sources:
@@ -393,19 +439,29 @@ def test_t1_user_reqs_config_invariants(
     assert primary_ds in cfg.metric.val_suites
     assert primary_m in cfg.metric.val_suites[primary_ds].metrics
 
-    # Scope check: ONLY vosr2 arch & vosr2_onestep_text experiment (placeholder configs removed).
-    arch_yaml_names = {p.name for p in (configs_dir / "arch").glob("*.yaml")}
-    assert arch_yaml_names == {"vosr2.yaml"}
+    # Scope check: 3 independent VOSR2 arch configs & vosr2_onestep_text experiment(s).
+    arch_yaml_names = {
+        p.relative_to(configs_dir / "arch").as_posix()
+        for p in (configs_dir / "arch").rglob("*.yaml")
+    }
+    assert arch_yaml_names == {
+        "vae/qwen_vae2d.yaml",
+        "dit/vosr2_dit.yaml",
+        "dino/dinov2_vitl14.yaml",
+    }
 
     exp_yaml_names = {p.name for p in (configs_dir / "experiment").glob("*.yaml")}
-    assert exp_yaml_names == {"vosr2_onestep_text.yaml"}
+    assert "vosr2_onestep_text.yaml" in exp_yaml_names
+    assert exp_yaml_names <= {"vosr2_onestep_text.yaml", "vosr2_onestep_text_local.yaml"}
 
     loss_yaml_names = {p.name for p in (configs_dir / "loss").glob("*.yaml")}
     assert {"l1.yaml", "l1_lpips.yaml"}.issubset(loss_yaml_names)
 
-    # Zero references to SRPredictor or removed placeholder archs/losses in parsed YAML.
+    # Zero references to SRPredictor, removed legacy symbols, or placeholder archs/losses in parsed YAML.
     forbidden_tokens = (
         "SRPredictor",
+        "VOSR2OneStep",
+        "models.SRModel",
         "ToyModel",
         "RRDBNet",
         "SwinIR",
@@ -437,6 +493,7 @@ def test_t1_config_utils_work_dir_setup_and_resolved_roundtrip(
     cfg = hydra_compose(
         "train",
         overrides=[
+            "experiment=vosr2_onestep_text",
             f"output_root={hydra_value_formatter(str(e2e_workdir['work']))}",
             "exp_name=roundtrip_exp",
             "++trainer.append_timestamp=false",

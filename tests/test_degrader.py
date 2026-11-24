@@ -247,7 +247,7 @@ def test_kernel_generator_variants_and_hydra_cfg() -> None:
 
     # Full Hydra-composed kernel_cfg
     with hydra.initialize_config_dir(config_dir=CONFIGS_DIR, version_base=None):
-        cfg = hydra.compose(config_name="train")
+        cfg = hydra.compose(config_name="train", overrides=["experiment=vosr2_onestep_text"])
     gen_hydra = KernelGenerator(cfg.data.degradation.kernel_cfg)
     assert gen_hydra.kernel_size == 21
     hk1, hk2, hsk = gen_hydra.sample(rng=np.random.default_rng(4))
@@ -509,7 +509,7 @@ def test_training_pool_warmup_overflow_and_aliasing_consistency() -> None:
 
 def test_realesrgan_degrader_hydra_instantiation() -> None:
     with hydra.initialize_config_dir(config_dir=CONFIGS_DIR, version_base=None):
-        cfg = hydra.compose(config_name="train")
+        cfg = hydra.compose(config_name="train", overrides=["experiment=vosr2_onestep_text"])
     deg = instantiate(cfg.data.degradation)
     assert isinstance(deg, RealESRGANDegrader)
     assert deg.scale == 1
@@ -835,7 +835,9 @@ def test_end_to_end_mixed_dataset_loader_and_degrader(tmp_path: Path) -> None:
     paired_json.write_text(json.dumps(paired_entries), encoding="utf-8")
 
     with hydra.initialize_config_dir(config_dir=CONFIGS_DIR, version_base=None):
-        cfg = hydra.compose(config_name="train", overrides=["scale=4"])
+        cfg = hydra.compose(
+            config_name="train", overrides=["experiment=vosr2_onestep_text", "scale=4"]
+        )
     degrader = instantiate(cfg.data.degradation)
 
     ds = MixedSRDataset(
