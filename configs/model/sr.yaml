@@ -1,8 +1,0 @@
-_target_: models.SRModel
-ema:
-  enabled: true
-  decay: 0.999
-  warmup_steps: 0
-pretrain_path: null
-pretrain_strict: true
-pretrain_key: null             # null | "params_ema" | "params"

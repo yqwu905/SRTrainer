@@ -30,9 +30,9 @@ import engine as engine_pkg
 import models as models_pkg
 from engine import Checkpointer, TiledInferencer, Trainer, TrainState
 from metrics.base import BaseMetric
-from models import BaseModel, ModelEMA, SRModel
+from models import BaseModel, ModelEMA, VOSRModel, VOSRPipeline
 from models.ema import unwrap_model_for_ema
-from tests.dummy_arch import DummySRNet
+from tests.dummy_arch import DummyDino, DummyDiT, DummySRNet, DummyVAE, get_dummy_vosr_arch_dict
 from utils.config import load_resolved_config
 from utils.image import load_image
 from utils.misc import load_weights, save_safetensors
@@ -304,12 +304,13 @@ def _make_base_train_cfg(
     ema_enabled: bool = True,
     ema_decay: float = 0.99,
     ema_warmup: int = 0,
-    pretrain_path: str | None = None,
-    pretrain_strict: bool = True,
-    pretrain_key: str | None = None,
+    trainable: dict[str, bool] | None = None,
+    dit_pretrain_path: str | None = None,
+    dit_pretrain_strict: bool = True,
+    dit_pretrain_key: str | None = None,
 ) -> DictConfig:
     with initialize_config_dir(version_base=None, config_dir=CONFIG_DIR):
-        cfg = compose(config_name="train")
+        cfg = compose(config_name="train", overrides=["experiment=vosr2_onestep_text"])
 
     OmegaConf.set_struct(cfg, False)
     cfg.exp_name = work_dir.name
@@ -318,16 +319,7 @@ def _make_base_train_cfg(
     cfg.output_root = str(work_dir.parent)
     cfg.work_dir = str(work_dir)
 
-    cfg.arch = OmegaConf.create(
-        {
-            "_target_": "tests.dummy_arch.DummySRNet",
-            "num_in_ch": 3,
-            "num_out_ch": 3,
-            "num_feat": 8,
-            "num_block": 1,
-            "scale": 2,
-        }
-    )
+    cfg.arch = OmegaConf.create(get_dummy_vosr_arch_dict())
 
     cfg.loss = OmegaConf.create(
         {
@@ -348,12 +340,24 @@ def _make_base_train_cfg(
             }
         )
 
+    cfg.model.scale = 2
+    cfg.model.trainable = OmegaConf.create(
+        trainable if trainable is not None else {"vae": False, "dit": True, "dino": False}
+    )
     cfg.model.ema.enabled = ema_enabled
     cfg.model.ema.decay = ema_decay
     cfg.model.ema.warmup_steps = ema_warmup
-    cfg.model.pretrain_path = pretrain_path
-    cfg.model.pretrain_strict = pretrain_strict
-    cfg.model.pretrain_key = pretrain_key
+    cfg.model.pretrain = OmegaConf.create(
+        {
+            "vae": {"path": None, "strict": True, "key": None},
+            "dit": {
+                "path": dit_pretrain_path,
+                "strict": dit_pretrain_strict,
+                "key": dit_pretrain_key,
+            },
+            "dino": {"path": None, "strict": True, "key": None},
+        }
+    )
 
     cfg.data.gt_size = 32
     cfg.data.scale = 2
@@ -456,16 +460,23 @@ def _run_torchrun_train(
     env = os.environ.copy()
     env["ACCELERATE_USE_CPU"] = "true"
     env["OMP_NUM_THREADS"] = "1"
+    if sys.platform == "darwin" and "GLOO_SOCKET_IFNAME" not in env:
+        env["GLOO_SOCKET_IFNAME"] = "lo0"
     existing_pp = env.get("PYTHONPATH", "")
     extra_pp = f"{REPO_ROOT}:{REPO_ROOT / 'src'}"
     env["PYTHONPATH"] = f"{extra_pp}:{existing_pp}" if existing_pp else extra_pp
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        master_port = int(sock.getsockname()[1])
 
     cmd = [
         sys.executable,
         "-m",
         "torch.distributed.run",
-        "--standalone",
         f"--nproc_per_node={nproc}",
+        "--master_addr=127.0.0.1",
+        f"--master_port={master_port}",
         str(TOOLS_TRAIN),
         *overrides,
     ]
@@ -491,8 +502,8 @@ def test_engine_and_models_exports_and_trainer_failfast_validation(
     _block_network_downloads(monkeypatch)
 
     assert engine_pkg.__all__ == ["Trainer", "TrainState", "Checkpointer", "TiledInferencer"]
-    assert models_pkg.__all__ == ["BaseModel", "SRModel", "ModelEMA"]
-    assert issubclass(SRModel, BaseModel)
+    assert models_pkg.__all__ == ["BaseModel", "VOSRModel", "VOSRPipeline", "ModelEMA"]
+    assert issubclass(VOSRModel, BaseModel)
     with pytest.raises(TypeError):
         BaseModel({})  # type: ignore[abstract]
 
@@ -586,7 +597,13 @@ def test_engine_and_models_exports_and_trainer_failfast_validation(
     assert trainer.primary_dataset is None
     assert trainer.primary_metric is None
     assert list((empty_dir / "weights").glob("best_*.safetensors")) == []
-    assert (empty_dir / "weights" / "latest.safetensors").is_file()
+    for fname in (
+        "latest_vae.safetensors",
+        "latest_dit.safetensors",
+        "latest_dit_ema.safetensors",
+        "latest_dino.safetensors",
+    ):
+        assert (empty_dir / "weights" / fname).is_file()
 
 
 # ---------------------------------------------------------------------------
@@ -771,38 +788,49 @@ def test_model_ema_train_state_and_checkpointer_units(tmp_path: Path) -> None:
     best_path = ckpt.save_best(acc, prefixed_sd, "set5", "psnr", step=10, metric_value=31.5)
     assert best_path == ckpt_work / "weights" / "best_set5_psnr.safetensors"
     assert best_path.is_file()
+    best_multi = ckpt.save_best_weights(
+        acc,
+        {"vae": prefixed_sd, "dit": prefixed_sd, "dino": prefixed_sd},
+        "set5",
+        "psnr",
+        step=10,
+        metric_value=31.5,
+    )
+    assert set(best_multi.keys()) == {"vae", "dit", "dino"}
+    for comp in ("vae", "dit", "dino"):
+        assert (ckpt_work / "weights" / f"best_set5_psnr_{comp}.safetensors").is_file()
     assert list((ckpt_work / "weights").glob("*.tmp")) == []
 
     acc.end_training()
 
 
 # ---------------------------------------------------------------------------
-# Test 3: SRModel 7-Step Setup, Pretrain, Losses, LR Scheduler & Skip Gating
+# Test 3: VOSRModel Setup, Per-Arch Pretrain, Losses, LR Scheduler & Skip Gating
 # ---------------------------------------------------------------------------
 
 
-def test_sr_model_7step_setup_losses_pretrain_and_scheduler_gating(
+def test_vosr_model_7step_setup_losses_pretrain_and_scheduler_gating(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _block_network_downloads(monkeypatch)
     ds = _create_synthetic_datasets(tmp_path)
 
-    # Save a distinctive pretrained checkpoint as .pth with nested key 'params_ema'
-    ref_net = DummySRNet(num_feat=8, num_block=1, scale=2)
+    # Save a distinctive pretrained DiT checkpoint as .pth with nested key 'params_ema'
+    ref_dit = DummyDiT(in_channels=8, out_channels=4, patch_size=2, hidden_ch=8, z_dims=8)
     with torch.no_grad():
-        for p in ref_net.parameters():
+        for p in ref_dit.parameters():
             p.fill_(0.125)
-    pth_pretrain = tmp_path / "pretrain_nested.pth"
-    torch.save({"params_ema": ref_net.state_dict()}, pth_pretrain)
+    pth_pretrain = tmp_path / "pretrain_dit_nested.pth"
+    torch.save({"params_ema": ref_dit.state_dict()}, pth_pretrain)
 
     cfg = _make_base_train_cfg(
-        tmp_path / "sr_model_test",
+        tmp_path / "vosr_model_test",
         ds,
         use_lpips_loss=True,
         grad_accum=2,
-        pretrain_path=str(pth_pretrain),
-        pretrain_strict=True,
-        pretrain_key="params_ema",
+        dit_pretrain_path=str(pth_pretrain),
+        dit_pretrain_strict=True,
+        dit_pretrain_key="params_ema",
         ema_enabled=True,
         ema_decay=0.9,
     )
@@ -818,22 +846,23 @@ def test_sr_model_7step_setup_losses_pretrain_and_scheduler_gating(
 
     acc = Accelerator(mixed_precision="no", gradient_accumulation_steps=2)
     model = hydra.utils.instantiate(cfg.model, cfg=cfg, _recursive_=False)
-    assert isinstance(model, SRModel)
+    assert isinstance(model, VOSRModel)
     model.setup(acc)
 
     # Verify double-setup rejected
     with pytest.raises(RuntimeError, match="already been called"):
         model.setup(acc)
 
-    # Verify pretrain loaded BEFORE EMA clone so EMA inherits exact 0.125 weights
-    assert model.ema is not None
-    assert all(torch.allclose(p, torch.full_like(p, 0.125)) for p in model.ema.module.parameters())
+    # Verify pretrain loaded BEFORE EMA clone so DiT EMA inherits exact 0.125 weights
+    assert set(model.emas.keys()) == {"dit"}
+    dit_ema = model.emas["dit"]
+    assert all(torch.allclose(p, torch.full_like(p, 0.125)) for p in dit_ema.module.parameters())
     assert "zero_skip" not in model.losses
     assert set(model.losses.keys()) == {"l1", "lpips"}
 
     # Verify lr_scheduler is NOT in accelerator._schedulers and registered before ema
     assert len(acc._schedulers) == 0
-    assert acc._custom_objects == [model.lr_scheduler, model.ema]
+    assert acc._custom_objects == [model.lr_scheduler, dit_ema]
 
     # Single-group LR dict
     lr_dict = model.get_lr_dict()
@@ -855,7 +884,7 @@ def test_sr_model_7step_setup_losses_pretrain_and_scheduler_gating(
     assert stepped1 is True
     assert "loss/total" in s1 and "loss/l1" in s1 and "loss/lpips" in s1 and "grad_norm" in s1
     assert "lr" not in s1  # Never duplicate lr inside scalars!
-    assert model.ema.num_updates == 0
+    assert dit_ema.num_updates == 0
     assert model.get_lr_dict()["lr"] == pytest.approx(lr_before)
 
     # Now allow step to apply -> LR & EMA advance exactly once
@@ -864,17 +893,17 @@ def test_sr_model_7step_setup_losses_pretrain_and_scheduler_gating(
     assert stepped2 is False
     s3, stepped3 = model.train_step(batch, global_step=1)
     assert stepped3 is True
-    assert model.ema.num_updates == 1
+    assert dit_ema.num_updates == 1
     assert model.get_lr_dict()["lr"] < lr_before
 
-    # Verify export_weights returns isolated CPU clones without prefixes
+    # Verify export_weights returns isolated per-arch CPU clones without prefixes
     exported = model.export_weights(acc)
-    assert set(exported.keys()) == {"net_g", "net_g_ema"}
-    first_k = next(iter(exported["net_g"]))
-    saved_val = exported["net_g"][first_k].clone()
+    assert set(exported.keys()) == {"vae", "dit", "dit_ema", "dino"}
+    first_k = next(iter(exported["dit"]))
+    saved_val = exported["dit"][first_k].clone()
     with torch.no_grad():
-        next(model.get_infer_network(use_ema=False).parameters()).fill_(99.0)
-    assert torch.equal(exported["net_g"][first_k], saved_val)
+        next(model.get_infer_network(use_ema=False).dit.parameters()).fill_(99.0)
+    assert torch.equal(exported["dit"][first_k], saved_val)
 
     # Verify multi-param-group get_lr_dict returns lr/group_i
     model.optimizer.add_param_group({"params": [torch.nn.Parameter(torch.zeros(1))], "lr": 5e-5})
@@ -886,30 +915,32 @@ def test_sr_model_7step_setup_losses_pretrain_and_scheduler_gating(
     _reset_accelerate_and_loggers()
 
     # Verify pretrain .safetensors with strict=False & all-zero loss fail-fast
-    st_path = tmp_path / "partial.safetensors"
-    partial_sd = {k: v for i, (k, v) in enumerate(ref_net.state_dict().items()) if i > 0}
+    st_path = tmp_path / "partial_dit.safetensors"
+    partial_sd = {k: v for i, (k, v) in enumerate(ref_dit.state_dict().items()) if i > 0}
     partial_sd["extra_unused_weight"] = torch.zeros(1)
     save_safetensors(partial_sd, st_path)
 
     cfg_partial = _make_base_train_cfg(
-        tmp_path / "sr_partial",
+        tmp_path / "vosr_partial",
         ds,
-        pretrain_path=str(st_path),
-        pretrain_strict=False,
-        pretrain_key=None,
+        dit_pretrain_path=str(st_path),
+        dit_pretrain_strict=False,
+        dit_pretrain_key=None,
     )
     acc2 = Accelerator(mixed_precision="no")
-    model2 = SRModel(cfg_partial)
+    model2 = VOSRModel(cfg_partial)
     model2.setup(acc2)
-    assert model2.get_infer_network(use_ema=True) is model2.ema.module
+    infer_pipe = model2.get_infer_network(use_ema=True)
+    assert isinstance(infer_pipe, VOSRPipeline)
+    assert infer_pipe.dit is model2.emas["dit"].module
     acc2.end_training()
     _reset_accelerate_and_loggers()
 
-    cfg_all_zero = _make_base_train_cfg(tmp_path / "sr_zero_loss", ds)
+    cfg_all_zero = _make_base_train_cfg(tmp_path / "vosr_zero_loss", ds)
     cfg_all_zero.loss.l1.weight = 0.0
     acc3 = Accelerator(mixed_precision="no")
     with pytest.raises(ValueError, match="at least one active loss"):
-        SRModel(cfg_all_zero).setup(acc3)
+        VOSRModel(cfg_all_zero).setup(acc3)
     acc3.end_training()
 
 
@@ -1020,19 +1051,33 @@ def test_trainer_full_smoke_mixed_l1_lpips_multisuite_grad_accum_tb(
     state_dirs = sorted(p.name for p in (work_dir / "checkpoints").glob("state_iter_*"))
     assert state_dirs == ["state_iter_000004"]
 
-    # Track 2 weights exist and load strictly into ToyModel
-    for fname in (
-        "iter_000002.safetensors",
-        "iter_000002_ema.safetensors",
-        "iter_000004.safetensors",
-        "iter_000004_ema.safetensors",
-        "latest.safetensors",
-        "latest_ema.safetensors",
-        "best_val_ref_psnr.safetensors",
-    ):
+    # Track 2 weights exist per-arch and load strictly into each independent arch
+    arch_factories = {
+        "vae": lambda: DummyVAE(z_dim=4, spatial_compression_ratio=2),
+        "dit": lambda: DummyDiT(in_channels=8, out_channels=4, patch_size=2, hidden_ch=8, z_dims=8),
+        "dino": lambda: DummyDino(embed_dim=8, image_size=16, patch_size=4),
+    }
+    expected_files = [
+        ("iter_000002_vae.safetensors", "vae"),
+        ("iter_000002_dit.safetensors", "dit"),
+        ("iter_000002_dit_ema.safetensors", "dit"),
+        ("iter_000002_dino.safetensors", "dino"),
+        ("iter_000004_vae.safetensors", "vae"),
+        ("iter_000004_dit.safetensors", "dit"),
+        ("iter_000004_dit_ema.safetensors", "dit"),
+        ("iter_000004_dino.safetensors", "dino"),
+        ("latest_vae.safetensors", "vae"),
+        ("latest_dit.safetensors", "dit"),
+        ("latest_dit_ema.safetensors", "dit"),
+        ("latest_dino.safetensors", "dino"),
+        ("best_val_ref_psnr_vae.safetensors", "vae"),
+        ("best_val_ref_psnr_dit.safetensors", "dit"),
+        ("best_val_ref_psnr_dino.safetensors", "dino"),
+    ]
+    for fname, comp in expected_files:
         fpath = work_dir / "weights" / fname
         assert fpath.is_file(), f"Missing expected weight file: {fname}"
-        missing, unexpected = load_weights(DummySRNet(num_feat=8, num_block=1, scale=2), fpath, strict=True)
+        missing, unexpected = load_weights(arch_factories[comp](), fpath, strict=True)
         assert missing == [] and unexpected == []
 
     # Visuals: 3-panel for val_ref (collision-safe duplicate stems!) and 2-panel for val_ocr_nogt
@@ -1129,15 +1174,15 @@ def test_trainer_log_with_null_lower_is_better_best_and_nan_safety(
     # Lower-is-better selected 0.25 (ignoring 0.80 and NaN)
     assert state.best_metrics["val_tiny/lpips_like"] == pytest.approx(0.25)
 
-    # val_use_ema=False -> best_*.safetensors must equal net_g (iter_000004), NOT net_g_ema!
+    # val_use_ema=False -> best_*_dit.safetensors must equal dit (iter_000004_dit), NOT dit_ema!
     best_sd = load_safetensors_file(
-        str(trainer.work_dir / "weights" / "best_val_tiny_lpips_like.safetensors")
+        str(trainer.work_dir / "weights" / "best_val_tiny_lpips_like_dit.safetensors")
     )
-    net_g_sd = load_safetensors_file(str(trainer.work_dir / "weights" / "iter_000004.safetensors"))
+    dit_sd = load_safetensors_file(str(trainer.work_dir / "weights" / "iter_000004_dit.safetensors"))
     ema_sd = load_safetensors_file(
-        str(trainer.work_dir / "weights" / "iter_000004_ema.safetensors")
+        str(trainer.work_dir / "weights" / "iter_000004_dit_ema.safetensors")
     )
-    assert all(torch.equal(best_sd[k], net_g_sd[k]) for k in net_g_sd)
+    assert all(torch.equal(best_sd[k], dit_sd[k]) for k in dit_sd)
     assert any(not torch.equal(best_sd[k], ema_sd[k]) for k in ema_sd)
 
     # Verify resume="auto" on empty checkpoints logs WARNING and starts cleanly from step 0
@@ -1224,7 +1269,7 @@ def test_trainer_no_duplicate_final_val_save_and_already_finished_resume(
 
     # (c) Resuming with resume=auto when global_step == total_iters skips loop & does not overwrite ckpts
     _reset_accelerate_and_loggers()
-    ckpt_mtime_before = (work_b / "weights" / "iter_000003.safetensors").stat().st_mtime_ns
+    ckpt_mtime_before = (work_b / "weights" / "iter_000003_dit.safetensors").stat().st_mtime_ns
     cfg_done = _make_base_train_cfg(
         work_b,
         ds,
@@ -1237,7 +1282,7 @@ def test_trainer_no_duplicate_final_val_save_and_already_finished_resume(
     trainer_done = Trainer(cfg_done)
     state_done = trainer_done.fit()
     assert state_done.global_step == 3
-    assert (work_b / "weights" / "iter_000003.safetensors").stat().st_mtime_ns == ckpt_mtime_before
+    assert (work_b / "weights" / "iter_000003_dit.safetensors").stat().st_mtime_ns == ckpt_mtime_before
 
 
 # ---------------------------------------------------------------------------
@@ -1267,8 +1312,8 @@ def test_trainer_interrupt_and_resume_auto_bit_exact_consistency(
     trainer_cont = Trainer(cfg_cont)
     state_cont = trainer_cont.fit()
     lr_cont = trainer_cont.model.get_lr_dict()["lr"]
-    net_cont = load_safetensors_file(str(work_cont / "weights" / "iter_000006.safetensors"))
-    ema_cont = load_safetensors_file(str(work_cont / "weights" / "iter_000006_ema.safetensors"))
+    net_cont = load_safetensors_file(str(work_cont / "weights" / "iter_000006_dit.safetensors"))
+    ema_cont = load_safetensors_file(str(work_cont / "weights" / "iter_000006_dit_ema.safetensors"))
 
     # Run B1: stop at step 3 (same T_max=6)
     _reset_accelerate_and_loggers()
@@ -1306,8 +1351,8 @@ def test_trainer_interrupt_and_resume_auto_bit_exact_consistency(
     trainer_p2 = Trainer(cfg_part2)
     state_p2 = trainer_p2.fit()
     lr_res = trainer_p2.model.get_lr_dict()["lr"]
-    net_res = load_safetensors_file(str(work_res / "weights" / "iter_000006.safetensors"))
-    ema_res = load_safetensors_file(str(work_res / "weights" / "iter_000006_ema.safetensors"))
+    net_res = load_safetensors_file(str(work_res / "weights" / "iter_000006_dit.safetensors"))
+    ema_res = load_safetensors_file(str(work_res / "weights" / "iter_000006_dit_ema.safetensors"))
 
     assert state_p2.global_step == state_cont.global_step == 6
     assert lr_res == pytest.approx(lr_cont, abs=0.0)
@@ -1351,8 +1396,10 @@ def test_train_to_tools_infer_exp_dir_integration(
 
     trainer = train_mod.run_train(cfg)
     assert trainer.train_state.global_step == 2
-    best_weight = work_dir / "weights" / "best_val_ref_psnr.safetensors"
-    assert best_weight.is_file()
+    best_vae = work_dir / "weights" / "best_val_ref_psnr_vae.safetensors"
+    best_dit = work_dir / "weights" / "best_val_ref_psnr_dit.safetensors"
+    best_dino = work_dir / "weights" / "best_val_ref_psnr_dino.safetensors"
+    assert best_vae.is_file() and best_dit.is_file() and best_dino.is_file()
 
     # Invoke tools/infer.py in Mode 1 (infer.exp_dir ONLY — no arch/scale/weights_path!)
     infer_out = tmp_path / "infer_outputs"
@@ -1385,9 +1432,14 @@ def test_train_to_tools_infer_exp_dir_integration(
     out_unique = infer_out / "val_ref" / "unique_img.png"
     assert out_unique.is_file()
 
-    # Reference output using TiledInferencer directly with best_*.safetensors & tile_size=16 (32//2)
-    ref_model = DummySRNet(num_feat=8, num_block=1, scale=2)
-    load_weights(ref_model, best_weight, strict=True)
+    # Reference output using TiledInferencer directly with best_*_{vae,dit,dino}.safetensors & tile_size=16 (32//2)
+    ref_vae = DummyVAE(z_dim=4, spatial_compression_ratio=2)
+    ref_dit = DummyDiT(in_channels=8, out_channels=4, patch_size=2, hidden_ch=8, z_dims=8)
+    ref_dino = DummyDino(embed_dim=8, image_size=16, patch_size=4)
+    load_weights(ref_vae, best_vae, strict=True)
+    load_weights(ref_dit, best_dit, strict=True)
+    load_weights(ref_dino, best_dino, strict=True)
+    ref_model = VOSRPipeline(vae=ref_vae, dit=ref_dit, dino=ref_dino, scale=2, eval_seed=42)
     ref_inf = TiledInferencer(
         model=ref_model,
         scale=2,
@@ -1478,13 +1530,18 @@ def test_train_cli_distributed_2proc_cpu_torchrun_smoke(tmp_path: Path) -> None:
     total_iters = 4
 
     overrides = [
+        "experiment=vosr2_onestep_text",
         f"exp_name={base_work.name}",
         f"output_root={base_work.parent}",
         f"work_dir={base_work}",
         "scale=2",
         "seed=42",
-        "~arch",
-        "+arch={_target_:tests.dummy_arch.DummySRNet,num_in_ch:3,num_out_ch:3,num_feat:8,num_block:1,scale:2}",
+        "~arch/vae",
+        "~arch/dit",
+        "~arch/dino",
+        f"+arch={_to_hydra_val(get_dummy_vosr_arch_dict())}",
+        "~loss",
+        "+loss={l1:{weight:1.0,criterion:{_target_:losses.L1Loss,reduction:mean}}}",
         "data.gt_size=32",
         "data.batch_size_per_gpu=2",
         "data.num_workers=0",
@@ -1527,7 +1584,8 @@ def test_train_cli_distributed_2proc_cpu_torchrun_smoke(tmp_path: Path) -> None:
     exp_dir = matching_dirs[0]
 
     assert (exp_dir / "config_resolved.yaml").is_file()
-    assert (exp_dir / "weights" / "best_val_odd5_meta_score.safetensors").is_file()
+    for comp in ("vae", "dit", "dino"):
+        assert (exp_dir / "weights" / f"best_val_odd5_meta_score_{comp}.safetensors").is_file()
 
     # Both rank RNG files exist in state_iter_000004
     state_dir = exp_dir / "checkpoints" / "state_iter_000004"
@@ -1617,13 +1675,21 @@ def test_train_cli_distributed_2proc_resume_auto(tmp_path: Path) -> None:
     )
 
     common = [
+        "experiment=vosr2_onestep_text",
         f"exp_name={exp_dir.name}",
         f"output_root={exp_dir.parent}",
         f"work_dir={exp_dir}",
         "scale=2",
         "seed=42",
-        "~arch",
-        "+arch={_target_:tests.dummy_arch.DummySRNet,num_in_ch:3,num_out_ch:3,num_feat:8,num_block:1,scale:2}",
+        "~arch/vae",
+        "~arch/dit",
+        "~arch/dino",
+        f"+arch={_to_hydra_val(get_dummy_vosr_arch_dict())}",
+        "~loss",
+        "+loss={l1:{weight:1.0,criterion:{_target_:losses.L1Loss,reduction:mean}}}",
+        "model.trainable.vae=true",
+        "model.trainable.dit=true",
+        "model.trainable.dino=false",
         "data.gt_size=32",
         "data.batch_size_per_gpu=2",
         "data.num_workers=0",
@@ -1666,8 +1732,14 @@ def test_train_cli_distributed_2proc_resume_auto(tmp_path: Path) -> None:
     log_text = (exp_dir / "train.log").read_text(encoding="utf-8")
     assert "[Resume]" in log_text
     assert "[Iter 4/4]" in log_text
-    assert (exp_dir / "weights" / "iter_000004.safetensors").is_file()
-    assert (exp_dir / "weights" / "iter_000004_ema.safetensors").is_file()
+    for fname in (
+        "iter_000004_vae.safetensors",
+        "iter_000004_vae_ema.safetensors",
+        "iter_000004_dit.safetensors",
+        "iter_000004_dit_ema.safetensors",
+        "iter_000004_dino.safetensors",
+    ):
+        assert (exp_dir / "weights" / fname).is_file(), f"Missing {fname}"
     state4 = exp_dir / "checkpoints" / "state_iter_000004"
     assert (state4 / "random_states_0.pkl").is_file()
     assert (state4 / "random_states_1.pkl").is_file()

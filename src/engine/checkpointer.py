@@ -224,6 +224,61 @@ class Checkpointer:
         accelerator.wait_for_everyone()
         return best_path
 
+    def save_best_weights(
+        self,
+        accelerator: Accelerator,
+        exported_weights: Mapping[str, Mapping[str, torch.Tensor]],
+        val_name: str,
+        metric_name: str,
+        *,
+        step: int | None = None,
+        metric_value: float | None = None,
+    ) -> dict[str, Path]:
+        """Save Track 2 atomic best-metric safetensors weights for single- or multi-arch models."""
+        safe_val = _validate_name_component(val_name, "val_name")
+        safe_metric = _validate_name_component(metric_name, "metric_name")
+        if not isinstance(exported_weights, Mapping) or len(exported_weights) == 0:
+            raise ValueError(
+                "exported_weights must be a non-empty mapping of component name -> state_dict."
+            )
+
+        non_null_items = [
+            (str(k), sd) for k, sd in exported_weights.items() if sd is not None
+        ]
+        if not non_null_items:
+            raise ValueError("exported_weights contains no non-null state dicts to save.")
+
+        saved: dict[str, Path] = {}
+        if accelerator.is_main_process:
+            self.weights_dir.mkdir(parents=True, exist_ok=True)
+            is_single_net_g = len(non_null_items) == 1 and non_null_items[0][0] == "net_g"
+            for key, state_dict in non_null_items:
+                if not isinstance(state_dict, Mapping) or len(state_dict) == 0:
+                    raise ValueError(
+                        f"Best checkpoint state_dict for {key!r} must be a non-empty tensor mapping."
+                    )
+                if is_single_net_g:
+                    best_path = self.weights_dir / f"best_{safe_val}_{safe_metric}.safetensors"
+                else:
+                    safe_key = _validate_name_component(key, "exported_weights key")
+                    best_path = (
+                        self.weights_dir / f"best_{safe_val}_{safe_metric}_{safe_key}.safetensors"
+                    )
+                metadata: dict[str, str] = {
+                    "val_name": safe_val,
+                    "metric_name": safe_metric,
+                    "name": key,
+                }
+                if step is not None:
+                    metadata["step"] = str(_validate_step(step))
+                if metric_value is not None:
+                    metadata["metric_value"] = str(metric_value)
+                save_safetensors(state_dict, best_path, metadata=metadata)
+                saved[key] = best_path
+
+        accelerator.wait_for_everyone()
+        return saved
+
     def find_latest_state(self) -> Path | None:
         """Return the highest-iteration ``checkpoints/state_iter_*`` directory, or ``None``."""
         entries = self._list_state_dirs()
@@ -256,6 +311,6 @@ class Checkpointer:
         if not explicit.is_dir():
             raise ValueError(
                 f"Resume path must be a checkpoint state directory, got file: {explicit} "
-                "(use model.pretrain_path for weight files)."
+                "(use model.pretrain.<arch>.path for weight files)."
             )
         return explicit

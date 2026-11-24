@@ -58,7 +58,23 @@ class BaseModel(ABC):
         self,
         accelerator: Accelerator,
     ) -> dict[str, dict[str, torch.Tensor]]:
-        """Export clean, prefix-free inference weight snapshots (e.g., ``{'net_g': ...}``)."""
+        """Export clean, prefix-free inference weight snapshots (e.g., per-arch dicts)."""
+
+    def export_infer_weights(
+        self,
+        accelerator: Accelerator,
+        use_ema: bool = True,
+    ) -> dict[str, dict[str, torch.Tensor]]:
+        """Export the inference weight snapshot(s) corresponding to ``get_infer_network(use_ema)``."""
+        exported = self.export_weights(accelerator)
+        if "net_g" in exported or "net_g_ema" in exported:
+            selected = (
+                exported["net_g_ema"]
+                if (use_ema and "net_g_ema" in exported)
+                else exported["net_g"]
+            )
+            return {"net_g": selected}
+        return exported
 
     def get_lr_dict(self) -> dict[str, float]:
         """Return current learning rates for structured logging and trackers."""

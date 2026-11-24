@@ -222,16 +222,9 @@ def _make_trainer_cfg(
     cfg.seed = 42
     cfg.output_root = str(work_dir.parent)
     cfg.work_dir = str(work_dir)
-    cfg.arch = OmegaConf.create(
-        {
-            "_target_": "tests.dummy_arch.DummySRNet",
-            "num_in_ch": 3,
-            "num_out_ch": 3,
-            "num_feat": 8,
-            "num_block": 1,
-            "scale": 1,
-        }
-    )
+    from tests.dummy_arch import get_dummy_vosr_arch_dict
+
+    cfg.arch = OmegaConf.create(get_dummy_vosr_arch_dict())
     cfg.loss = OmegaConf.create(
         {
             "l1": {
@@ -240,8 +233,10 @@ def _make_trainer_cfg(
             }
         }
     )
+    cfg.model.scale = 1
     cfg.model.ema.enabled = False
-    cfg.model.pretrain_path = None
+    cfg.model.trainable = OmegaConf.create({"vae": False, "dit": True, "dino": False})
+    cfg.model.pretrain = None
     cfg.data.gt_size = 16
     cfg.data.scale = 1
     cfg.data.batch_size_per_gpu = 1
@@ -1137,8 +1132,8 @@ def test_trainer_validate_mixed_metrics_weighted_ocr_cer_best_nan_and_no_stale_c
     assert math.isnan(res1["empty_ocr"]["cer"])
     assert math.isnan(res1["empty_ocr"]["one_minus_ned"])
 
-    best_path = work_dir / "weights" / "best_mixed_cer.safetensors"
-    assert best_path.is_file()
+    for comp in ("vae", "dit", "dino"):
+        assert (work_dir / "weights" / f"best_mixed_cer_{comp}.safetensors").is_file()
     assert trainer.train_state.best_metrics["mixed/cer"] == pytest.approx(1.0 / 31.0, abs=1e-12)
 
     res2 = trainer.validate(step=2)
@@ -1200,7 +1195,8 @@ def test_trainer_validate_mixed_metrics_weighted_ocr_cer_best_nan_and_no_stale_c
     res_inf = trainer_inf.validate(step=1)
     assert math.isinf(res_inf["inf_suite"]["psnr"]) and res_inf["inf_suite"]["psnr"] > 0.0
     assert math.isinf(trainer_inf.train_state.best_metrics["inf_suite/psnr"])
-    assert (work_inf / "weights" / "best_inf_suite_psnr.safetensors").is_file()
+    for comp in ("vae", "dit", "dino"):
+        assert (work_inf / "weights" / f"best_inf_suite_psnr_{comp}.safetensors").is_file()
     trainer_inf.accelerator.end_training()  # type: ignore[union-attr]
 
 
@@ -1351,6 +1347,8 @@ except ImportError:
         }
     )
 
+    from tests.dummy_arch import get_dummy_vosr_arch_dict
+
     overrides = [
         "experiment=vosr2_onestep_text",
         f"exp_name={exp_dir.name}",
@@ -1358,8 +1356,10 @@ except ImportError:
         f"work_dir={exp_dir}",
         "scale=1",
         "seed=42",
-        "~arch",
-        "+arch={_target_:tests.dummy_arch.DummySRNet,num_in_ch:3,num_out_ch:3,num_feat:8,num_block:1,scale:1}",
+        "~arch/vae",
+        "~arch/dit",
+        "~arch/dino",
+        f"+arch={_to_hydra_val(get_dummy_vosr_arch_dict())}",
         "~loss",
         "+loss={l1:{weight:1.0,criterion:{_target_:losses.L1Loss,reduction:mean}}}",
         "model.ema.enabled=false",
@@ -1456,4 +1456,5 @@ except ImportError:
     assert (
         f"one_minus_ned: {expected_ned:.4f}" in log_text
     ), f"Missing exact 1-ned in log:\n{log_text}"
-    assert (exp_dir / "weights" / "best_text_odd5_cer.safetensors").is_file()
+    for comp in ("vae", "dit", "dino"):
+        assert (exp_dir / "weights" / f"best_text_odd5_cer_{comp}.safetensors").is_file()

@@ -1,0 +1,12 @@
+_target_: archs.DINOv2Encoder
+model_name: dinov2_vitl14
+image_size: 448
+layer: 17
+
+# DINOv2 hub repository & checkpoint paths
+cache_dir: null
+local_repo: null
+pretrained_path: null
+load_hub_weights: true
+pretrained_strict: true
+pretrained_key: null

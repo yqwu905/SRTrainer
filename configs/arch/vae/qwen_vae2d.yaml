@@ -1,0 +1,18 @@
+_target_: archs.AutoencoderKLQwenImage2D
+base_dim: 96
+z_dim: 16
+dim_mult: [1, 2, 4, 4]
+num_res_blocks: 2
+attn_scales: []
+temperal_downsample: [false, true, true]
+dropout: 0.0
+latents_mean: null
+latents_std: null
+non_linearity: silu
+gradient_checkpointing: false
+
+# Pretrained Qwen-Image 2D VAE (local path/dir or HuggingFace repo + subfolder)
+pretrained_path: CSWRY/VOSR
+subfolder: Qwen-Image-vae-2d
+pretrained_strict: true
+pretrained_key: null

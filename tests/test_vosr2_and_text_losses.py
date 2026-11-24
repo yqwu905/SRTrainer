@@ -1,10 +1,9 @@
-"""Unit and integration tests for VOSR2OneStep, OCRKLLoss, GlyphLoss, and glyph dataset plumbing."""
+"""Unit and integration tests for independent VOSR2 archs, VOSRModel, OCRKLLoss, GlyphLoss, and glyph plumbing."""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
 
 import hydra
 import numpy as np
@@ -12,12 +11,13 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from accelerate import Accelerator
 from omegaconf import OmegaConf
 from PIL import Image
+from safetensors.torch import load_file as load_safetensors_file
 from safetensors.torch import save_file
 
-from archs import VOSR2OneStep
-from archs.vosr2 import AutoencoderKLQwenImage2D, VOSR2DiT
+from archs import AutoencoderKLQwenImage2D, DINOv2Encoder, VOSR2DiT
 from data.mixed_dataset import MixedSRDataset, train_collate_fn
 from engine import TiledInferencer, Trainer
 from losses import GlyphLoss, OCRKLLoss
@@ -27,7 +27,8 @@ from losses.ocr_kl_loss import (
     extract_text_strips,
     load_ppocr_recognizer,
 )
-from models import ModelEMA
+from models import ModelEMA, VOSRModel, VOSRPipeline
+from tests.dummy_arch import DummyDino, DummyDiT, DummyVAE, get_dummy_vosr_arch_dict
 from tests.helpers.fake_backends import (
     TinyRecognizer,
     patch_ppocr_loader,
@@ -51,23 +52,40 @@ def reset_accelerate_state():
     GradientState._reset_state()
 
 
-def _make_tiny_vosr2(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> VOSR2OneStep:
-    out_ch = int(overrides.get("out_channels", 4))
-    z_dims = int(overrides.get("z_dims", 16))
+def _make_tiny_vosr_components(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    out_channels: int = 4,
+    z_dims: int | None = 16,
+    rope_mode: str = "interpolate",
+    use_checkpoint: bool = False,
+    vae_gradient_checkpointing: bool = False,
+    dino_layer: int = 0,
+    dino_num_blocks: int = 2,
+) -> tuple[AutoencoderKLQwenImage2D, VOSR2DiT, DINOv2Encoder | None]:
     patch_vosr2_backends(
         monkeypatch,
-        z_dim=out_ch,
-        dino_dim=z_dims,
+        z_dim=out_channels,
+        dino_dim=z_dims or 16,
         vae_base_dim=8,
         vae_dim_mult=(1, 2, 2, 2),
         vae_num_res_blocks=1,
+        dino_num_blocks=dino_num_blocks,
     )
-    kwargs: dict[str, Any] = dict(
-        scale=4,
+    vae = AutoencoderKLQwenImage2D(
+        base_dim=8,
+        z_dim=out_channels,
+        dim_mult=(1, 2, 2, 2),
+        num_res_blocks=1,
+        latents_mean=[0.0] * out_channels,
+        latents_std=[1.0] * out_channels,
+        gradient_checkpointing=vae_gradient_checkpointing,
+    )
+    dit = VOSR2DiT(
         input_size=8,
         patch_size=2,
-        in_channels=out_ch * 2,
-        out_channels=out_ch,
+        in_channels=out_channels * 2,
+        out_channels=out_channels,
         hidden_size=32,
         depth=2,
         num_heads=4,
@@ -79,18 +97,59 @@ def _make_tiny_vosr2(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> VOSR2
         use_rope=True,
         use_rmsnorm=True,
         wo_shift=False,
-        use_checkpoint=False,
-        noise_input="gaussian",
-        eval_seed=42,
-        dino_size=28,
-        dino_layer=0,
+        use_checkpoint=use_checkpoint,
+        rope_mode=rope_mode,
     )
-    kwargs.update(overrides)
-    return VOSR2OneStep(**kwargs)
+    dino = (
+        DINOv2Encoder(
+            model_name="dinov2_vitl14",
+            image_size=28,
+            layer=dino_layer,
+            load_hub_weights=False,
+        )
+        if z_dims is not None
+        else None
+    )
+    return vae, dit, dino
+
+
+def _make_tiny_vosr_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    scale: int = 4,
+    rope_mode: str = "interpolate",
+    use_checkpoint: bool = False,
+    vae_gradient_checkpointing: bool = False,
+    clamp_decode_in_train: bool = True,
+    trainable: dict[str, bool] | None = None,
+    z_dims: int | None = 16,
+    dino_layer: int = 0,
+    dino_num_blocks: int = 2,
+) -> VOSRPipeline:
+    vae, dit, dino = _make_tiny_vosr_components(
+        monkeypatch,
+        z_dims=z_dims,
+        rope_mode=rope_mode,
+        use_checkpoint=use_checkpoint,
+        vae_gradient_checkpointing=vae_gradient_checkpointing,
+        dino_layer=dino_layer,
+        dino_num_blocks=dino_num_blocks,
+    )
+    return VOSRPipeline(
+        vae=vae,
+        dit=dit,
+        dino=dino,
+        scale=scale,
+        noise_input="gaussian",
+        posterior_mode=True,
+        clamp_decode_in_train=clamp_decode_in_train,
+        eval_seed=42,
+        trainable=trainable,
+    )
 
 
 # ---------------------------------------------------------------------------
-# 1. VOSR2 Architecture, Official Key Parity, EMA Sharing & Gradient Flow
+# 1. Independent VOSR2 Archs, Official Key Parity, VOSRPipeline & Gradient Flow
 # ---------------------------------------------------------------------------
 
 
@@ -117,20 +176,81 @@ def test_vosr2_official_meta_key_counts_and_no_vosr1_r_embedder() -> None:
     assert "_latents_std_inv" not in vae_keys
 
 
+def test_independent_archs_save_load_roundtrip_and_dinov2_raw_vs_wrapped_ckpt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(11)
+    vae, dit, dino = _make_tiny_vosr_components(monkeypatch, dino_layer=0, dino_num_blocks=2)
+    assert dino is not None
+
+    # Independent safetensors round-trip for VAE, DiT, and DINOv2Encoder
+    vae_path = save_safetensors(vae.state_dict(), tmp_path / "vae.safetensors")
+    dit_path = save_safetensors(dit.state_dict(), tmp_path / "dit.safetensors")
+    dino_path = save_safetensors(dino.state_dict(), tmp_path / "dino.safetensors")
+    dino_raw_pth = tmp_path / "dinov2_raw_pretrain.pth"
+    torch.save(dino.encoder.state_dict(), dino_raw_pth)
+
+    vae2 = AutoencoderKLQwenImage2D(
+        base_dim=8,
+        z_dim=4,
+        dim_mult=(1, 2, 2, 2),
+        num_res_blocks=1,
+        latents_mean=[0.0] * 4,
+        latents_std=[1.0] * 4,
+        pretrained_path=vae_path,
+    )
+    dit2 = VOSR2DiT(
+        input_size=8,
+        patch_size=2,
+        in_channels=8,
+        out_channels=4,
+        hidden_size=32,
+        depth=2,
+        num_heads=4,
+        mlp_ratio=2.0,
+        z_dims=16,
+        encdim_ratio=2,
+        pretrained_path=dit_path,
+    )
+    dino_from_wrapped = DINOv2Encoder(
+        image_size=28, layer=0, pretrained_path=dino_path, load_hub_weights=False
+    )
+    dino_from_raw = DINOv2Encoder(
+        image_size=28, layer=0, pretrained_path=dino_raw_pth, load_hub_weights=False
+    )
+
+    for k, v in vae.state_dict().items():
+        assert torch.equal(vae2.state_dict()[k], v)
+    for k, v in dit.state_dict().items():
+        assert torch.equal(dit2.state_dict()[k], v)
+    for k, v in dino.state_dict().items():
+        assert torch.equal(dino_from_wrapped.state_dict()[k], v)
+        assert torch.equal(dino_from_raw.state_dict()[k], v)
+
+    # DINOv2Encoder.freeze_unused_parameters freezes post-layer blocks, norm, and mask_token
+    dino_from_raw.requires_grad_(True)
+    dino_from_raw.freeze_unused_parameters()
+    assert all(p.requires_grad for p in dino_from_raw.encoder.blocks[0].parameters())
+    assert all(not p.requires_grad for p in dino_from_raw.encoder.blocks[1].parameters())
+    assert all(not p.requires_grad for p in dino_from_raw.encoder.norm.parameters())
+    assert dino_from_raw.encoder.mask_token.requires_grad is False
+
+
 @pytest.mark.parametrize("rope_mode", ["interpolate", "extrapolate"])
 @pytest.mark.parametrize("in_hw", [(8, 8), (12, 16), (7, 9)])
-def test_vosr2_onestep_forward_shapes_rectangular_and_deterministic_eval(
+def test_vosr_pipeline_forward_shapes_rectangular_and_deterministic_eval(
     monkeypatch: pytest.MonkeyPatch,
     rope_mode: str,
     in_hw: tuple[int, int],
 ) -> None:
     torch.manual_seed(0)
-    model = _make_tiny_vosr2(monkeypatch, rope_mode=rope_mode).eval()
+    pipeline = _make_tiny_vosr_pipeline(monkeypatch, rope_mode=rope_mode).eval()
     lq = torch.rand(1, 3, *in_hw)
 
     with torch.no_grad():
-        y1 = model(lq)
-        y2 = model(lq)
+        y1 = pipeline(lq)
+        y2 = pipeline(lq)
 
     assert y1.shape == (1, 3, in_hw[0] * 4, in_hw[1] * 4)
     assert torch.isfinite(y1).all()
@@ -138,43 +258,14 @@ def test_vosr2_onestep_forward_shapes_rectangular_and_deterministic_eval(
     assert torch.equal(y1, y2)
 
 
-def test_vosr2_state_dict_exclusivity_ema_backend_sharing_and_tiled_infer(
-    tmp_path: Path,
+def test_vosr_pipeline_tiled_infer_and_replaceable_components(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     torch.manual_seed(1)
-    model = _make_tiny_vosr2(monkeypatch)
+    pipeline = _make_tiny_vosr_pipeline(monkeypatch).eval()
 
-    # state_dict() must contain ONLY DiT weights (never vae.* or dino.*)
-    sd = model.state_dict()
-    assert len(sd) > 0
-    assert not any(k.startswith(("vae.", "dino.", "_backends.")) for k in sd)
-
-    # Strict safetensors save/load round-trip via SRTrainer's load_weights
-    w_path = save_safetensors(sd, tmp_path / "vosr2_tiny.safetensors")
-    model2 = _make_tiny_vosr2(monkeypatch)
-    missing, unexpected = load_weights(model2, w_path, strict=True)
-    assert missing == [] and unexpected == []
-
-    # ModelEMA shares frozen VAE & DINO backends by reference without copying VRAM,
-    # while deep-copying DiT parameters independently.
-    ema = ModelEMA(model, decay=0.99, device="cpu")
-    assert ema.module._backends is model._backends
-    assert ema.module.vae is model.vae
-    assert ema.module.dino is model.dino
-    assert ema.module.x_embedder.proj.weight is not model.x_embedder.proj.weight
-
-    # Frozen backends remain locked in eval & requires_grad=False even after model.train(True)
-    model.train(True)
-    assert model.training is True
-    assert model.vae.training is False
-    assert model.dino is not None and model.dino.training is False
-    assert all(not p.requires_grad for p in model.vae.parameters())
-    assert all(not p.requires_grad for p in model.dino.parameters())
-
-    # TiledInferencer seamlessly runs VOSR2OneStep
     inferencer = TiledInferencer(
-        model=model.eval(),
+        model=pipeline,
         scale=4,
         tile_enabled=True,
         tile_size=8,
@@ -187,41 +278,77 @@ def test_vosr2_state_dict_exclusivity_ema_backend_sharing_and_tiled_infer(
     assert out.shape == (1, 3, 48, 56)
     assert torch.isfinite(out).all()
 
+    # Replaceable arch components: swap Qwen VAE + VOSR2DiT + DINOv2 with completely different modules
+    swapped = VOSRPipeline(
+        vae=DummyVAE(z_dim=4, spatial_compression_ratio=2),
+        dit=DummyDiT(in_channels=8, out_channels=4, patch_size=2, z_dims=8),
+        dino=DummyDino(embed_dim=8, image_size=16, patch_size=4),
+        scale=2,
+    ).eval()
+    with torch.no_grad():
+        swapped_out = swapped(torch.rand(1, 3, 10, 12))
+    assert swapped_out.shape == (1, 3, 20, 24)
+    assert torch.isfinite(swapped_out).all()
+
+    # Also supports dino=None when dit.z_dims is None
+    no_dino = VOSRPipeline(
+        vae=DummyVAE(z_dim=4, spatial_compression_ratio=2),
+        dit=DummyDiT(in_channels=8, out_channels=4, patch_size=2, z_dims=None),
+        dino=None,
+        scale=1,
+    ).eval()
+    with torch.no_grad():
+        no_dino_out = no_dino(torch.rand(1, 3, 11, 13))
+    assert no_dino_out.shape == (1, 3, 11, 13)
+    assert torch.isfinite(no_dino_out).all()
+
 
 @pytest.mark.parametrize("use_checkpoint", [False, True])
-def test_vosr2_gradient_flow_through_frozen_vae_decoder_into_all_dit_blocks(
+def test_vosr_gradient_flow_through_frozen_vae_decoder_into_all_dit_blocks(
     monkeypatch: pytest.MonkeyPatch,
     use_checkpoint: bool,
 ) -> None:
     torch.manual_seed(7)
-    model = _make_tiny_vosr2(
+    pipeline = _make_tiny_vosr_pipeline(
         monkeypatch,
         use_checkpoint=use_checkpoint,
         vae_gradient_checkpointing=use_checkpoint,
         clamp_decode_in_train=False,
-    ).train()
+        trainable={"vae": False, "dit": True, "dino": False},
+    )
+    pipeline.vae.requires_grad_(False).eval()
+    assert pipeline.dino is not None
+    pipeline.dino.requires_grad_(False).eval()
+    pipeline.dit.requires_grad_(True)
+    pipeline.train(True)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    # Frozen components stay eval even after pipeline.train(True)
+    assert pipeline.dit.training is True
+    assert pipeline.vae.training is False
+    assert pipeline.dino.training is False
+
+    opt = torch.optim.AdamW(pipeline.dit.parameters(), lr=1e-2)
     lq = torch.rand(1, 3, 8, 8)
     gt = torch.rand(1, 3, 32, 32)
 
     # Step 1: DiT zero-initializes final_layer.linear, so step 1 updates final_layer.
-    pred1 = model(lq)
+    pred1 = pipeline(lq)
     loss1 = F.l1_loss(pred1, gt)
     loss1.backward()
-    assert model.final_layer.linear.weight.grad is not None
-    assert model.final_layer.linear.weight.grad.abs().sum().item() > 0.0
-    assert all(p.grad is None for p in model.vae.parameters())
-    assert model.dino is not None and all(p.grad is None for p in model.dino.parameters())
+    assert pipeline.dit.final_layer.linear.weight.grad is not None
+    assert pipeline.dit.final_layer.linear.weight.grad.abs().sum().item() > 0.0
+    assert all(p.grad is None for p in pipeline.vae.parameters())
+    assert all(p.grad is None for p in pipeline.dino.parameters())
     opt.step()
     opt.zero_grad(set_to_none=True)
 
-    # Step 2: Now final_layer is non-zero -> gradients must flow through frozen VAE decoder
+    # Step 2: Now final_layer is non-zero -> gradients flow through frozen VAE decoder
     # all the way to x_embedder, t_embedder, mlp_ca, blocks[0], and final_layer.
-    pred2 = model(lq)
+    pred2 = pipeline(lq)
     loss2 = F.l1_loss(pred2, gt)
     loss2.backward()
 
+    dit_params = dict(pipeline.dit.named_parameters())
     for key in (
         "x_embedder.proj.weight",
         "t_embedder.mlp.0.weight",
@@ -231,13 +358,205 @@ def test_vosr2_gradient_flow_through_frozen_vae_decoder_into_all_dit_blocks(
         "blocks.0.mlp.w12.weight",
         "final_layer.linear.weight",
     ):
-        param = dict(model.named_parameters())[key]
+        param = dit_params[key]
         assert param.grad is not None, f"Missing gradient on {key}"
         assert torch.isfinite(param.grad).all(), f"Non-finite gradient on {key}"
         assert param.grad.abs().sum().item() > 0.0, f"Zero gradient on {key}"
 
-    assert all(p.grad is None for p in model.vae.parameters())
-    assert all(p.grad is None for p in model.dino.parameters())
+    assert all(p.grad is None for p in pipeline.vae.parameters())
+    assert all(p.grad is None for p in pipeline.dino.parameters())
+
+
+@pytest.mark.parametrize(
+    "trainable_cfg",
+    [
+        {"vae": False, "dit": True, "dino": False},
+        {"vae": True, "dit": False, "dino": False},
+        {"vae": False, "dit": False, "dino": True},
+        {"vae": True, "dit": True, "dino": False},
+        {"vae": True, "dit": True, "dino": True},
+    ],
+)
+def test_vosr_model_per_arch_trainability_combinations_ema_and_separate_export(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_accelerate_state,
+    trainable_cfg: dict[str, bool],
+) -> None:
+    """Verify every subset of trainable archs updates ONLY selected archs, tracks EMA, and exports separately."""
+    torch.manual_seed(17)
+    patch_vosr2_backends(monkeypatch, z_dim=4, dino_dim=16, dino_num_blocks=2)
+
+    cfg = OmegaConf.create(
+        {
+            "scale": 1,
+            "arch": {
+                "vae": {
+                    "_target_": "archs.AutoencoderKLQwenImage2D",
+                    "base_dim": 8,
+                    "z_dim": 4,
+                    "dim_mult": [1, 2, 2, 2],
+                    "num_res_blocks": 1,
+                    "latents_mean": [0.0, 0.0, 0.0, 0.0],
+                    "latents_std": [1.0, 1.0, 1.0, 1.0],
+                    "gradient_checkpointing": False,
+                    "pretrained_path": None,
+                },
+                "dit": {
+                    "_target_": "archs.VOSR2DiT",
+                    "input_size": 4,
+                    "patch_size": 2,
+                    "in_channels": 8,
+                    "out_channels": 4,
+                    "hidden_size": 32,
+                    "depth": 2,
+                    "num_heads": 4,
+                    "mlp_ratio": 2.0,
+                    "z_dims": 16,
+                    "encdim_ratio": 2,
+                    "use_checkpoint": False,
+                    "pretrained_path": None,
+                },
+                "dino": {
+                    "_target_": "archs.DINOv2Encoder",
+                    "model_name": "dinov2_vitl14",
+                    "image_size": 28,
+                    "layer": 0,
+                    "load_hub_weights": False,
+                    "pretrained_path": None,
+                },
+            },
+            "loss": {
+                "l1": {
+                    "weight": 1.0,
+                    "criterion": {"_target_": "losses.L1Loss", "reduction": "mean"},
+                }
+            },
+            "model": {
+                "_target_": "models.VOSRModel",
+                "scale": 1,
+                "trainable": trainable_cfg,
+                "noise_input": "gaussian",
+                "posterior_mode": True,
+                "clamp_decode_in_train": False,
+                "eval_seed": 42,
+                "ema": {"enabled": True, "decay": 0.9, "warmup_steps": 0},
+                "save_frozen_weights": True,
+            },
+            "optim": {
+                "optimizer": {
+                    "_target_": "torch.optim.AdamW",
+                    "_partial_": True,
+                    "lr": 1e-2,
+                },
+                "scheduler": None,
+            },
+            "trainer": {"grad_clip_norm": 1.0, "compile": False},
+        }
+    )
+
+    acc = Accelerator(cpu=True, mixed_precision="no")
+    model = VOSRModel(cfg)
+    model.setup(acc)
+
+    # Non-zero final_layer so step 1 propagates gradients through frozen DiT into VAE encoder / DINO too!
+    with torch.no_grad():
+        nn.init.normal_(model.dit.final_layer.linear.weight, std=0.1)
+
+    expected_trainable = {k for k, v in trainable_cfg.items() if v}
+    assert set(model.emas.keys()) == expected_trainable
+    assert set(model.trainable_components) == expected_trainable
+
+    init_snap = {
+        comp: {k: v.detach().cpu().clone() for k, v in model.get_component(comp).state_dict().items()}
+        for comp in ("vae", "dit", "dino")
+    }
+
+    batch = {"lq": torch.rand(1, 3, 16, 16), "gt": torch.rand(1, 3, 16, 16)}
+    scalars, stepped = model.train_step(batch, global_step=0)
+    assert stepped is True
+    assert "loss/total" in scalars and "loss/l1" in scalars
+
+    for comp in ("vae", "dit", "dino"):
+        cur_sd = model.get_component(comp).state_dict()
+        changed = any(
+            not torch.equal(cur_sd[k].detach().cpu(), init_snap[comp][k])
+            for k in cur_sd
+            if torch.is_floating_point(cur_sd[k])
+        )
+        if trainable_cfg[comp]:
+            assert changed, f"Trainable component {comp!r} did not update!"
+            assert model.emas[comp].num_updates == 1
+        else:
+            assert not changed, f"Frozen component {comp!r} unexpectedly mutated!"
+            assert model.get_component(comp).training is False
+
+    # Verify separate per-arch export keys and strict reloadability into each arch
+    exported = model.export_weights(acc)
+    expected_keys = {"vae", "dit", "dino"} | {f"{c}_ema" for c in expected_trainable}
+    assert set(exported.keys()) == expected_keys
+    assert len(exported["vae"]) == len(model.vae.state_dict())
+    assert len(exported["dit"]) == len(model.dit.state_dict())
+    assert len(exported["dino"]) == len(model.dino.state_dict())
+
+    # Verify EMA infer network shares frozen components without copying while using EMA for trainable ones
+    infer_ema = model.get_infer_network(use_ema=True)
+    assert isinstance(infer_ema, VOSRPipeline)
+    for comp in ("vae", "dit", "dino"):
+        if trainable_cfg[comp]:
+            assert infer_ema.get_component(comp) is model.emas[comp].module
+        else:
+            assert infer_ema.get_component(comp) is model.get_component(comp)
+
+    # Verify save_frozen_weights=False exports ONLY trainable archs + their EMAs
+    model.save_frozen_weights = False
+    exported_train_only = model.export_weights(acc)
+    assert set(exported_train_only.keys()) == expected_trainable | {
+        f"{c}_ema" for c in expected_trainable
+    }
+    acc.end_training()
+
+
+def test_vosr_model_invalid_trainability_and_missing_dino_fail_fast(
+    reset_accelerate_state,
+) -> None:
+    base_cfg = {
+        "scale": 1,
+        "arch": get_dummy_vosr_arch_dict(with_dino=False),
+        "loss": {
+            "l1": {"weight": 1.0, "criterion": {"_target_": "losses.L1Loss"}},
+        },
+        "model": {
+            "_target_": "models.VOSRModel",
+            "scale": 1,
+            "trainable": {"vae": False, "dit": False, "dino": False},
+            "ema": {"enabled": False},
+        },
+        "optim": {
+            "optimizer": {"_target_": "torch.optim.AdamW", "_partial_": True, "lr": 1e-3},
+            "scheduler": None,
+        },
+    }
+
+    # All components frozen -> fail fast
+    acc = Accelerator(cpu=True, mixed_precision="no")
+    with pytest.raises(ValueError, match="At least one active VOSR arch"):
+        VOSRModel(base_cfg).setup(acc)
+    acc.end_training()
+
+    # trainable.dino=True when arch.dino is None -> fail fast
+    cfg_bad_dino = OmegaConf.create(base_cfg)
+    cfg_bad_dino.model.trainable.dino = True
+    acc2 = Accelerator(cpu=True, mixed_precision="no")
+    with pytest.raises(ValueError, match="trainable.dino"):
+        VOSRModel(cfg_bad_dino).setup(acc2)
+    acc2.end_training()
+
+    # Unknown component in trainable -> fail fast
+    cfg_unknown = OmegaConf.create(base_cfg)
+    cfg_unknown.model.trainable.unknown_arch = True
+    with pytest.raises(ValueError, match="Unknown component"):
+        VOSRModel(cfg_unknown)
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +595,6 @@ def test_ocr_kl_loss_rescaling_frozen_eval_and_gradients(monkeypatch: pytest.Mon
         input_range="0_1",
     )
 
-    # Permanently frozen and eval-locked
     criterion.train(True)
     assert criterion.training is False
     assert criterion.recognizer.training is False
@@ -370,11 +688,9 @@ def test_glyph_loss_exact_score_parity_region_gradients_and_empty_batch(
     loss.backward()
     assert pred.grad is not None and torch.isfinite(pred.grad).all()
     assert pred.grad.abs().sum().item() > 0.0
-    # Lower half (rows 8..16) contains only unsupported '?' -> strictly zero gradient!
     assert torch.count_nonzero(pred.grad[:, :, 8:]) == 0
     assert all(p.grad is None for p in loss_fn.parameters())
 
-    # Empty / unsupported glyph batch still produces connected zero loss
     pred.grad = None
     empty = loss_fn(pred, None, text_lines=[[{"glyphs": [boxes[-1]]}], []])
     assert loss_fn.last_counts == (0, 1)
@@ -403,7 +719,6 @@ def test_mixed_dataset_inline_and_external_glyphs_and_collate(tmp_path: Path) ->
     _write_dummy_rgb_image(hr_dir / "page02.png", (64, 64), seed=3)
     _write_dummy_rgb_image(lr_dir / "page02.png", (16, 16), seed=4)
 
-    # Source 1: inline glyphs in manifest JSON
     manifest1 = tmp_path / "m1.json"
     manifest1.write_text(
         json.dumps(
@@ -421,7 +736,6 @@ def test_mixed_dataset_inline_and_external_glyphs_and_collate(tmp_path: Path) ->
         encoding="utf-8",
     )
 
-    # Source 2: external VOSR annotate_glyphs.py glyphs.json
     manifest2 = tmp_path / "m2.json"
     manifest2.write_text(
         json.dumps([{"gt": "hr/page02.png", "lq": "lr/page02.png"}]),
@@ -474,13 +788,17 @@ def test_hydra_configs_vosr2_ocr_kl_and_glyph(monkeypatch: pytest.MonkeyPatch) -
 
     assert cfg.exp_name == "vosr2_onestep_text"
     assert cfg.scale == 1
-    assert cfg.arch._target_ == "archs.VOSR2OneStep"
-    assert cfg.arch.scale == 1
-    assert cfg.arch.hidden_size == 1536
-    assert cfg.arch.depth == 36
-    assert cfg.arch.num_heads == 24
-    assert cfg.arch.input_size == 64
-    assert cfg.arch.z_dims == 1024
+    assert cfg.model._target_ == "models.VOSRModel"
+    assert cfg.model.scale == 1
+    assert dict(cfg.model.trainable) == {"vae": False, "dit": True, "dino": False}
+    assert cfg.arch.vae._target_ == "archs.AutoencoderKLQwenImage2D"
+    assert cfg.arch.dit._target_ == "archs.VOSR2DiT"
+    assert cfg.arch.dino._target_ == "archs.DINOv2Encoder"
+    assert cfg.arch.dit.hidden_size == 1536
+    assert cfg.arch.dit.depth == 36
+    assert cfg.arch.dit.num_heads == 24
+    assert cfg.arch.dit.input_size == 64
+    assert cfg.arch.dit.z_dims == 1024
     assert set(cfg.loss.keys()) == {"l1", "lpips", "ocr_kl", "glyph"}
     assert cfg.loss.ocr_kl.criterion._target_ == "losses.OCRKLLoss"
     assert cfg.loss.glyph.criterion._target_ == "losses.GlyphLoss"
@@ -492,20 +810,21 @@ def test_hydra_configs_vosr2_ocr_kl_and_glyph(monkeypatch: pytest.MonkeyPatch) -
     assert cfg.trainer.val_tile.overlap == 64
     assert cfg.trainer.val_tile.pad_multiple == 16
 
-    # Default VOSR2OneStep scale=1 (no upscale) produces same-resolution output
-    model_x1 = _make_tiny_vosr2(monkeypatch, scale=1).eval()
-    assert model_x1.scale == 1
+    # Default scale=1 (no upscale) produces same-resolution output
+    pipe_x1 = _make_tiny_vosr_pipeline(monkeypatch, scale=1).eval()
+    assert pipe_x1.scale == 1
     with torch.no_grad():
-        out_x1 = model_x1(torch.rand(1, 3, 19, 23))
+        out_x1 = pipe_x1(torch.rand(1, 3, 19, 23))
     assert out_x1.shape == (1, 3, 19, 23)
 
 
-def test_end_to_end_trainer_vosr2_with_ocr_kl_and_glyph_losses(
+def test_end_to_end_trainer_vosr2_with_ocr_kl_and_glyph_losses_and_per_arch_saving(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     reset_accelerate_state,
 ) -> None:
-    """Mocked-backend plumbing smoke: VOSR2OneStep + L1 + OCRKLLoss + GlyphLoss + EMA + Val + Save."""
+    """Mocked-backend smoke: VOSRModel + QwenVAE/VOSR2DiT/DINOv2 + L1/OCR-KL/Glyph + per-arch saving."""
+    monkeypatch.setenv("ACCELERATE_USE_CPU", "true")
     patch_vosr2_backends(monkeypatch, z_dim=4, dino_dim=16)
     patch_ppocr_loader(monkeypatch, recognizer=TinyRecognizer(num_classes=16))
     patch_textverifier_loader(monkeypatch)
@@ -552,22 +871,40 @@ def test_end_to_end_trainer_vosr2_with_ocr_kl_and_glyph_losses(
             "seed": 42,
             "work_dir": str(work_dir),
             "arch": {
-                "_target_": "archs.VOSR2OneStep",
-                "scale": 4,
-                "input_size": 8,
-                "patch_size": 2,
-                "in_channels": 8,
-                "out_channels": 4,
-                "hidden_size": 32,
-                "depth": 2,
-                "num_heads": 4,
-                "mlp_ratio": 2.0,
-                "z_dims": 16,
-                "encdim_ratio": 2,
-                "use_checkpoint": False,
-                "clamp_decode_in_train": False,
-                "dino_size": 28,
-                "dino_layer": 0,
+                "vae": {
+                    "_target_": "archs.AutoencoderKLQwenImage2D",
+                    "base_dim": 8,
+                    "z_dim": 4,
+                    "dim_mult": [1, 2, 2, 2],
+                    "num_res_blocks": 1,
+                    "latents_mean": [0.0, 0.0, 0.0, 0.0],
+                    "latents_std": [1.0, 1.0, 1.0, 1.0],
+                    "gradient_checkpointing": False,
+                    "pretrained_path": None,
+                },
+                "dit": {
+                    "_target_": "archs.VOSR2DiT",
+                    "input_size": 8,
+                    "patch_size": 2,
+                    "in_channels": 8,
+                    "out_channels": 4,
+                    "hidden_size": 32,
+                    "depth": 2,
+                    "num_heads": 4,
+                    "mlp_ratio": 2.0,
+                    "z_dims": 16,
+                    "encdim_ratio": 2,
+                    "use_checkpoint": False,
+                    "pretrained_path": None,
+                },
+                "dino": {
+                    "_target_": "archs.DINOv2Encoder",
+                    "model_name": "dinov2_vitl14",
+                    "image_size": 28,
+                    "layer": 0,
+                    "load_hub_weights": False,
+                    "pretrained_path": None,
+                },
             },
             "loss": {
                 "l1": {
@@ -592,11 +929,16 @@ def test_end_to_end_trainer_vosr2_with_ocr_kl_and_glyph_losses(
                 },
             },
             "model": {
-                "_target_": "models.SRModel",
+                "_target_": "models.VOSRModel",
+                "scale": 4,
+                "trainable": {"vae": False, "dit": True, "dino": False},
+                "noise_input": "gaussian",
+                "posterior_mode": True,
+                "clamp_decode_in_train": False,
+                "eval_seed": 42,
                 "ema": {"enabled": True, "decay": 0.99, "warmup_steps": 0},
-                "pretrain_path": None,
-                "pretrain_strict": True,
-                "pretrain_key": None,
+                "save_frozen_weights": True,
+                "pretrain": None,
             },
             "data": {
                 "gt_size": 32,
@@ -667,18 +1009,54 @@ def test_end_to_end_trainer_vosr2_with_ocr_kl_and_glyph_losses(
     )
 
     trainer = Trainer(cfg)
-    raw_net = trainer.model.get_infer_network(use_ema=False)
-    assert isinstance(raw_net, VOSR2OneStep)
-    init_final_w = raw_net.final_layer.linear.weight.detach().clone()
-    init_block0_w = raw_net.blocks[0].attn.qkv.weight.detach().clone()
-    init_vae_w = raw_net.vae.decoder.conv_out.weight.detach().clone()
+    assert isinstance(trainer.model, VOSRModel)
+    raw_pipe = trainer.model.get_infer_network(use_ema=False)
+    assert isinstance(raw_pipe, VOSRPipeline)
+    assert isinstance(raw_pipe.vae, AutoencoderKLQwenImage2D)
+    assert isinstance(raw_pipe.dit, VOSR2DiT)
+    assert isinstance(raw_pipe.dino, DINOv2Encoder)
+
+    init_final_w = raw_pipe.dit.final_layer.linear.weight.detach().clone()
+    init_block0_w = raw_pipe.dit.blocks[0].attn.qkv.weight.detach().clone()
+    init_vae_w = raw_pipe.vae.decoder.conv_out.weight.detach().clone()
+    init_dino_w = raw_pipe.dino.encoder.proj.weight.detach().clone()
 
     trainer.fit()
 
     # Step 1 updates final_layer; Step 2 propagates gradients through VAE decoder into blocks[0].
-    assert not torch.equal(raw_net.final_layer.linear.weight.detach(), init_final_w)
-    assert not torch.equal(raw_net.blocks[0].attn.qkv.weight.detach(), init_block0_w)
-    assert torch.equal(raw_net.vae.decoder.conv_out.weight.detach(), init_vae_w)
-    assert (work_dir / "weights" / "iter_000002.safetensors").is_file()
-    assert (work_dir / "weights" / "iter_000002_ema.safetensors").is_file()
-    assert (work_dir / "weights" / "best_val_text_psnr.safetensors").is_file()
+    assert not torch.equal(raw_pipe.dit.final_layer.linear.weight.detach(), init_final_w)
+    assert not torch.equal(raw_pipe.dit.blocks[0].attn.qkv.weight.detach(), init_block0_w)
+    assert torch.equal(raw_pipe.vae.decoder.conv_out.weight.detach(), init_vae_w)
+    assert torch.equal(raw_pipe.dino.encoder.proj.weight.detach(), init_dino_w)
+
+    # Every arch saved separately (iter, latest, ema for trainable dit, and best)
+    weights_dir = work_dir / "weights"
+    for fname in (
+        "iter_000002_vae.safetensors",
+        "iter_000002_dit.safetensors",
+        "iter_000002_dit_ema.safetensors",
+        "iter_000002_dino.safetensors",
+        "latest_vae.safetensors",
+        "latest_dit.safetensors",
+        "latest_dit_ema.safetensors",
+        "latest_dino.safetensors",
+        "best_val_text_psnr_vae.safetensors",
+        "best_val_text_psnr_dit.safetensors",
+        "best_val_text_psnr_dino.safetensors",
+    ):
+        assert (weights_dir / fname).is_file(), f"Missing expected per-arch weight file: {fname}"
+
+    # Verify best_val_text_psnr_dit equals latest_dit_ema (val_use_ema=True) and loads cleanly
+    best_dit_sd = load_safetensors_file(str(weights_dir / "best_val_text_psnr_dit.safetensors"))
+    ema_dit_sd = load_safetensors_file(str(weights_dir / "latest_dit_ema.safetensors"))
+    assert all(torch.equal(best_dit_sd[k], ema_dit_sd[k]) for k in ema_dit_sd)
+
+    vae_reloaded, dit_reloaded, dino_reloaded = _make_tiny_vosr_components(monkeypatch)
+    assert dino_reloaded is not None
+    assert load_weights(vae_reloaded, weights_dir / "latest_vae.safetensors", strict=True) == ([], [])
+    assert load_weights(dit_reloaded, weights_dir / "latest_dit.safetensors", strict=True) == ([], [])
+    assert load_weights(dino_reloaded, weights_dir / "latest_dino.safetensors", strict=True) == ([], [])
+
+    # Verify ModelEMA unit check still works cleanly on standalone VOSR2DiT
+    ema = ModelEMA(dit_reloaded, decay=0.99, device="cpu")
+    assert ema.module.x_embedder.proj.weight is not dit_reloaded.x_embedder.proj.weight

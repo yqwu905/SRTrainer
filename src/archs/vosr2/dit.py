@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+
+from utils.misc import load_weights
 
 __all__ = [
     "RMSNorm",
@@ -456,6 +459,28 @@ class FinalLayer(nn.Module):
         return self.linear(x)
 
 
+def _resolve_dit_checkpoint_file(
+    checkpoint_path_or_repo: str | Path,
+    filename: str = "VOSR2/checkpoints/ema_model.safetensors",
+) -> Path:
+    path = Path(checkpoint_path_or_repo)
+    if path.is_file():
+        return path
+    if path.is_dir():
+        for sub in ("checkpoints", "clean_weights", ""):
+            for name in ("ema_model.safetensors", "model.safetensors"):
+                candidate = path / sub / name if sub else path / name
+                if candidate.is_file():
+                    return candidate
+        raise FileNotFoundError(f"No VOSR2 .safetensors checkpoint found under directory: {path}")
+    repo_str = str(checkpoint_path_or_repo)
+    if path.is_absolute() or repo_str.count("/") != 1:
+        raise FileNotFoundError(f"VOSR2 checkpoint path not found: {checkpoint_path_or_repo}")
+    from huggingface_hub import hf_hub_download
+
+    return Path(hf_hub_download(repo_id=repo_str, filename=filename))
+
+
 class VOSR2DiT(nn.Module):
     """VOSR2 single-step LightningDiT backbone (849 exact official checkpoint keys).
 
@@ -483,6 +508,10 @@ class VOSR2DiT(nn.Module):
         wo_shift: bool = False,
         use_checkpoint: bool = False,
         rope_mode: str = "interpolate",
+        pretrained_path: str | Path | None = None,
+        pretrained_filename: str = "VOSR2/checkpoints/ema_model.safetensors",
+        pretrained_strict: bool = True,
+        pretrained_key: str | None = None,
     ) -> None:
         super().__init__()
         for name, val in (
@@ -589,7 +618,32 @@ class VOSR2DiT(nn.Module):
                 drop=0.0,
             )
 
+        if not isinstance(pretrained_strict, bool):
+            raise ValueError(
+                f"pretrained_strict must be a bool, got {type(pretrained_strict).__name__}: {pretrained_strict!r}."
+            )
+
         self.initialize_weights()
+
+        if pretrained_path is not None:
+            self.load_pretrained(
+                pretrained_path,
+                filename=pretrained_filename,
+                strict=pretrained_strict,
+                key=pretrained_key,
+            )
+
+    def load_pretrained(
+        self,
+        checkpoint_path_or_repo: str | Path,
+        *,
+        filename: str = "VOSR2/checkpoints/ema_model.safetensors",
+        strict: bool = True,
+        key: str | None = None,
+    ) -> tuple[list[str], list[str]]:
+        """Load VOSR2 DiT weights from a local file/dir or HuggingFace repository."""
+        ckpt_file = _resolve_dit_checkpoint_file(checkpoint_path_or_repo, filename=filename)
+        return load_weights(self, ckpt_file, strict=strict, key=key)
 
     def initialize_weights(self) -> None:
         """Apply official DiT / LightningDiT weight initialization."""

@@ -1,11 +1,15 @@
 defaults:
   - _self_
-  - arch: null
+  - model: null
+  - arch/vae: null
+  - arch/dit: null
+  - arch/dino: null
   - infer: default
   - override hydra/job_logging: disabled
 
-# Standalone mode example: arch=vosr2 scale=1 infer.weights_path=/path/to/weights.safetensors
-arch: null
+# Mode 1 (recommended): infer.exp_dir=experiments/vosr2_onestep_text infer.input=/path/to/imgs
+# Mode 2 (standalone): model=vosr arch/vae=qwen_vae2d arch/dit=vosr2_dit arch/dino=dinov2_vitl14 scale=1
+#   infer.weights_path='{vae:/path/vae.safetensors,dit:/path/dit.safetensors,dino:/path/dino.safetensors}'
 scale: 1
 
 hydra:
