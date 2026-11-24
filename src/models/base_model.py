@@ -63,3 +63,11 @@ class BaseModel(ABC):
     def get_lr_dict(self) -> dict[str, float]:
         """Return current learning rates for structured logging and trackers."""
         return {}
+
+    def set_capture_train_visuals(self, enabled: bool, max_images: int = 0) -> None:
+        """Configure whether subsequent ``train_step`` calls snapshot training visuals on CPU."""
+        _ = (enabled, max_images)
+
+    def pop_train_visuals(self) -> dict[str, torch.Tensor] | None:
+        """Return and clear the latest captured training visual tensors (e.g. ``lq``, ``gt``, ``pred``)."""
+        return None

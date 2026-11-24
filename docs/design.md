@@ -741,6 +741,11 @@ tracker_init_kwargs:
 # 续训配置
 resume: null                   # null | auto | /path/to/state_iter_xxxxxx
 
+# 训练抽样图像上报至已启用 Tracker（0 或 null 表示关闭）
+train_log_image_interval: 500
+train_max_log_images: 4
+train_log_image_mode: comparison  # comparison ([LQ_bicubic | Pred | GT]) | separate (lq / pred / gt)
+
 # 验证抽样存图
 val_save_visuals: true
 val_max_save_images: 8
@@ -752,6 +757,7 @@ val_use_ema: true
   `[Iter 005000/300000] lr: 1.98e-4 | loss/total: 0.0412 | loss/l1: 0.0365 | loss/lpips: 0.0940 | grad_norm: 0.42 | 12.4 it/s | mem: 9.8 GB | ETA: 6h 35m`
 - **Accelerate Trackers**：
   - 标量统一通过 `accelerator.log(metrics_dict, step=global_step)` 上报；
+  - 训练图像按 `train_log_image_interval`（及末步）仅在 Rank 0 且启用 Tracker 时从当前步低开销采样最多 `train_max_log_images` 张 `(lq, pred, gt)`，支持 `comparison`（横向拼接 `[LQ_bicubic | Pred | GT]`，标签 `train/lq_pred_gt/sample_XX`）与 `separate`（分图 `train/sample_XX/{lq,pred,gt}`）两种模式，通过 `log_image_dict_to_trackers` 批量写入；
   - 验证图像按已启用的 tracker 类型通过轻量适配封装写入（如 TensorBoard `add_image`、WandB `wandb.Image`），新增其他 tracker 只需补充少量图像写入适配即可。
 
 ---

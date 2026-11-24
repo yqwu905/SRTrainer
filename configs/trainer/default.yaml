@@ -22,6 +22,11 @@ tracker_init_kwargs:
 resume: null                   # null | auto | /path/to/state_iter_xxxxxx
 append_timestamp: false        # If true (and not resuming), Rank 0 appends _YYYYMMDD_HHMMSS & broadcasts work_dir
 
+# Training visuals logged to active Accelerate trackers (0 or null disables)
+train_log_image_interval: 500
+train_max_log_images: 4
+train_log_image_mode: comparison  # comparison ([LQ_bicubic | Pred | GT]) | separate (lq / pred / gt)
+
 # Validation visuals, EMA selection & shared TiledInferencer settings
 val_save_visuals: true
 val_max_save_images: 8

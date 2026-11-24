@@ -166,6 +166,11 @@ class SRModel(BaseModel):
         self._accum_steps: int = 0
         self._accum_total: float = 0.0
         self._accum_losses: dict[str, float] = {}
+        self._capture_visuals_max: int = 0
+        self._captured_lq: list[torch.Tensor] = []
+        self._captured_gt: list[torch.Tensor] = []
+        self._captured_pred: list[torch.Tensor] = []
+        self._captured_count: int = 0
 
     def _require_setup(self) -> Accelerator:
         if not self._is_setup or self.accelerator is None or self.net_g is None or self.optimizer is None:
@@ -176,6 +181,40 @@ class SRModel(BaseModel):
         self._accum_steps = 0
         self._accum_total = 0.0
         self._accum_losses.clear()
+
+    def _clear_train_visuals(self) -> None:
+        self._captured_lq.clear()
+        self._captured_gt.clear()
+        self._captured_pred.clear()
+        self._captured_count = 0
+
+    def set_capture_train_visuals(self, enabled: bool, max_images: int = 0) -> None:
+        """Enable or disable CPU snapshotting of training ``(lq, gt, pred)`` tensors."""
+        if not isinstance(enabled, bool):
+            raise ValueError(f"enabled must be a bool, got {type(enabled).__name__}: {enabled!r}.")
+        if isinstance(max_images, bool) or not isinstance(max_images, int) or max_images < 0:
+            raise ValueError(
+                f"max_images must be a non-negative integer, got {max_images!r}."
+            )
+        target_max = max_images if enabled else 0
+        if target_max == 0:
+            self._capture_visuals_max = 0
+            self._clear_train_visuals()
+        else:
+            self._capture_visuals_max = target_max
+
+    def pop_train_visuals(self) -> dict[str, torch.Tensor] | None:
+        """Return and clear the latest captured training ``lq``, ``gt``, and ``pred`` CPU tensors."""
+        if self._captured_count <= 0:
+            self._clear_train_visuals()
+            return None
+        visuals = {
+            "lq": torch.cat(self._captured_lq, dim=0).contiguous(),
+            "gt": torch.cat(self._captured_gt, dim=0).contiguous(),
+            "pred": torch.cat(self._captured_pred, dim=0).contiguous(),
+        }
+        self._clear_train_visuals()
+        return visuals
 
     def setup(self, accelerator: Accelerator) -> None:
         """Execute strict 7-step model setup lifecycle on ``accelerator``."""
@@ -354,6 +393,7 @@ class SRModel(BaseModel):
         self.optimizer = prepared_optimizer
         self.lr_scheduler = lr_scheduler
         self._reset_loss_accumulators()
+        self._clear_train_visuals()
         self._is_setup = True
 
     def preprocess_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
@@ -388,6 +428,9 @@ class SRModel(BaseModel):
         if gt.device != accelerator.device:
             gt = gt.to(device=accelerator.device, non_blocking=True)
 
+        if self._accum_steps == 0:
+            self._clear_train_visuals()
+
         self.net_g.train()
         try:
             with accelerator.accumulate(self.net_g):
@@ -415,6 +458,44 @@ class SRModel(BaseModel):
 
                 # Accelerate divides loss by gradient_accumulation_steps internally.
                 accelerator.backward(total_loss)
+
+                if (
+                    self._capture_visuals_max > 0
+                    and self._captured_count < self._capture_visuals_max
+                    and lq.ndim == 4
+                    and gt.ndim == 4
+                    and pred.ndim == 4
+                    and lq.shape[1] == 3
+                    and gt.shape[1] == 3
+                    and pred.shape[1] == 3
+                ):
+                    shapes_compatible = (
+                        not self._captured_lq
+                        or (
+                            lq.shape[2:] == self._captured_lq[0].shape[2:]
+                            and gt.shape[2:] == self._captured_gt[0].shape[2:]
+                            and pred.shape[2:] == self._captured_pred[0].shape[2:]
+                        )
+                    )
+                    if shapes_compatible:
+                        need = min(
+                            self._capture_visuals_max - self._captured_count,
+                            int(lq.shape[0]),
+                            int(gt.shape[0]),
+                            int(pred.shape[0]),
+                        )
+                        if need > 0:
+                            with torch.no_grad():
+                                self._captured_lq.append(
+                                    lq[:need].detach().to(device="cpu", dtype=torch.float32)
+                                )
+                                self._captured_gt.append(
+                                    gt[:need].detach().to(device="cpu", dtype=torch.float32)
+                                )
+                                self._captured_pred.append(
+                                    pred[:need].detach().to(device="cpu", dtype=torch.float32)
+                                )
+                            self._captured_count += need
 
                 self._accum_steps += 1
                 self._accum_total += step_total
@@ -453,6 +534,7 @@ class SRModel(BaseModel):
                 return scalars, True
         except BaseException:
             self._reset_loss_accumulators()
+            self._clear_train_visuals()
             raise
 
     def get_infer_network(self, use_ema: bool = True) -> nn.Module:
