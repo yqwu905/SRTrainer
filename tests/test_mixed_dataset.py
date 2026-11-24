@@ -399,7 +399,7 @@ def test_mixed_dataset_tuple_and_flat_indexing(tmp_path: Path) -> None:
     augment_cfg = OmegaConf.create({"hflip": True, "vflip": True, "rot90": True})
 
     with hydra.initialize_config_dir(config_dir=CONFIGS_DIR, version_base=None):
-        train_cfg = hydra.compose(config_name="train")
+        train_cfg = hydra.compose(config_name="train", overrides=["experiment=vosr2_onestep_text"])
         kernel_cfg = train_cfg.data.degradation.kernel_cfg
 
     ds = MixedSRDataset(

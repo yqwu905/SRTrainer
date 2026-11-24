@@ -1,7 +1,9 @@
 defaults:
-  - arch: ???
+  - arch/vae: ???
+  - arch/dit: ???
+  - arch/dino: null
   - loss: ???
-  - model: sr
+  - model: vosr
   - data: mixed_sr
   - optim: adamw_cosine
   - metric: sr_default

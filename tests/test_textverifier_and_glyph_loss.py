@@ -15,7 +15,7 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
 
-from archs import VOSR2OneStep
+from archs import AutoencoderKLQwenImage2D, DINOv2Encoder, VOSR2DiT
 from archs.textverifier import (
     TEXTVERIFIER_BACKBONE_NORM_EPS,
     TEXTVERIFIER_EMBED_DIM,
@@ -27,7 +27,6 @@ from archs.textverifier import (
     ImageProjector,
     TextVerifierVision,
 )
-from archs.vosr2.qwen_vae2d import AutoencoderKLQwenImage2D
 from losses import GlyphLoss, LPIPSLoss, OCRKLLoss
 from losses.textverifier import (
     DEFAULT_TEXTVERIFIER_REPO,
@@ -479,7 +478,7 @@ def test_removed_stub_and_revision_kwargs_raise_type_error() -> None:
     with pytest.raises(TypeError):
         LPIPSMetric(net="alex", pretrained=False)  # type: ignore[call-arg]
 
-    for bad_vosr_kwargs in (
+    for bad_dit_kwargs in (
         {"vae_pretrained": False},
         {"dino_pretrained": False},
         {"vae_base_dim": 8},
@@ -487,7 +486,10 @@ def test_removed_stub_and_revision_kwargs_raise_type_error() -> None:
         {"vae_num_res_blocks": 1},
     ):
         with pytest.raises(TypeError):
-            VOSR2OneStep(**bad_vosr_kwargs)  # type: ignore[arg-type]
+            VOSR2DiT(**bad_dit_kwargs)  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError):
+        DINOv2Encoder(pretrained=False)  # type: ignore[call-arg]
 
     with pytest.raises(TypeError):
         AutoencoderKLQwenImage2D.from_pretrained("CSWRY/VOSR", revision="main")  # type: ignore[call-arg]

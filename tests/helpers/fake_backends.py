@@ -137,15 +137,28 @@ def patch_textverifier_loader(
     return resolved
 
 
+class _FakeDinoBlock(nn.Module):
+    """Tiny token-mixing block so CLS and patch tokens both receive gradients when trainable."""
+
+    def __init__(self, embed_dim: int) -> None:
+        super().__init__()
+        self.fc = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + 0.1 * self.fc(x + x.mean(dim=1, keepdim=True))
+
+
 class FakeDinoV2(nn.Module):
     """Lightweight DINOv2 test double implementing the exact real DINOv2 extraction protocol."""
 
     def __init__(self, embed_dim: int = 16, patch_size: int = 14, num_blocks: int = 2) -> None:
         super().__init__()
+        self.embed_dim = embed_dim
         self.patch_size = patch_size
         self.proj = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size, bias=True)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.blocks = nn.ModuleList([nn.Identity() for _ in range(num_blocks)])
+        self.mask_token = nn.Parameter(torch.zeros(1, embed_dim))
+        self.blocks = nn.ModuleList([_FakeDinoBlock(embed_dim) for _ in range(num_blocks)])
         self.norm = nn.LayerNorm(embed_dim)
 
     def prepare_tokens_with_masks(self, x: torch.Tensor) -> torch.Tensor:
@@ -164,7 +177,8 @@ def patch_vosr2_backends(
     vae_num_res_blocks: int = 1,
     dino_num_blocks: int = 2,
 ) -> None:
-    """Monkeypatch VOSR2's frozen Qwen VAE and DINOv2 loaders for offline CPU tests."""
+    """Monkeypatch Qwen VAE HF loader and DINOv2 torch.hub loader for offline CPU tests."""
+    orig_load_pretrained = AutoencoderKLQwenImage2D.load_pretrained
 
     def _fake_vae_from_pretrained(
         cls: type[AutoencoderKLQwenImage2D],
@@ -184,14 +198,39 @@ def patch_vosr2_backends(
             gradient_checkpointing=gradient_checkpointing,
         )
 
-    def _fake_load_dinov2(**_kwargs: Any) -> nn.Module:
-        return FakeDinoV2(embed_dim=dino_dim, num_blocks=dino_num_blocks).eval().requires_grad_(False)
+    def _fake_vae_load_pretrained(
+        self: AutoencoderKLQwenImage2D,
+        pretrained_path_or_repo: str | Path,
+        *,
+        subfolder: str | None = None,
+        strict: bool = True,
+        key: str | None = None,
+    ) -> tuple[list[str], list[str]]:
+        if Path(pretrained_path_or_repo).exists():
+            return orig_load_pretrained(
+                self,
+                pretrained_path_or_repo,
+                subfolder=subfolder,
+                strict=strict,
+                key=key,
+            )
+        return [], []
+
+    def _fake_load_dinov2_backbone(**_kwargs: Any) -> nn.Module:
+        return FakeDinoV2(embed_dim=dino_dim, num_blocks=dino_num_blocks)
 
     monkeypatch.setattr(
-        "archs.vosr2.model.AutoencoderKLQwenImage2D.from_pretrained",
+        "archs.vosr2.qwen_vae2d.AutoencoderKLQwenImage2D.from_pretrained",
         classmethod(_fake_vae_from_pretrained),
     )
-    monkeypatch.setattr("archs.vosr2.model._load_dinov2", _fake_load_dinov2)
+    monkeypatch.setattr(
+        "archs.vosr2.qwen_vae2d.AutoencoderKLQwenImage2D.load_pretrained",
+        _fake_vae_load_pretrained,
+    )
+    monkeypatch.setattr(
+        "archs.vosr2.dinov2._load_dinov2_backbone",
+        _fake_load_dinov2_backbone,
+    )
 
 
 class TinyRecognizer(nn.Module):

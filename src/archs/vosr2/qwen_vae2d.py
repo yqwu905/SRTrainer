@@ -13,6 +13,8 @@ import torch.nn.functional as F
 from safetensors.torch import load_file
 from torch.utils.checkpoint import checkpoint
 
+from utils.misc import load_weights
+
 __all__ = [
     "AutoencoderKLQwenImage2D",
     "DiagonalGaussianDistribution",
@@ -222,7 +224,7 @@ class MidBlock2D(nn.Module):
 
 
 class Encoder2D(nn.Module):
-    """2D Qwen-Image VAE encoder (8x spatial compression)."""
+    """2D Qwen-Image VAE encoder (8x spatial compression) with optional activation checkpointing."""
 
     def __init__(
         self,
@@ -233,6 +235,7 @@ class Encoder2D(nn.Module):
         attn_scales: Sequence[float] = (),
         dropout: float = 0.0,
         non_linearity: str = "silu",
+        gradient_checkpointing: bool = False,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -241,6 +244,7 @@ class Encoder2D(nn.Module):
         self.num_res_blocks = num_res_blocks
         self.attn_scales = list(attn_scales)
         self.nonlinearity = _get_activation(non_linearity)
+        self.gradient_checkpointing = bool(gradient_checkpointing)
 
         dims = [dim * u for u in [1] + self.dim_mult]
         scale = 1.0
@@ -263,10 +267,18 @@ class Encoder2D(nn.Module):
         self.conv_out = nn.Conv2d(out_dim, z_dim, kernel_size=3, padding=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        use_ckpt = self.gradient_checkpointing and torch.is_grad_enabled() and (
+            x.requires_grad or self.training
+        )
         x = self.conv_in(x)
-        for layer in self.down_blocks:
-            x = layer(x)
-        x = self.mid_block(x)
+        if use_ckpt:
+            for layer in self.down_blocks:
+                x = checkpoint(layer, x, use_reentrant=False)
+            x = checkpoint(self.mid_block, x, use_reentrant=False)
+        else:
+            for layer in self.down_blocks:
+                x = layer(x)
+            x = self.mid_block(x)
         x = self.norm_out(x)
         x = self.nonlinearity(x)
         return self.conv_out(x)
@@ -346,7 +358,9 @@ class Decoder2D(nn.Module):
         self.conv_out = nn.Conv2d(out_dim, 3, kernel_size=3, padding=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        use_ckpt = self.gradient_checkpointing and x.requires_grad and torch.is_grad_enabled()
+        use_ckpt = self.gradient_checkpointing and torch.is_grad_enabled() and (
+            x.requires_grad or self.training
+        )
         x = self.conv_in(x)
         if use_ckpt:
             x = checkpoint(self.mid_block, x, use_reentrant=False)
@@ -359,6 +373,69 @@ class Decoder2D(nn.Module):
         x = self.norm_out(x)
         x = self.nonlinearity(x)
         return self.conv_out(x)
+
+
+def _resolve_qwen_vae_files(
+    pretrained_path_or_repo: str | Path,
+    *,
+    subfolder: str | None = None,
+) -> tuple[Path | None, Path]:
+    """Resolve ``(config_path, weights_path)`` for a local file/dir or HuggingFace Hub repo."""
+    raw_path = Path(pretrained_path_or_repo)
+    if subfolder is not None and raw_path.exists():
+        candidate = raw_path / subfolder
+        if candidate.exists():
+            raw_path = candidate
+
+    config_path: Path | None = None
+    weights_path: Path | None = None
+
+    if raw_path.is_file():
+        weights_path = raw_path
+        sibling_cfg = raw_path.parent / "config.json"
+        if sibling_cfg.is_file():
+            config_path = sibling_cfg
+    elif raw_path.is_dir():
+        cfg_candidate = raw_path / "config.json"
+        if cfg_candidate.is_file():
+            config_path = cfg_candidate
+        for name in ("diffusion_pytorch_model.safetensors", "model.safetensors"):
+            w_candidate = raw_path / name
+            if w_candidate.is_file():
+                weights_path = w_candidate
+                break
+        if weights_path is None:
+            raise FileNotFoundError(
+                f"No safetensors weights found in Qwen VAE directory: {raw_path}"
+            )
+    else:
+        repo_str = str(pretrained_path_or_repo)
+        if raw_path.is_absolute() or repo_str.count("/") != 1:
+            raise FileNotFoundError(
+                f"Qwen VAE checkpoint path not found: {pretrained_path_or_repo}"
+            )
+        from huggingface_hub import snapshot_download
+
+        prefix = f"{subfolder.strip('/')}/" if subfolder else ""
+        snapshot_dir = Path(
+            snapshot_download(
+                repo_id=repo_str,
+                allow_patterns=[
+                    f"{prefix}config.json",
+                    f"{prefix}diffusion_pytorch_model.safetensors",
+                ],
+            )
+        )
+        sub_dir = snapshot_dir / subfolder if subfolder else snapshot_dir
+        config_path = sub_dir / "config.json"
+        weights_path = sub_dir / "diffusion_pytorch_model.safetensors"
+        if not config_path.is_file() or not weights_path.is_file():
+            raise FileNotFoundError(
+                f"Incomplete Qwen VAE snapshot under {sub_dir} from {repo_str}."
+            )
+
+    assert weights_path is not None
+    return config_path, weights_path
 
 
 class AutoencoderKLQwenImage2D(nn.Module):
@@ -381,14 +458,25 @@ class AutoencoderKLQwenImage2D(nn.Module):
         latents_std: Sequence[float] | None = None,
         non_linearity: str = "silu",
         gradient_checkpointing: bool = False,
+        pretrained_path: str | Path | None = None,
+        subfolder: str | None = None,
+        pretrained_strict: bool = True,
+        pretrained_key: str | None = None,
     ) -> None:
         super().__init__()
+        if not isinstance(pretrained_strict, bool):
+            raise ValueError(
+                f"pretrained_strict must be a bool, got {type(pretrained_strict).__name__}: {pretrained_strict!r}."
+            )
+
         self.base_dim = int(base_dim)
         self.z_dim = int(z_dim)
         self.dim_mult = list(dim_mult)
         self.num_res_blocks = int(num_res_blocks)
         self.temperal_downsample = list(temperal_downsample)
         self.spatial_compression_ratio = 2 ** (len(self.dim_mult) - 1)
+        self._explicit_latents_mean = latents_mean is not None
+        self._explicit_latents_std = latents_std is not None
 
         self.encoder = Encoder2D(
             dim=self.base_dim,
@@ -398,6 +486,7 @@ class AutoencoderKLQwenImage2D(nn.Module):
             attn_scales=attn_scales,
             dropout=dropout,
             non_linearity=non_linearity,
+            gradient_checkpointing=gradient_checkpointing,
         )
         self.quant_conv = nn.Conv2d(self.z_dim * 2, self.z_dim * 2, kernel_size=1)
         self.post_quant_conv = nn.Conv2d(self.z_dim, self.z_dim, kernel_size=1)
@@ -431,27 +520,74 @@ class AutoencoderKLQwenImage2D(nn.Module):
         else:
             std_vals = [float(v) for v in latents_std]
 
-        if len(mean_vals) != self.z_dim or len(std_vals) != self.z_dim:
+        self._set_latent_stats(mean_vals, std_vals)
+
+        if pretrained_path is not None:
+            self.load_pretrained(
+                pretrained_path,
+                subfolder=subfolder,
+                strict=pretrained_strict,
+                key=pretrained_key,
+            )
+
+    def _set_latent_stats(self, mean_vals: Sequence[float], std_vals: Sequence[float]) -> None:
+        means = [float(v) for v in mean_vals]
+        stds = [float(v) for v in std_vals]
+        if len(means) != self.z_dim or len(stds) != self.z_dim:
             raise ValueError(
-                f"latents_mean ({len(mean_vals)}) and latents_std ({len(std_vals)}) "
+                f"latents_mean ({len(means)}) and latents_std ({len(stds)}) "
                 f"must have length z_dim={self.z_dim}."
             )
-        if any(s <= 0.0 for s in std_vals):
+        if any(s <= 0.0 for s in stds):
             raise ValueError("All latents_std entries must be strictly positive.")
 
-        self.latents_mean = mean_vals
-        self.latents_std = std_vals
+        self.latents_mean = means
+        self.latents_std = stds
         # Non-persistent buffers keep state_dict() strictly identical to the 186-key official file.
-        self.register_buffer(
-            "_latents_mean",
-            torch.tensor(mean_vals, dtype=torch.float32).view(1, self.z_dim, 1, 1),
-            persistent=False,
+        mean_t = torch.tensor(means, dtype=torch.float32).view(1, self.z_dim, 1, 1)
+        std_inv_t = (1.0 / torch.tensor(stds, dtype=torch.float32)).view(1, self.z_dim, 1, 1)
+        if "_latents_mean" in self._buffers and self._buffers["_latents_mean"] is not None:
+            dev = self._buffers["_latents_mean"].device
+            self._buffers["_latents_mean"] = mean_t.to(device=dev)
+            self._buffers["_latents_std_inv"] = std_inv_t.to(device=dev)
+        else:
+            self.register_buffer("_latents_mean", mean_t, persistent=False)
+            self.register_buffer("_latents_std_inv", std_inv_t, persistent=False)
+
+    def load_pretrained(
+        self,
+        pretrained_path_or_repo: str | Path,
+        *,
+        subfolder: str | None = None,
+        strict: bool = True,
+        key: str | None = None,
+    ) -> tuple[list[str], list[str]]:
+        """Load Qwen VAE weights from a local ``.safetensors``/``.pth`` file, directory, or HF repo."""
+        raw_path = Path(pretrained_path_or_repo)
+        if raw_path.is_file():
+            return load_weights(self, raw_path, strict=strict, key=key)
+
+        config_path, weights_path = _resolve_qwen_vae_files(
+            pretrained_path_or_repo,
+            subfolder=subfolder,
         )
-        self.register_buffer(
-            "_latents_std_inv",
-            (1.0 / torch.tensor(std_vals, dtype=torch.float32)).view(1, self.z_dim, 1, 1),
-            persistent=False,
-        )
+        if config_path is not None and config_path.is_file():
+            raw_cfg = json.loads(config_path.read_text(encoding="utf-8"))
+            cfg_mean = raw_cfg.get("latents_mean")
+            cfg_std = raw_cfg.get("latents_std")
+            new_mean = (
+                cfg_mean
+                if (not self._explicit_latents_mean and isinstance(cfg_mean, list) and len(cfg_mean) == self.z_dim)
+                else self.latents_mean
+            )
+            new_std = (
+                cfg_std
+                if (not self._explicit_latents_std and isinstance(cfg_std, list) and len(cfg_std) == self.z_dim)
+                else self.latents_std
+            )
+            self._set_latent_stats(new_mean, new_std)
+
+        return load_weights(self, weights_path, strict=strict, key=key)
 
     def encode_posterior(self, x: torch.Tensor) -> DiagonalGaussianDistribution:
         h = self.quant_conv(self.encoder(x))
@@ -500,58 +636,10 @@ class AutoencoderKLQwenImage2D(nn.Module):
         gradient_checkpointing: bool = False,
     ) -> AutoencoderKLQwenImage2D:
         """Load ``AutoencoderKLQwenImage2D`` from a local directory/file or HuggingFace Hub repo."""
-        raw_path = Path(pretrained_path_or_repo)
-        if subfolder is not None and raw_path.exists():
-            candidate = raw_path / subfolder
-            if candidate.exists():
-                raw_path = candidate
-
-        config_path: Path | None = None
-        weights_path: Path | None = None
-
-        if raw_path.is_file():
-            weights_path = raw_path
-            sibling_cfg = raw_path.parent / "config.json"
-            if sibling_cfg.is_file():
-                config_path = sibling_cfg
-        elif raw_path.is_dir():
-            cfg_candidate = raw_path / "config.json"
-            if cfg_candidate.is_file():
-                config_path = cfg_candidate
-            for name in ("diffusion_pytorch_model.safetensors", "model.safetensors"):
-                w_candidate = raw_path / name
-                if w_candidate.is_file():
-                    weights_path = w_candidate
-                    break
-            if weights_path is None:
-                raise FileNotFoundError(
-                    f"No safetensors weights found in Qwen VAE directory: {raw_path}"
-                )
-        else:
-            repo_str = str(pretrained_path_or_repo)
-            if raw_path.is_absolute() or repo_str.count("/") != 1:
-                raise FileNotFoundError(
-                    f"Qwen VAE checkpoint path not found: {pretrained_path_or_repo}"
-                )
-            from huggingface_hub import snapshot_download
-
-            prefix = f"{subfolder.strip('/')}/" if subfolder else ""
-            snapshot_dir = Path(
-                snapshot_download(
-                    repo_id=repo_str,
-                    allow_patterns=[
-                        f"{prefix}config.json",
-                        f"{prefix}diffusion_pytorch_model.safetensors",
-                    ],
-                )
-            )
-            sub_dir = snapshot_dir / subfolder if subfolder else snapshot_dir
-            config_path = sub_dir / "config.json"
-            weights_path = sub_dir / "diffusion_pytorch_model.safetensors"
-            if not config_path.is_file() or not weights_path.is_file():
-                raise FileNotFoundError(
-                    f"Incomplete Qwen VAE snapshot under {sub_dir} from {repo_str}."
-                )
+        config_path, weights_path = _resolve_qwen_vae_files(
+            pretrained_path_or_repo,
+            subfolder=subfolder,
+        )
 
         kwargs: dict[str, Any] = {}
         if config_path is not None:
@@ -574,7 +662,6 @@ class AutoencoderKLQwenImage2D(nn.Module):
 
         kwargs["gradient_checkpointing"] = gradient_checkpointing
         model = cls(**kwargs)
-        assert weights_path is not None
         state = load_file(str(weights_path), device="cpu")
         model.load_state_dict(state, strict=True)
         return model
