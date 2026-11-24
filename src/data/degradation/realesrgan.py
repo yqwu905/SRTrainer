@@ -187,7 +187,12 @@ def _filter2d_tiled(
         for j0 in range(0, w, tile):
             j1 = min(j0 + tile, w)
             window = img_pad[:, :, i0 : i1 + kh - 1, j0 : j1 + kw - 1]
-            out[:, :, i0:i1, j0:j1] = _depthwise_conv(window.contiguous(), weight, b, c)
+            # _depthwise_conv 返回 [1, b*c, h_tile, w_tile]（batch 展平进 channel），
+            # 必须先还原成 [b, c, h_tile, w_tile] 再写回 out；否则 b>1 时维度对不上
+            # （b=1 时靠 broadcast 侥幸通过，但语义也不对）。
+            out[:, :, i0:i1, j0:j1] = _depthwise_conv(window.contiguous(), weight, b, c).view(
+                b, c, i1 - i0, j1 - j0
+            )
     return out
 
 

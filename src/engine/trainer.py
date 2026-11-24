@@ -461,10 +461,9 @@ class Trainer:
                 automatic_checkpoint_naming=False,
             )
             ddp_kwargs = DistributedDataParallelKwargs(
-                # 默认 True：VOSR2PBOneStep 当前有两处参数不参与反向图
-                #   context_embedder.*（joint_attention_dim 占位，永远不会被调用）
-                #   adapter.*（DINO 条件分支在 _PBBackends.extract_cond 的 no_grad 里）
-                # 把它们从接收梯度的集合里去掉后，可改设为 False 去掉每步的图遍历开销。
+                # 默认 True 最稳（保守，兼容任意自定义 arch）。
+                # 若所用 arch 已通过 ``freeze_unused_parameters()`` 冻结前向旁路参数
+                # （如 VOSR2PBDiT 的 ``context_embedder``），可设为 False 去掉每步图遍历开销。
                 find_unused_parameters=bool(
                     OmegaConf.select(
                         cfg_oc, "trainer.ddp_find_unused_parameters", default=True
