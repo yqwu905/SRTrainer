@@ -129,8 +129,79 @@ def _slice_kernel(
     return tensor[mask_k].to(device=target_device, dtype=torch.float32)
 
 
+# ---------------------------------------------------------------------------
+# NPU depthwise-conv fast path limits (measured on Ascend 910B3 / torch_npu 2.9)
+#
+# ``F.conv2d`` with ``groups == C`` (i.e. cin=1 per group) has a fast AICore path
+# only for *small* kernels and *small* spatial extents:
+#
+#   kernel 3x3, 5x5  @ any H,W        -> 1-2 ms @ 2048^2
+#   kernel 7x7+      @ 2048^2         -> 1112 ms  (7x7), 2756 ms (11x11)
+#   kernel 21x21     @ H,W <= 640     -> 2 ms
+#   kernel 21x21     @ 768^2 / 1024^2 -> 1404 ms / 2494 ms
+#   kernel 21x21     @ 2048^2         -> 9970 ms
+#
+# i.e. beyond these limits the op silently falls into a ~3 orders-of-magnitude
+# slower path (per-tile im2col / AICPU style), which made the 2048^2 Real-ESRGAN
+# degradation the dominant cost of a training step. Tiling the *output* and
+# keeping every conv call inside the fast window restores the fast path while
+# producing bit-identical results (disjoint output tiles on the padded input).
+# Doc/limit source: see ``filter2d`` docstring + ``docs/`` perf notes.
+_DEPTHWISE_FAST_MAX_KERNEL: int = 5
+_DEPTHWISE_FAST_MAX_HW: int = 640
+_DEPTHWISE_TILE: int = 512
+
+
+def _depthwise_conv(img_pad: torch.Tensor, weight: torch.Tensor, b: int, c: int) -> torch.Tensor:
+    """Grouped (per-channel) conv2d on an already padded ``[B, C, Hp, Wp]`` tensor."""
+    hp, wp = int(img_pad.shape[-2]), int(img_pad.shape[-1])
+    img_grouped = img_pad.reshape(1, b * c, hp, wp)
+    return F.conv2d(img_grouped, weight, groups=b * c)
+
+
+def _needs_tiling(device_type: str, hp: int, wp: int, kh: int, kw: int) -> bool:
+    """Return True when the depthwise conv must be split to stay on the NPU fast path."""
+    if device_type != "npu":
+        return False
+    if max(kh, kw) <= _DEPTHWISE_FAST_MAX_KERNEL and max(hp, wp) <= _DEPTHWISE_FAST_MAX_HW:
+        return False
+    return max(hp, wp) > _DEPTHWISE_FAST_MAX_HW or max(kh, kw) > _DEPTHWISE_FAST_MAX_KERNEL
+
+
+def _filter2d_tiled(
+    img_pad: torch.Tensor,
+    weight: torch.Tensor,
+    b: int,
+    c: int,
+    h: int,
+    w: int,
+    kh: int,
+    kw: int,
+) -> torch.Tensor:
+    """Exact tiled depthwise conv: disjoint output tiles, halo taken from the padded input."""
+    # Conv input window is tile + (k - 1); keep it below the fast-path extent.
+    tile = min(_DEPTHWISE_TILE, max(64, _DEPTHWISE_FAST_MAX_HW - (max(kh, kw) - 1)))
+    out = img_pad.new_empty((b, c, h, w))
+    for i0 in range(0, h, tile):
+        i1 = min(i0 + tile, h)
+        for j0 in range(0, w, tile):
+            j1 = min(j0 + tile, w)
+            window = img_pad[:, :, i0 : i1 + kh - 1, j0 : j1 + kw - 1]
+            # _depthwise_conv 返回 [1, b*c, h_tile, w_tile]（batch 展平进 channel），
+            # 必须先还原成 [b, c, h_tile, w_tile] 再写回 out；否则 b>1 时维度对不上
+            # （b=1 时靠 broadcast 侥幸通过，但语义也不对）。
+            out[:, :, i0:i1, j0:j1] = _depthwise_conv(window.contiguous(), weight, b, c).view(
+                b, c, i1 - i0, j1 - j0
+            )
+    return out
+
+
 def filter2d(img: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
     """Apply per-sample 2D spatial filtering via grouped ``F.conv2d`` with reflect->replicate padding.
+
+    On NPU the conv is automatically split into disjoint output tiles so that every
+    ``F.conv2d`` call stays inside the AICore fast window (small kernel / small
+    spatial extent); the result is numerically identical to the untiled version.
 
     Args:
         img: 4D tensor of shape ``[B, C, H, W]``.
@@ -169,11 +240,34 @@ def filter2d(img: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
     pw1, pw2 = (kw - 1) // 2, kw // 2
     pad_mode = "replicate" if (pw1 >= w or pw2 >= w or ph1 >= h or ph2 >= h) else "reflect"
     img_pad = F.pad(img, (pw1, pw2, ph1, ph2), mode=pad_mode)
-
-    img_grouped = img_pad.reshape(1, b * c, h + kh - 1, w + kw - 1)
+    hp, wp = h + kh - 1, w + kw - 1
     weight = k.unsqueeze(1).expand(b, c, kh, kw).reshape(b * c, 1, kh, kw).contiguous()
-    out = F.conv2d(img_grouped, weight, groups=b * c)
+
+    if _needs_tiling(img.device.type, hp, wp, kh, kw):
+        return _filter2d_tiled(img_pad, weight, b, c, h, w, kh, kw)
+
+    out = _depthwise_conv(img_pad, weight, b, c)
     return out.view(b, c, h, w)
+
+
+def _poisson_unit_noise(img_c: torch.Tensor, vals: float) -> torch.Tensor:
+    """Return ``torch.poisson(img_c * vals) / vals - img_c`` without leaving the device.
+
+    ``aten::poisson`` has no NPU kernel: on Ascend it silently falls back to CPU
+    (a full D2H -> CPU sample -> H2D round-trip), measured at ~0.7 s per 2048^2 RGB
+    call — i.e. ~1.4 s per training step with the 2nd-order pipeline.
+
+    For large rates (here ``lambda = img_c * 256 >= 30`` for any pixel above 0.12)
+    a Gaussian with the *same first two moments* is an excellent approximation of
+    Poisson:  ``Poisson(l) ~ l + sqrt(l) * N(0,1)``, relative distribution error
+    O(1/sqrt(l)) <= 0.12 quantization level at l=40 and < 0.02 level at l=256.
+    Dividing by ``vals`` and subtracting ``img_c`` gives exactly
+    ``randn * sqrt(img_c / vals)`` with mean 0 and variance ``img_c / vals``,
+    matching the original shot-noise statistics to first order.
+    """
+    if img_c.device.type == "npu":
+        return torch.randn_like(img_c) * torch.sqrt(img_c.clamp_min(0.0) / vals)
+    return torch.poisson(img_c * vals) / vals - img_c
 
 
 class USMSharp(nn.Module):
@@ -482,14 +576,14 @@ class RealESRGANDegrader(nn.Module):
             )
             return (x + torch.where(gray_mask, noise_gray, noise_rgb)).clamp(0.0, 1.0)
 
-        # Clamp strictly to [0, 1] before torch.poisson so bicubic negative undershoot never NaNs.
+        # Clamp strictly to [0, 1] before Poisson so bicubic negative undershoot never NaNs.
         img_c = x.clamp(0.0, 1.0)
         vals = 256.0
         gray = (
             0.299 * img_c[:, 0:1] + 0.587 * img_c[:, 1:2] + 0.114 * img_c[:, 2:3]
         ).clamp(0.0, 1.0)
-        noise_rgb = torch.poisson(img_c * vals) / vals - img_c
-        noise_gray = (torch.poisson(gray * vals) / vals - gray).expand_as(img_c)
+        noise_rgb = _poisson_unit_noise(img_c, vals)
+        noise_gray = _poisson_unit_noise(gray, vals).expand_as(img_c)
         scale = torch.empty((b, 1, 1, 1), device=device, dtype=torch.float32).uniform_(
             poisson_scale_range[0], poisson_scale_range[1]
         )

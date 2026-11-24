@@ -1,6 +1,9 @@
 # @package _global_
 defaults:
-  - override /arch: vosr2
+  - override /model: vosr
+  - override /arch/vae: qwen_vae2d
+  - override /arch/dit: vosr2_dit
+  - override /arch/dino: dinov2_vitl14
   - override /data: mixed_sr
   - override /loss: vosr2_text
   - override /optim: adamw_cosine

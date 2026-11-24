@@ -31,23 +31,23 @@ def _get_ema_module(ema: Any) -> Any:
     )
 
 
-def test_t1_base_model_abc_and_srmodel_setup_contracts(
+def test_t1_base_model_abc_and_vosr_model_setup_contracts(
     e2e_workdir: dict[str, Path],
     paired_train_source_factory: Callable[..., dict[str, Any]],
     minimal_train_cfg_factory: Callable[..., Any],
 ) -> None:
-    """F41, F43: BaseModel ABC enforcement and SRModel 7-step setup/export/lr contracts."""
+    """F41, F43: BaseModel ABC enforcement and VOSRModel setup/export/lr contracts."""
     import hydra.utils
     import torch
     import torch.nn as nn
     from accelerate import Accelerator
 
-    from models import BaseModel, SRModel
+    from models import BaseModel, VOSRModel
 
     assert issubclass(BaseModel, abc.ABC)
-    src = paired_train_source_factory(name="srmodel_src", n_samples=2, lq_h=16, lq_w=16, scale=2)
+    src = paired_train_source_factory(name="vosr_src", n_samples=2, lq_h=16, lq_w=16, scale=2)
     cfg = minimal_train_cfg_factory(
-        e2e_workdir["work"] / "srmodel_setup",
+        e2e_workdir["work"] / "vosr_setup",
         [src],
         val_suites={},
         has_degradation=False,
@@ -78,7 +78,7 @@ def test_t1_base_model_abc_and_srmodel_setup_contracts(
     assert dummy.preprocess_batch(sentinel_batch) is sentinel_batch
 
     model = hydra.utils.instantiate(cfg.model, cfg=cfg, _recursive_=False)
-    assert isinstance(model, SRModel)
+    assert isinstance(model, VOSRModel)
     assert isinstance(model, BaseModel)
 
     accelerator = Accelerator(cpu=True, mixed_precision="no")
@@ -95,8 +95,8 @@ def test_t1_base_model_abc_and_srmodel_setup_contracts(
     assert all(isinstance(k, str) and isinstance(v, float) and v > 0.0 for k, v in lr_dict.items())
 
     exported = model.export_weights(accelerator)
-    assert "net_g" in exported and "net_g_ema" in exported
-    for tag in ("net_g", "net_g_ema"):
+    assert {"vae", "dit", "dit_ema", "dino"} == set(exported.keys())
+    for tag in ("vae", "dit", "dit_ema", "dino"):
         sd = exported[tag]
         assert len(sd) > 0
         for k, tensor in sd.items():
@@ -172,7 +172,7 @@ def test_t1_model_ema_fp32_update_warmup_and_state_roundtrip() -> None:
         assert torch.equal(restored, expected)
 
 
-def test_t1_srmodel_named_loss_dict_raw_values_and_skip_nonpositive(
+def test_t1_vosr_model_named_loss_dict_raw_values_and_skip_nonpositive(
     e2e_workdir: dict[str, Path],
     paired_train_source_factory: Callable[..., dict[str, Any]],
     minimal_train_cfg_factory: Callable[..., Any],
@@ -183,7 +183,7 @@ def test_t1_srmodel_named_loss_dict_raw_values_and_skip_nonpositive(
     from accelerate import Accelerator
     from tests.helpers.fake_backends import patch_lpips_offline
 
-    from models import SRModel
+    from models import VOSRModel
 
     patch_lpips_offline(monkeypatch)
     # gt_size=64 so AlexNet LPIPS runs cleanly at 64x64.
@@ -217,7 +217,7 @@ def test_t1_srmodel_named_loss_dict_raw_values_and_skip_nonpositive(
     )
 
     accelerator = Accelerator(cpu=True, mixed_precision="no")
-    model = SRModel(cfg)
+    model = VOSRModel(cfg)
     model.setup(accelerator)
 
     torch.manual_seed(12)
@@ -240,41 +240,41 @@ def test_t1_srmodel_named_loss_dict_raw_values_and_skip_nonpositive(
     assert scalars["loss/total"] == pytest.approx(expected_total, rel=1e-4)
 
 
-def test_t1_srmodel_pretrain_safetensors_and_basicsr_pth_cloned_to_ema(
+def test_t1_vosr_model_pretrain_safetensors_and_basicsr_pth_cloned_to_ema(
     e2e_workdir: dict[str, Path],
     paired_train_source_factory: Callable[..., dict[str, Any]],
     minimal_train_cfg_factory: Callable[..., Any],
 ) -> None:
-    """F43: Pretrain (.safetensors and BasicSR .pth params_ema) loads into net_g and clones to EMA."""
+    """F43: Per-arch pretrain (.safetensors and .pth params_ema) loads into DiT and clones to EMA."""
     import torch
     from accelerate import Accelerator
     from accelerate.state import AcceleratorState, GradientState
-    from tests.dummy_arch import DummySRNet
+    from tests.dummy_arch import DummyDiT
 
-    from models import SRModel
+    from models import VOSRModel
     from utils.misc import save_safetensors
 
     torch.manual_seed(21)
-    ref_net = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
+    ref_dit = DummyDiT(in_channels=8, out_channels=4, patch_size=2, hidden_ch=8, z_dims=8)
     ref_sd = {
         k: (
             (v.detach().cpu().clone() + 0.123)
             if torch.is_floating_point(v)
             else v.detach().cpu().clone()
         )
-        for k, v in ref_net.state_dict().items()
+        for k, v in ref_dit.state_dict().items()
     }
     zero_sd = {k: torch.zeros_like(v) for k, v in ref_sd.items()}
 
-    st_path = e2e_workdir["work"] / "pretrain_ref.safetensors"
+    st_path = e2e_workdir["work"] / "pretrain_dit_ref.safetensors"
     save_safetensors(ref_sd, st_path)
 
-    pth_path = e2e_workdir["work"] / "pretrain_basicsr.pth"
+    pth_path = e2e_workdir["work"] / "pretrain_dit_basicsr.pth"
     torch.save({"params_ema": ref_sd, "params": zero_sd}, pth_path)
 
     src = paired_train_source_factory(name="pretrain_src", n_samples=2, lq_h=16, lq_w=16, scale=2)
 
-    # Case (a): .safetensors pretrain loaded into both main net and EMA before step 0.
+    # Case (a): .safetensors pretrain loaded into both main DiT and EMA before step 0.
     cfg_st = minimal_train_cfg_factory(
         e2e_workdir["work"] / "run_pretrain_st",
         [src],
@@ -282,17 +282,17 @@ def test_t1_srmodel_pretrain_safetensors_and_basicsr_pth_cloned_to_ema(
         has_degradation=False,
         use_ema=True,
     )
-    cfg_st.model.pretrain_path = str(st_path)
-    cfg_st.model.pretrain_strict = True
-    cfg_st.model.pretrain_key = None
+    cfg_st.model.pretrain.dit.path = str(st_path)
+    cfg_st.model.pretrain.dit.strict = True
+    cfg_st.model.pretrain.dit.key = None
 
     acc1 = Accelerator(cpu=True, mixed_precision="no")
-    model_st = SRModel(cfg_st)
+    model_st = VOSRModel(cfg_st)
     model_st.setup(acc1)
     for use_ema in (False, True):
-        net_sd = model_st.get_infer_network(use_ema=use_ema).state_dict()
+        dit_sd = model_st.get_infer_network(use_ema=use_ema).dit.state_dict()
         for k, expected in ref_sd.items():
-            assert torch.allclose(net_sd[k].cpu(), expected, atol=1e-6), (
+            assert torch.allclose(dit_sd[k].cpu(), expected, atol=1e-6), (
                 f"Safetensors pretrain mismatch (use_ema={use_ema}) on key {k}"
             )
 
@@ -300,7 +300,7 @@ def test_t1_srmodel_pretrain_safetensors_and_basicsr_pth_cloned_to_ema(
     AcceleratorState._reset_state(reset_partial_state=True)
     GradientState._reset_state()
 
-    # Case (b): BasicSR .pth with pretrain_key="params_ema".
+    # Case (b): BasicSR .pth with key="params_ema".
     cfg_pth = minimal_train_cfg_factory(
         e2e_workdir["work"] / "run_pretrain_pth",
         [src],
@@ -308,22 +308,22 @@ def test_t1_srmodel_pretrain_safetensors_and_basicsr_pth_cloned_to_ema(
         has_degradation=False,
         use_ema=True,
     )
-    cfg_pth.model.pretrain_path = str(pth_path)
-    cfg_pth.model.pretrain_strict = True
-    cfg_pth.model.pretrain_key = "params_ema"
+    cfg_pth.model.pretrain.dit.path = str(pth_path)
+    cfg_pth.model.pretrain.dit.strict = True
+    cfg_pth.model.pretrain.dit.key = "params_ema"
 
     acc2 = Accelerator(cpu=True, mixed_precision="no")
-    model_pth = SRModel(cfg_pth)
+    model_pth = VOSRModel(cfg_pth)
     model_pth.setup(acc2)
     for use_ema in (False, True):
-        net_sd = model_pth.get_infer_network(use_ema=use_ema).state_dict()
+        dit_sd = model_pth.get_infer_network(use_ema=use_ema).dit.state_dict()
         for k, expected in ref_sd.items():
-            assert torch.allclose(net_sd[k].cpu(), expected, atol=1e-6), (
-                f"BasicSR .pth pretrain_key='params_ema' mismatch (use_ema={use_ema}) on key {k}"
+            assert torch.allclose(dit_sd[k].cpu(), expected, atol=1e-6), (
+                f"BasicSR .pth key='params_ema' mismatch (use_ema={use_ema}) on key {k}"
             )
 
 
-def test_t1_srmodel_grad_accum_and_lr_scheduler_step_cadence(
+def test_t1_vosr_model_grad_accum_and_lr_scheduler_step_cadence(
     e2e_workdir: dict[str, Path],
     paired_train_source_factory: Callable[..., dict[str, Any]],
     minimal_train_cfg_factory: Callable[..., Any],
@@ -332,7 +332,7 @@ def test_t1_srmodel_grad_accum_and_lr_scheduler_step_cadence(
     import torch
     from accelerate import Accelerator
 
-    from models import SRModel
+    from models import VOSRModel
 
     base_lr = 2.0e-4
     eta_min = 1.0e-6
@@ -353,7 +353,7 @@ def test_t1_srmodel_grad_accum_and_lr_scheduler_step_cadence(
     cfg.optim.scheduler.eta_min = eta_min
 
     accelerator = Accelerator(cpu=True, mixed_precision="no", gradient_accumulation_steps=2)
-    model = SRModel(cfg)
+    model = VOSRModel(cfg)
     model.setup(accelerator)
 
     # Guardrail #5: lr_scheduler must NEVER be passed to accelerator.prepare().
@@ -590,16 +590,25 @@ def test_t1_trainer_fit_full_dir_layout_train_log_visuals_and_best(
     )
     assert pattern.search(log_text), f"train.log did not match expected format:\n{log_text}"
 
-    # Track 1 & Track 2 checkpoints + best weights.
+    # Track 1 & Track 2 checkpoints + best weights (saved per independent arch).
     assert (work_dir / "checkpoints" / "state_iter_000002").is_dir()
     assert (work_dir / "checkpoints" / "state_iter_000004").is_dir()
     for fname in (
-        "iter_000002.safetensors",
-        "iter_000004.safetensors",
-        "iter_000004_ema.safetensors",
-        "latest.safetensors",
-        "latest_ema.safetensors",
-        "best_set5_psnr.safetensors",
+        "iter_000002_vae.safetensors",
+        "iter_000002_dit.safetensors",
+        "iter_000002_dit_ema.safetensors",
+        "iter_000002_dino.safetensors",
+        "iter_000004_vae.safetensors",
+        "iter_000004_dit.safetensors",
+        "iter_000004_dit_ema.safetensors",
+        "iter_000004_dino.safetensors",
+        "latest_vae.safetensors",
+        "latest_dit.safetensors",
+        "latest_dit_ema.safetensors",
+        "latest_dino.safetensors",
+        "best_set5_psnr_vae.safetensors",
+        "best_set5_psnr_dit.safetensors",
+        "best_set5_psnr_dino.safetensors",
     ):
         assert (work_dir / "weights" / fname).is_file(), f"Missing {fname}"
 
@@ -729,5 +738,6 @@ def test_t1_tools_train_cli_subprocess_cwd_independent(
     assert not (work_dir / ".hydra").exists(), "Hydra output_subdir must be null"
     assert (work_dir / "config_resolved.yaml").is_file()
     assert (work_dir / "train.log").is_file()
-    assert (work_dir / "weights" / "latest.safetensors").is_file()
+    for fname in ("latest_vae.safetensors", "latest_dit.safetensors", "latest_dino.safetensors"):
+        assert (work_dir / "weights" / fname).is_file()
     assert (work_dir / "checkpoints" / "state_iter_000002").is_dir()

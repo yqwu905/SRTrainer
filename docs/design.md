@@ -126,46 +126,59 @@ SRTrainer/
 ├── docs/
 │   └── design.md                        # 本文档
 ├── configs/                             # Hydra 分级配置根目录
-│   ├── train.yaml                       # 训练主入口配置
+│   ├── train.yaml                       # 训练主入口配置（要求指定 experiment 或 arch/* + loss）
 │   ├── infer.yaml                       # 推理主入口配置
-│   ├── arch/                            # 网络结构原子配置（仅保留轻量占位配置）
-│   │   └── toy_x4.yaml
-│   ├── loss/                            # 损失函数组合配置（仅内置 L1Loss 与 LPIPSLoss）
+│   ├── arch/                            # 独立解耦的网络子架构配置组
+│   │   ├── vae/
+│   │   │   └── qwen_vae2d.yaml          # archs.AutoencoderKLQwenImage2D（Qwen-Image 2D VAE）
+│   │   ├── dit/
+│   │   │   └── vosr2_dit.yaml           # archs.VOSR2DiT（VOSR2 单步隐空间 DiT）
+│   │   └── dino/
+│   │       └── dinov2_vitl14.yaml       # archs.DINOv2Encoder（可选视觉特征编码器）
+│   ├── loss/                            # 损失函数组合配置（L1 / LPIPS / OCR-KL / Glyph）
 │   │   ├── l1.yaml
-│   │   └── l1_lpips.yaml
+│   │   ├── l1_lpips.yaml
+│   │   ├── ocr_kl.yaml
+│   │   ├── glyph.yaml
+│   │   └── vosr2_text.yaml
 │   ├── model/                           # 训练范式配置
-│   │   └── sr.yaml
+│   │   └── vosr.yaml                    # models.VOSRModel（可替换子架构、逐组件 trainable/pretrain/EMA）
 │   ├── data/                            # 训练数据集与在线退化配置
-│   │   ├── mixed_sr_x4.yaml
+│   │   ├── mixed_sr.yaml
 │   │   └── degradation/
 │   │       └── realesrgan_2nd.yaml
 │   ├── optim/                           # 优化器与学习率调度配置
 │   │   ├── adamw_cosine.yaml
 │   │   └── adam_multistep.yaml
 │   ├── metric/                          # 验证集套件与评测指标组合配置（含各验证集数据源与对应指标）
-│   │   └── sr_default.yaml
+│   │   ├── sr_default.yaml
+│   │   └── text_ocr.yaml
 │   ├── trainer/                         # Trainer / Accelerate / 日志 / 保存配置
 │   │   └── default.yaml
 │   ├── infer/                           # 推理切块与分布式配置
 │   │   └── default.yaml
 │   └── experiment/                      # 实验配置层（支持多级继承与局部微调）
-│       ├── base_sr_x4.yaml
-│       └── exp01_toy_mixed_x4.yaml
+│       └── vosr2_onestep_text.yaml
 ├── src/
 │   ├── engine/                          # 训练/验证/推理引擎层
 │   │   ├── __init__.py
 │   │   ├── trainer.py                   # Trainer：外层循环、验证、Checkpoint、Tracker
 │   │   ├── state.py                     # TrainState（注册到 Accelerate checkpoint）
-│   │   ├── checkpointer.py              # 双轨保存（save_state + safetensors + best）
+│   │   ├── checkpointer.py              # 双轨保存（save_state + 按架构 safetensors + best）
 │   │   └── inferencer.py                # TiledInferencer（验证阶段与 tools/infer.py 共享）
 │   ├── models/                          # 算法范式层（通过 Hydra _target_ 实例化）
-│   │   ├── __init__.py                  # 重导出 BaseModel, SRModel, ModelEMA
+│   │   ├── __init__.py                  # 重导出 BaseModel, VOSRModel, VOSRPipeline, ModelEMA
 │   │   ├── base_model.py                # 抽象基类（预留多网络/多优化器/Diffusion 扩展点）
-│   │   ├── sr_model.py                  # 第一版主力：单网络 + Loss字典 + EMA + GPU退化
+│   │   ├── vosr_model.py                # VOSRModel + VOSRPipeline：组装 vae/dit/可选 dino、逐组件 trainable/pretrain/EMA 与独立导出
 │   │   └── ema.py                       # 可注册到 Accelerate Checkpoint 的 ModelEMA
-│   ├── archs/                           # 神经网络结构（纯 PyTorch nn.Module，占位实现）
-│   │   ├── __init__.py                  # 短路径重导出：archs.ToyModel
-│   │   └── toy_model.py                 # 轻量占位超分网络 ToyModel
+│   ├── archs/                           # 独立神经网络子架构（纯 PyTorch nn.Module）
+│   │   ├── __init__.py                  # 短路径重导出：AutoencoderKLQwenImage2D, VOSR2DiT, DINOv2Encoder
+│   │   ├── textverifier.py              # GlyphLoss 使用的纯 PyTorch TextVerifier Stage-3 编码器
+│   │   └── vosr2/
+│   │       ├── __init__.py
+│   │       ├── qwen_vae2d.py            # AutoencoderKLQwenImage2D（独立 VAE Encoder+Decoder）
+│   │       ├── dit.py                   # VOSR2DiT（独立单步 DiT）
+│   │       └── dinov2.py                # DINOv2Encoder（独立可选 DINOv2 特征提取器）
 │   ├── losses/                          # 损失函数模块（纯 PyTorch nn.Module，仅内置 L1 与 LPIPS）
 │   │   ├── __init__.py                  # 重导出 L1Loss, LPIPSLoss
 │   │   ├── pixel_loss.py                # L1Loss
@@ -418,15 +431,20 @@ class BaseModel(ABC):
         """返回当前学习率字典用于日志上报。"""
 ```
 
-### 5.2 `SRModel` 的核心细节
+### 5.2 `VOSRModel` 与 `VOSRPipeline` 的核心细节
 
-1. **任意可组合 Loss 字典**：遍历 `cfg.loss`，框架内置 `L1Loss` 与 `LPIPSLoss`，同时支持用户通过 Hydra `_target_` 自由扩展任意自定义 Loss，自动记录每个分项的原始值与加权总值（`loss/l1`、`loss/lpips`、`loss/total`），跳过 `weight <= 0` 的项。
-2. **Accelerate + `lr_scheduler` 关键规范**：
+1. **三架构解耦与自由替换**：`VOSRModel` 从 `cfg.arch.{vae,dit,dino}` 分别实例化三个独立子架构（其中 `dino` 为可选，设为 `null` 或 `~arch/dino` 即无条件推理），并组装为统一的 `VOSRPipeline(nn.Module)`（对外暴露 `[0, 1] -> [0, 1]` 契约，兼容单次 DDP 前向与 `TiledInferencer`）。任意满足接口契约的自定义 VAE / Denoiser / 视觉编码器均可通过修改对应 `configs/arch/<role>/*.yaml` 直接替换。
+2. **逐组件 `trainable` 与 `pretrain` 控制**：
+   - 通过 `model.trainable.{vae,dit,dino}` 独立配置各组件是否参与训练（至少一个为 `true`；对未启用的 `dino` 不可设为 `true`）；
+   - 冻结组件在 `VOSRPipeline.train()` 中始终保持 `.eval()`，且在仅可训练部分组件时避免多余梯度与显存开销；可训练 `DINOv2Encoder` 会自动冻结 `layer` 之后的未使用参数以兼容 DDP；
+   - `model.pretrain.{vae,dit,dino}` 支持为每个子架构分别指定本地 `.safetensors`/`.pth` 预训练权重、`strict` 与 `key`，并在指定本地覆盖权重时自动跳过默认远端预训练加载。
+3. **任意可组合 Loss 字典**：遍历 `cfg.loss`，框架内置 `L1Loss`、`LPIPSLoss`、`OCRKLLoss` 与 `GlyphLoss`，同时支持用户通过 Hydra `_target_` 自由扩展任意自定义 Loss，自动记录每个分项的原始值与加权总值（`loss/l1`、`loss/lpips`、`loss/total`），跳过 `weight <= 0` 的项。
+4. **Accelerate + `lr_scheduler` 关键规范**：
    - 在 Accelerate 中，若将 `lr_scheduler` 传给 `accelerator.prepare()`，Accelerate 默认会在每步按 `num_processes` 倍调用 `scheduler.step()`，极易导致多卡时学习率提前衰减到 0。
    - 因此本框架对 Iteration 级 `lr_scheduler` **不传入 `prepare()`**，而是直接通过 `accelerator.register_for_checkpointing(lr_scheduler)` 纳入断点保存，并在 `sync_gradients and not accelerator.optimizer_step_was_skipped` 时精确步进 1 次（FP16 出现梯度溢出跳过 step 时也不会错误推进 LR！）。
-3. **ModelEMA 设计**：
-   - 维护 FP32 阴影权重副本，支持 `decay`（默认 `0.999`）与可选前期 warmup decay（防止前几千步 EMA 滞后）；
-   - 实现 `state_dict()` / `load_state_dict()` 并注册到 `accelerator.register_for_checkpointing(ema)`，确保断点续训时 EMA 权重 100% 连续。
+5. **按可训练组件维护 FP32 `ModelEMA`**：
+   - 仅针对 `trainable[comp] == True` 的组件创建 FP32 `ModelEMA`（不给冻结组件浪费阴影显存），并在 `get_infer_network(use_ema=True)` 时无缝拼装 EMA 子模块与冻结子模块；
+   - 每个 `ModelEMA` 均实现 `state_dict()` / `load_state_dict()` 并按组件顺序注册到 `accelerator.register_for_checkpointing()`，确保断点续训时 EMA 权重 100% 连续。
 
 ### 5.3 `Trainer` 外层循环与 `TrainState`
 
@@ -692,24 +710,29 @@ experiments/exp01_toy_l1_lpips_x4/
 ├── checkpoints/                         # 【轨道 1】完整续训快照（滚动保留最近 N 份）
 │   ├── state_iter_005000/               # accelerator.save_state() 目录（含 model/optim/scheduler/ema/rng/train_state）
 │   └── state_iter_010000/
-├── weights/                             # 【轨道 2】轻量纯模型权重（safetensors，供推理与二阶段微调）
-│   ├── iter_005000.safetensors          # 保存 net_g（若启用 EMA 则同时保存 iter_005000_ema.safetensors 或合并 key）
-│   ├── iter_010000.safetensors
-│   ├── latest.safetensors               # 指向最新权重（复制或软链）
-│   └── best_set5_psnr.safetensors       # 自动维护最优指标权重
+├── weights/                             # 【轨道 2】按架构独立导出的纯模型权重（safetensors，供推理与二阶段微调）
+│   ├── iter_005000_vae.safetensors      # 各活跃子架构分别落盘（save_frozen_weights=true 时包含冻结组件）
+│   ├── iter_005000_dit.safetensors
+│   ├── iter_005000_dit_ema.safetensors  # 仅对启用 EMA 的可训练组件保存 *_ema.safetensors
+│   ├── iter_005000_dino.safetensors
+│   ├── latest_vae.safetensors           # 各组件最新权重副本（原子覆盖）
+│   ├── latest_dit.safetensors
+│   ├── latest_dit_ema.safetensors
+│   ├── latest_dino.safetensors
+│   ├── best_realce_lpips_vae.safetensors   # 最优验证步按组件保存推理权重（由 Checkpointer.save_best_weights 写出）
+│   ├── best_realce_lpips_dit.safetensors
+│   └── best_realce_lpips_dino.safetensors
 └── visuals/                             # 验证阶段抽样可视化结果
     └── iter_010000/
-        └── set5/
-            └── baby_cmp.png
+        └── realce/
+            └── sample_cmp.png
 ```
 
 ### 8.2 权重格式与加载策略
 
-- **纯模型权重格式**：默认采用 `safetensors`（零反序列化安全风险、mmap 极速加载）；为了同时兼顾单文件清爽与 EMA 共存，约定单次保存输出：
-  - `iter_010000.safetensors`（标准 `net_g` 权重）
-  - `iter_010000_ema.safetensors`（若启用 EMA，额外导出干净的 EMA 权重；且 `best_<val>_<metric>.safetensors` 直接保存参与验证胜出的对应权重，推理开箱即用）。
+- **按架构分文件导出（`safetensors`）**：默认采用 `safetensors`（零反序列化安全风险、mmap 极速加载）。`VOSRModel.export_weights()` 按组件键（`vae`、`dit`、`dit_ema`、`dino` 等）返回干净的无前缀 `state_dict`；验证刷新主指标时，`VOSRModel.export_infer_weights()` + `Checkpointer.save_best_weights()` 同步写出一致的 `best_<val>_<metric>_<arch>.safetensors`，`tools/infer.py` Mode 1 自动按统一前缀与 EMA 策略恢复全部子架构权重。
 - **Pretrain 初始化 vs Resume 续训**：
-  - `model.pretrain_path`: 加载纯模型权重（`.safetensors` 或兼容读取外部 `.pth`），支持 `pretrain_strict: true/false` 与 `pretrain_key`（如兼容 BasicSR 常见 `params_ema` / `params` 字典键），从 `global_step = 0` 开始新训练；
+  - `model.pretrain.{vae,dit,dino}.{path,strict,key}`: 为每个子架构分别加载纯模型权重（`.safetensors` 或兼容读取外部 `.pth`），从 `global_step = 0` 开始新训练；
   - `trainer.resume`: 设为 `"auto"` 时自动检索 `checkpoints/state_iter_*` 中步数最大的目录，或指定具体状态目录路径，通过 `accelerator.load_state()` 精确恢复全部训练状态。
 
 ---
@@ -769,10 +792,10 @@ val_use_ema: true
 推理仅提供命令行脚本入口 `tools/infer.py`（底层复用 `TiledInferencer`，不再单独封装 Python SDK `SRPredictor`），支持两种配置模式：
 
 1. **实验目录自动还原模式（推荐，零配置漂移）**：
-   - 仅需提供 `exp_dir=experiments/exp01_toy_l1_lpips_x4`（可选指定 `weights_path`）；
-   - 自动加载 `${exp_dir}/config_resolved.yaml` 中的 `arch`、`scale` 与 `data.gt_size`，自动找到对应权重（未显式指定时优先 `best_*` → `latest_ema` → `latest`）。
+   - 仅需提供 `infer.exp_dir=experiments/vosr2_onestep_text`（可选通过 `infer.weights_path.{vae,dit,dino}` 覆盖单个组件权重）；
+   - 自动加载 `${exp_dir}/config_resolved.yaml` 中的 `arch.{vae,dit,dino}`、`scale` 与 `data.gt_size`，为全部活跃组件按统一优先级还原权重（未显式指定时优先同一套 `best_*_{arch}` → `latest_{arch}_ema` → `latest_{arch}` → 冻结组件 `model.pretrain.{arch}.path` 或架构内置预训练权重）。
 2. **独立推理配置模式**：
-   - 通过 `infer.yaml` 显式指定 `arch` 配置组、`scale`、`weights_path` 与 `tile` 参数，脱离训练实验目录即可独立运行或推理第三方模型权重。
+   - 通过 `infer.yaml` 显式指定 `arch/vae`、`arch/dit`（及可选 `arch/dino`）、`scale`、组件级 `infer.weights_path` 映射与 `tile` 参数，脱离训练实验目录即可独立组合并推理任意子架构权重。
 
 ### 10.2 按训练输入尺寸自动 Tile 切块与 Overlap 无缝融合
 

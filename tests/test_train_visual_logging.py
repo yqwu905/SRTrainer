@@ -24,7 +24,8 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 from torch import nn
 
 from engine import Trainer
-from models import BaseModel, SRModel
+from models import BaseModel, VOSRModel
+from tests.dummy_arch import get_dummy_vosr_arch_dict
 from utils.logging import log_image_dict_to_trackers, log_images_to_trackers
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -111,7 +112,7 @@ def _make_train_cfg(
     train_log_image_interval: Any = 2,
     train_max_log_images: Any = 2,
     train_log_image_mode: Any = "comparison",
-    model_target: str = "models.SRModel",
+    model_target: str = "models.VOSRModel",
 ) -> DictConfig:
     sources: list[dict[str, Any]]
     if use_degradation:
@@ -151,14 +152,7 @@ def _make_train_cfg(
             "seed": 42,
             "output_root": str(work_dir.parent),
             "work_dir": str(work_dir),
-            "arch": {
-                "_target_": "tests.dummy_arch.DummySRNet",
-                "num_in_ch": 3,
-                "num_out_ch": 3,
-                "num_feat": 8,
-                "num_block": 1,
-                "scale": scale,
-            },
+            "arch": get_dummy_vosr_arch_dict(),
             "loss": {
                 "l1": {
                     "weight": 1.0,
@@ -167,10 +161,14 @@ def _make_train_cfg(
             },
             "model": {
                 "_target_": model_target,
+                "scale": scale,
+                "trainable": {"vae": False, "dit": True, "dino": False},
                 "ema": {"enabled": False, "decay": 0.99, "warmup_steps": 0},
-                "pretrain_path": None,
-                "pretrain_strict": True,
-                "pretrain_key": None,
+                "pretrain": {
+                    "vae": {"path": None, "strict": True, "key": None},
+                    "dit": {"path": None, "strict": True, "key": None},
+                    "dino": {"path": None, "strict": True, "key": None},
+                },
             },
             "data": {
                 "gt_size": gt_size,
@@ -396,15 +394,15 @@ def test_log_image_dict_to_trackers_batching_and_nan_safety(tmp_path: Path) -> N
 
 
 # ---------------------------------------------------------------------------
-# 3. SRModel visual capture unit tests (disabled, grad_accum, stale clear)
+# 3. VOSRModel visual capture unit tests (disabled, grad_accum, stale clear)
 # ---------------------------------------------------------------------------
 
 
-def test_sr_model_train_visual_capture_and_grad_accum(tmp_path: Path) -> None:
+def test_vosr_model_train_visual_capture_and_grad_accum(tmp_path: Path) -> None:
     ds = _create_train_manifests(tmp_path, scale=2)
-    cfg = _make_train_cfg(tmp_path / "sr_unit", ds, scale=2, grad_accum=2)
+    cfg = _make_train_cfg(tmp_path / "vosr_unit", ds, scale=2, grad_accum=2)
     acc = Accelerator(mixed_precision="no", cpu=True, gradient_accumulation_steps=2)
-    model = SRModel(cfg)
+    model = VOSRModel(cfg)
     model.setup(acc)
 
     with pytest.raises(ValueError, match="enabled"):

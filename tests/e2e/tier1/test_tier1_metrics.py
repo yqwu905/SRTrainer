@@ -347,7 +347,7 @@ def test_t1_d08_hydra_val_suites_config_structure_and_co_location(
 
     from metrics import BaseMetric
 
-    cfg = hydra_compose("train")
+    cfg = hydra_compose("train", overrides=["experiment=vosr2_onestep_text"])
     assert "val_suites" in cfg.metric
     assert not ({"val", "val_datasets", "val_suites"} & set(cfg.data.keys()))
 

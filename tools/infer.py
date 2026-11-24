@@ -19,6 +19,11 @@ from omegaconf import DictConfig, OmegaConf
 from torch import nn
 
 from engine.inferencer import TiledInferencer
+from models.vosr_model import (
+    VOSRPipeline,
+    _clone_arch_cfg_skip_pretrained,
+    _load_component_weights,
+)
 from utils.config import load_resolved_config, normalize_mixed_precision
 from utils.image import IMAGE_EXTENSIONS, load_image, save_image
 from utils.logging import setup_logger
@@ -33,6 +38,7 @@ __all__ = [
     "main",
     "normalize_save_format",
     "normalize_suffix",
+    "resolve_exp_component_weights",
     "resolve_exp_weights",
     "resolve_infer_config",
     "run_infer",
@@ -40,6 +46,8 @@ __all__ = [
 
 _CONFIG_DIR = str(Path(__file__).resolve().parents[1] / "configs")
 ALLOWED_SAVE_FORMATS: frozenset[str] = frozenset({"png", "jpg"})
+_VOSR_COMPONENTS: tuple[str, ...] = ("vae", "dit", "dino")
+_VOSR_REQUIRED_COMPONENTS: frozenset[str] = frozenset({"vae", "dit"})
 
 
 @dataclass(frozen=True)
@@ -53,6 +61,9 @@ class ResolvedInferConfig:
     weights_path: Path
     weights_key: str | None
     exp_dir: Path | None = None
+    component_weights: dict[str, Path | None] | None = None
+    component_weights_keys: dict[str, str | None] | None = None
+    pipeline_kwargs: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -75,6 +86,7 @@ class InferSummary:
     images_per_sec: float
     output_dir: Path
     weights_path: Path
+    component_weights: dict[str, Path | None] | None = None
 
 
 def _validate_positive_int(value: Any, field_name: str) -> int:
@@ -160,6 +172,22 @@ def _as_dict_config(cfg: DictConfig | Mapping[str, Any]) -> DictConfig:
     raise TypeError(f"Expected DictConfig or Mapping, got {type(cfg).__name__}.")
 
 
+def _is_non_empty_arch_override(raw_arch: Any) -> bool:
+    if raw_arch is None:
+        return False
+    if isinstance(raw_arch, (DictConfig, Mapping)):
+        return any(v is not None for v in raw_arch.values())
+    return True
+
+
+def _is_multi_arch_cfg(arch_cfg: Any) -> bool:
+    if not isinstance(arch_cfg, (DictConfig, Mapping)):
+        return False
+    if arch_cfg.get("_target_", None) is not None:
+        return False
+    return any(k in arch_cfg and arch_cfg.get(k) is not None for k in _VOSR_COMPONENTS)
+
+
 def _validate_arch_cfg(arch_cfg: Any, context: str) -> DictConfig:
     if not isinstance(arch_cfg, (DictConfig, Mapping)):
         raise ValueError(f"{context} must provide a mapping `arch` config with `_target_`.")
@@ -170,13 +198,119 @@ def _validate_arch_cfg(arch_cfg: Any, context: str) -> DictConfig:
     return arch_dc
 
 
+def _validate_multi_arch_cfg(arch_cfg: Any, context: str) -> tuple[DictConfig, tuple[str, ...]]:
+    if not isinstance(arch_cfg, (DictConfig, Mapping)):
+        raise ValueError(
+            f"{context} must provide a mapping `arch` config containing 'vae' and 'dit'."
+        )
+    arch_dc = _as_dict_config(arch_cfg) if not isinstance(arch_cfg, DictConfig) else arch_cfg
+    active: list[str] = []
+    for comp in _VOSR_COMPONENTS:
+        sub = OmegaConf.select(arch_dc, comp, default=None)
+        if sub is None:
+            if comp in _VOSR_REQUIRED_COMPONENTS:
+                raise ValueError(f"{context} `arch.{comp}` is required for VOSR inference.")
+            continue
+        _validate_arch_cfg(sub, context=f"{context} `arch.{comp}`")
+        active.append(comp)
+    return arch_dc, tuple(active)
+
+
+def _arch_has_builtin_pretrained(comp_cfg: DictConfig | Mapping[str, Any]) -> bool:
+    pretrained_path = comp_cfg.get("pretrained_path", None)
+    if isinstance(pretrained_path, (str, Path)) and str(pretrained_path).strip():
+        return True
+    if comp_cfg.get("load_hub_weights", False) is True:
+        return True
+    return False
+
+
+def _parse_component_weights_override(
+    raw_weights: Any,
+    active_components: tuple[str, ...],
+) -> dict[str, Path | None]:
+    if raw_weights is None:
+        return {}
+    if isinstance(raw_weights, (DictConfig, Mapping)):
+        parsed: dict[str, Path | None] = {}
+        for key, val in raw_weights.items():
+            k_str = str(key)
+            if k_str not in _VOSR_COMPONENTS:
+                raise ValueError(
+                    f"Unknown component {k_str!r} in infer.weights_path; "
+                    f"expected subset of {list(_VOSR_COMPONENTS)}."
+                )
+            if val is not None and k_str not in active_components:
+                raise ValueError(
+                    f"infer.weights_path.{k_str} was provided, but arch.{k_str} is not active."
+                )
+            p = _optional_path(val, f"infer.weights_path.{k_str}")
+            if p is not None and not p.is_file():
+                raise FileNotFoundError(f"Weight file not found for {k_str!r}: {p}")
+            parsed[k_str] = p
+        return parsed
+    raise ValueError(
+        "For multi-arch VOSR inference, `infer.weights_path` must be null or a mapping "
+        "of component name -> weight path (e.g. `{vae: ..., dit: ..., dino: ...}`)."
+    )
+
+
+def _parse_component_weights_keys(
+    raw_keys: Any,
+    active_components: tuple[str, ...],
+) -> dict[str, str | None]:
+    if raw_keys is None:
+        return {comp: None for comp in active_components}
+    if isinstance(raw_keys, str):
+        key_val = _optional_str(raw_keys, "infer.weights_key")
+        return {comp: key_val for comp in active_components}
+    if isinstance(raw_keys, (DictConfig, Mapping)):
+        parsed = {comp: None for comp in active_components}
+        for key, val in raw_keys.items():
+            k_str = str(key)
+            if k_str not in _VOSR_COMPONENTS:
+                raise ValueError(
+                    f"Unknown component {k_str!r} in infer.weights_key; "
+                    f"expected subset of {list(_VOSR_COMPONENTS)}."
+                )
+            parsed[k_str] = _optional_str(val, f"infer.weights_key.{k_str}")
+        return parsed
+    raise ValueError(
+        f"infer.weights_key must be a string, mapping, or None, got {type(raw_keys).__name__}."
+    )
+
+
+def _extract_pipeline_kwargs(cfg_node: DictConfig | Mapping[str, Any] | None) -> dict[str, Any]:
+    if cfg_node is None:
+        return {
+            "noise_input": "gaussian",
+            "posterior_mode": True,
+            "clamp_decode_in_train": True,
+            "eval_seed": 42,
+        }
+    model_cfg = cfg_node.get("model", None) if isinstance(cfg_node, (DictConfig, Mapping)) else None
+    if not isinstance(model_cfg, (DictConfig, Mapping)):
+        return {
+            "noise_input": "gaussian",
+            "posterior_mode": True,
+            "clamp_decode_in_train": True,
+            "eval_seed": 42,
+        }
+    return {
+        "noise_input": model_cfg.get("noise_input", "gaussian"),
+        "posterior_mode": bool(model_cfg.get("posterior_mode", True)),
+        "clamp_decode_in_train": bool(model_cfg.get("clamp_decode_in_train", True)),
+        "eval_seed": model_cfg.get("eval_seed", 42),
+    }
+
+
 def resolve_exp_weights(
     exp_dir: Path,
     train_cfg: DictConfig,
     use_ema: bool,
     explicit_weights_path: str | Path | None = None,
 ) -> Path:
-    """Resolve weight file for Mode 1 (``exp_dir`` auto-restore).
+    """Resolve weight file for Mode 1 single-arch ``exp_dir`` auto-restore.
 
     Priority:
     1. Explicit ``explicit_weights_path`` override (if provided).
@@ -240,6 +374,120 @@ def resolve_exp_weights(
     )
 
 
+def resolve_exp_component_weights(
+    exp_dir: Path,
+    train_cfg: DictConfig,
+    active_components: tuple[str, ...],
+    use_ema: bool,
+    explicit_weights: Mapping[str, Path | None] | None = None,
+) -> dict[str, Path | None]:
+    """Resolve per-arch weight files for Mode 1 multi-arch VOSR ``exp_dir`` auto-restore."""
+    weights_dir = Path(exp_dir) / "weights"
+    if not weights_dir.is_dir():
+        raise FileNotFoundError(f"Weights directory not found under exp_dir: {weights_dir}")
+
+    primary_dataset = _optional_str(
+        OmegaConf.select(train_cfg, "metric.primary_dataset", default=None),
+        "metric.primary_dataset",
+    )
+    primary_metric = _optional_str(
+        OmegaConf.select(train_cfg, "metric.primary_metric", default=None),
+        "metric.primary_metric",
+    )
+    raw_val_use_ema = OmegaConf.select(train_cfg, "trainer.val_use_ema", default=None)
+    val_use_ema = True if raw_val_use_ema is None else bool(raw_val_use_ema)
+    allow_best = bool(use_ema) or (not val_use_ema)
+
+    raw_trainable = OmegaConf.select(train_cfg, "model.trainable", default=None)
+    trainable_map: dict[str, bool] = {
+        comp: bool(raw_trainable.get(comp, comp == "dit"))
+        if isinstance(raw_trainable, (DictConfig, Mapping))
+        else (comp == "dit")
+        for comp in active_components
+    }
+
+    # Choose one consistent best_* prefix across all components when allow_best is True.
+    winning_best_prefix: str | None = None
+    if allow_best:
+        if primary_dataset and primary_metric:
+            cand_prefix = f"best_{primary_dataset}_{primary_metric}"
+            if any((weights_dir / f"{cand_prefix}_{c}.safetensors").is_file() for c in active_components):
+                winning_best_prefix = cand_prefix
+        if winning_best_prefix is None:
+            prefix_mtime: dict[str, int] = {}
+            for comp in active_components:
+                suffix_str = f"_{comp}.safetensors"
+                for path in weights_dir.glob(f"best_*{suffix_str}"):
+                    if not path.is_file():
+                        continue
+                    prefix = path.name[: -len(suffix_str)]
+                    if not prefix.startswith("best_"):
+                        continue
+                    mtime = path.stat().st_mtime_ns
+                    if prefix not in prefix_mtime or mtime > prefix_mtime[prefix]:
+                        prefix_mtime[prefix] = mtime
+            if prefix_mtime:
+                winning_best_prefix = max(
+                    prefix_mtime.items(),
+                    key=lambda item: (item[1], item[0]),
+                )[0]
+
+    explicit = explicit_weights or {}
+    resolved: dict[str, Path | None] = {}
+    for comp in active_components:
+        if comp in explicit and explicit[comp] is not None:
+            p = explicit[comp]
+            assert p is not None
+            if not p.is_file():
+                raise FileNotFoundError(f"Weight file not found for {comp!r}: {p}")
+            resolved[comp] = p
+            continue
+
+        checked: list[str] = []
+        chosen: Path | None = None
+        if allow_best and winning_best_prefix is not None:
+            cand = weights_dir / f"{winning_best_prefix}_{comp}.safetensors"
+            checked.append(cand.name)
+            if cand.is_file():
+                chosen = cand
+
+        if chosen is None and bool(use_ema):
+            cand_ema = weights_dir / f"latest_{comp}_ema.safetensors"
+            checked.append(cand_ema.name)
+            if cand_ema.is_file():
+                chosen = cand_ema
+
+        if chosen is None:
+            cand_latest = weights_dir / f"latest_{comp}.safetensors"
+            checked.append(cand_latest.name)
+            if cand_latest.is_file():
+                chosen = cand_latest
+
+        if chosen is None:
+            comp_cfg = OmegaConf.select(train_cfg, f"arch.{comp}", default=None)
+            if not trainable_map.get(comp, False):
+                pretrain_entry = OmegaConf.select(train_cfg, f"model.pretrain.{comp}", default=None)
+                pretrain_raw = (
+                    pretrain_entry.get("path", None)
+                    if isinstance(pretrain_entry, (DictConfig, Mapping))
+                    else pretrain_entry
+                )
+                pretrain_path = _optional_path(pretrain_raw, f"model.pretrain.{comp}.path")
+                if pretrain_path is not None and pretrain_path.is_file():
+                    resolved[comp] = pretrain_path
+                    continue
+                if isinstance(comp_cfg, (DictConfig, Mapping)) and _arch_has_builtin_pretrained(comp_cfg):
+                    resolved[comp] = None
+                    continue
+            raise FileNotFoundError(
+                f"No eligible weight file found for component {comp!r} in {weights_dir} "
+                f"(use_ema={bool(use_ema)}, val_use_ema={val_use_ema}; checked: {checked})."
+            )
+        resolved[comp] = chosen
+
+    return resolved
+
+
 def resolve_infer_config(
     cfg: DictConfig,
     logger: logging.Logger | None = None,
@@ -254,14 +502,8 @@ def resolve_infer_config(
     if not isinstance(raw_use_ema, bool):
         raise ValueError(f"infer.use_ema must be a bool, got {raw_use_ema!r}.")
 
-    weights_key = _optional_str(
-        OmegaConf.select(cfg_oc, "infer.weights_key", default=None),
-        "infer.weights_key",
-    )
-    explicit_weights = _optional_path(
-        OmegaConf.select(cfg_oc, "infer.weights_path", default=None),
-        "infer.weights_path",
-    )
+    raw_weights_key = OmegaConf.select(cfg_oc, "infer.weights_key", default=None)
+    raw_explicit_weights = OmegaConf.select(cfg_oc, "infer.weights_path", default=None)
     raw_exp_dir = OmegaConf.select(cfg_oc, "infer.exp_dir", default=None)
 
     if raw_exp_dir is not None:
@@ -273,9 +515,7 @@ def resolve_infer_config(
         train_cfg = load_resolved_config(config_path)
 
         arch_raw = OmegaConf.select(train_cfg, "arch", default=None)
-        arch_cfg = _validate_arch_cfg(arch_raw, context=f"config_resolved.yaml ({config_path})")
-
-        if OmegaConf.select(cfg_oc, "arch", default=None) is not None and logger is not None:
+        if _is_non_empty_arch_override(OmegaConf.select(cfg_oc, "arch", default=None)) and logger is not None:
             logger.warning(
                 "infer.exp_dir=%s is set; restoring arch from %s and ignoring CLI arch override.",
                 exp_dir,
@@ -283,6 +523,8 @@ def resolve_infer_config(
             )
 
         raw_scale = OmegaConf.select(train_cfg, "scale", default=None)
+        if raw_scale is None:
+            raw_scale = OmegaConf.select(train_cfg, "model.scale", default=None)
         if raw_scale is None:
             raw_scale = OmegaConf.select(train_cfg, "arch.scale", default=None)
         if raw_scale is None:
@@ -296,6 +538,42 @@ def resolve_infer_config(
             None if raw_gt_size is None else normalize_gt_size(raw_gt_size, scale)
         )
 
+        if _is_multi_arch_cfg(arch_raw):
+            arch_cfg, active_components = _validate_multi_arch_cfg(
+                arch_raw, context=f"config_resolved.yaml ({config_path})"
+            )
+            explicit_map = _parse_component_weights_override(
+                raw_explicit_weights, active_components
+            )
+            comp_keys = _parse_component_weights_keys(raw_weights_key, active_components)
+            comp_weights = resolve_exp_component_weights(
+                exp_dir=exp_dir,
+                train_cfg=train_cfg,
+                active_components=active_components,
+                use_ema=raw_use_ema,
+                explicit_weights=explicit_map,
+            )
+            summary_path = (
+                comp_weights.get("dit")
+                or next((p for p in comp_weights.values() if p is not None), None)
+                or (exp_dir / "weights")
+            )
+            return ResolvedInferConfig(
+                mode="exp_dir",
+                arch_cfg=arch_cfg,
+                scale=scale,
+                gt_size=gt_size,
+                weights_path=summary_path,
+                weights_key=None,
+                exp_dir=exp_dir,
+                component_weights=comp_weights,
+                component_weights_keys=comp_keys,
+                pipeline_kwargs=_extract_pipeline_kwargs(train_cfg),
+            )
+
+        arch_cfg = _validate_arch_cfg(arch_raw, context=f"config_resolved.yaml ({config_path})")
+        weights_key = _optional_str(raw_weights_key, "infer.weights_key")
+        explicit_weights = _optional_path(raw_explicit_weights, "infer.weights_path")
         weights_path = resolve_exp_weights(
             exp_dir=exp_dir,
             train_cfg=train_cfg,
@@ -314,13 +592,52 @@ def resolve_infer_config(
 
     # Mode 2: Standalone infer.yaml
     arch_raw = OmegaConf.select(cfg_oc, "arch", default=None)
-    if arch_raw is None:
+    if not _is_non_empty_arch_override(arch_raw):
         raise ValueError(
-            "Standalone inference mode (infer.exp_dir=null) requires `arch` (e.g. `arch=vosr2`)."
+            "Standalone inference mode (infer.exp_dir=null) requires `arch` "
+            "(e.g. `arch/vae=qwen_vae2d arch/dit=vosr2_dit arch/dino=dinov2_vitl14`)."
         )
-    arch_cfg = _validate_arch_cfg(arch_raw, context="Standalone inference config")
+
     scale = _validate_positive_int(OmegaConf.select(cfg_oc, "scale", default=None), "scale")
 
+    if _is_multi_arch_cfg(arch_raw):
+        arch_cfg, active_components = _validate_multi_arch_cfg(
+            arch_raw, context="Standalone inference config"
+        )
+        explicit_map = _parse_component_weights_override(raw_explicit_weights, active_components)
+        comp_keys = _parse_component_weights_keys(raw_weights_key, active_components)
+        comp_weights: dict[str, Path | None] = {}
+        for comp in active_components:
+            if comp in explicit_map and explicit_map[comp] is not None:
+                comp_weights[comp] = explicit_map[comp]
+            elif _arch_has_builtin_pretrained(arch_cfg[comp]):
+                comp_weights[comp] = None
+            else:
+                raise ValueError(
+                    f"Standalone VOSR inference requires `infer.weights_path.{comp}` or "
+                    f"`arch.{comp}.pretrained_path` for component {comp!r}."
+                )
+        summary_path = (
+            comp_weights.get("dit")
+            or next((p for p in comp_weights.values() if p is not None), None)
+            or Path(str(OmegaConf.select(arch_cfg, "dit.pretrained_path", default="builtin")))
+        )
+        return ResolvedInferConfig(
+            mode="standalone",
+            arch_cfg=arch_cfg,
+            scale=scale,
+            gt_size=None,
+            weights_path=summary_path,
+            weights_key=None,
+            exp_dir=None,
+            component_weights=comp_weights,
+            component_weights_keys=comp_keys,
+            pipeline_kwargs=_extract_pipeline_kwargs(cfg_oc),
+        )
+
+    arch_cfg = _validate_arch_cfg(arch_raw, context="Standalone inference config")
+    weights_key = _optional_str(raw_weights_key, "infer.weights_key")
+    explicit_weights = _optional_path(raw_explicit_weights, "infer.weights_path")
     if explicit_weights is None:
         raise ValueError(
             "Standalone inference mode (infer.exp_dir=null) requires `infer.weights_path`."
@@ -604,6 +921,66 @@ def _reenable_srtrainer_loggers() -> None:
             obj.disabled = False
 
 
+def _build_infer_model(
+    resolved: ResolvedInferConfig,
+    accelerator: Accelerator,
+) -> nn.Module:
+    if resolved.component_weights is not None:
+        comp_modules: dict[str, nn.Module] = {}
+        comp_keys = resolved.component_weights_keys or {}
+        for comp in _VOSR_COMPONENTS:
+            if comp not in resolved.component_weights:
+                continue
+            weight_path = resolved.component_weights[comp]
+            comp_cfg = resolved.arch_cfg[comp]
+            inst_cfg = (
+                _clone_arch_cfg_skip_pretrained(comp_cfg)
+                if weight_path is not None
+                else comp_cfg
+            )
+            with accelerator.main_process_first():
+                comp_mod = hydra.utils.instantiate(inst_cfg)
+            if not isinstance(comp_mod, nn.Module):
+                raise TypeError(
+                    f"Instantiated arch.{comp} must be torch.nn.Module, got {type(comp_mod).__name__}."
+                )
+            if weight_path is not None:
+                _load_component_weights(
+                    comp_mod,
+                    weight_path,
+                    strict=True,
+                    key=comp_keys.get(comp),
+                )
+            comp_modules[comp] = comp_mod
+
+        pipe_kwargs = dict(resolved.pipeline_kwargs or {})
+        model: nn.Module = VOSRPipeline(
+            vae=comp_modules["vae"],
+            dit=comp_modules["dit"],
+            dino=comp_modules.get("dino"),
+            scale=resolved.scale,
+            noise_input=pipe_kwargs.get("noise_input", "gaussian"),
+            posterior_mode=bool(pipe_kwargs.get("posterior_mode", True)),
+            clamp_decode_in_train=bool(pipe_kwargs.get("clamp_decode_in_train", True)),
+            eval_seed=pipe_kwargs.get("eval_seed", 42),
+            trainable=None,
+        )
+        model.to(accelerator.device)
+        model.eval()
+        return model
+
+    with accelerator.main_process_first():
+        model = hydra.utils.instantiate(resolved.arch_cfg)
+    if not isinstance(model, nn.Module):
+        raise TypeError(
+            f"Instantiated arch must be torch.nn.Module, got {type(model).__name__}."
+        )
+    load_weights(model, resolved.weights_path, strict=True, key=resolved.weights_key)
+    model.to(accelerator.device)
+    model.eval()
+    return model
+
+
 def run_infer(cfg: DictConfig) -> InferSummary:
     """Execute single-process or multi-process distributed inference from a Hydra config."""
     cfg_oc = _as_dict_config(cfg)
@@ -651,14 +1028,7 @@ def run_infer(cfg: DictConfig) -> InferSummary:
             output_dir.mkdir(parents=True, exist_ok=True)
         accelerator.wait_for_everyone()
 
-        model = hydra.utils.instantiate(resolved.arch_cfg)
-        if not isinstance(model, nn.Module):
-            raise TypeError(
-                f"Instantiated arch must be torch.nn.Module, got {type(model).__name__}."
-            )
-        load_weights(model, resolved.weights_path, strict=True, key=resolved.weights_key)
-        model.to(accelerator.device)
-        model.eval()
+        model = _build_infer_model(resolved, accelerator)
 
         tile_cfg = OmegaConf.select(cfg_oc, "infer.tile", default=None)
         inferencer = TiledInferencer.from_config(
@@ -670,11 +1040,16 @@ def run_infer(cfg: DictConfig) -> InferSummary:
             device=accelerator.device,
         )
 
+        weights_desc = (
+            {k: str(v) if v is not None else "arch_pretrained" for k, v in resolved.component_weights.items()}
+            if resolved.component_weights is not None
+            else str(resolved.weights_path)
+        )
         logger.info(
             "[Infer] mode=%s | scale=%d | weights=%s | total_images=%d | processes=%d | device=%s",
             resolved.mode,
             resolved.scale,
-            resolved.weights_path,
+            weights_desc,
             len(items),
             accelerator.num_processes,
             accelerator.device,
@@ -709,6 +1084,7 @@ def run_infer(cfg: DictConfig) -> InferSummary:
             images_per_sec=images_per_sec,
             output_dir=output_dir,
             weights_path=resolved.weights_path,
+            component_weights=resolved.component_weights,
         )
     finally:
         accelerator.end_training()

@@ -15,7 +15,7 @@ import hydra
 import torch
 from accelerate import Accelerator
 from accelerate.state import AcceleratorState, GradientState, PartialState
-from accelerate.utils import ProjectConfiguration, set_seed
+from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
@@ -205,7 +205,7 @@ def _validate_resume_early(raw_resume: Any) -> None:
     if not explicit.is_dir():
         raise ValueError(
             f"Resume path must be a checkpoint state directory, got file: {explicit} "
-            "(use model.pretrain_path for weight files)."
+            "(use model.pretrain.<arch>.path for weight files)."
         )
 
 
@@ -454,11 +454,22 @@ class Trainer:
                 logging_dir=str(self.work_dir / "trackers"),
                 automatic_checkpoint_naming=False,
             )
+            ddp_kwargs = DistributedDataParallelKwargs(
+                # 默认 True 最稳（保守，兼容任意自定义 arch）。
+                # 若所用 arch 已通过 ``freeze_unused_parameters()`` 冻结前向旁路参数
+                # （如 VOSR2PBDiT 的 ``context_embedder``），可设为 False 去掉每步图遍历开销。
+                find_unused_parameters=bool(
+                    OmegaConf.select(
+                        cfg_oc, "trainer.ddp_find_unused_parameters", default=True
+                    )
+                ),
+            )
             self.accelerator = Accelerator(
                 mixed_precision=self.mixed_precision,
                 gradient_accumulation_steps=self.grad_accum_steps,
                 log_with=normalized_log_with,
                 project_config=project_config,
+                kwargs_handlers=[ddp_kwargs],
             )
 
             # Step 4: Rank-0 experiment directory creation & config_resolved.yaml persistence.
@@ -505,8 +516,8 @@ class Trainer:
 
             # Step 7: Instantiate & setup model, TrainState, Checkpointer, and deterministic registration.
             # NOTE: Never wrap model.setup() in main_process_first() because setup() invokes
-            # collective accelerator.prepare() (DDP sync). Pretrained loss downloads are guarded
-            # inside SRModel.setup() Step 1 before prepare().
+            # collective accelerator.prepare() (DDP sync). Pretrained loss/arch downloads are guarded
+            # inside VOSRModel.setup() Step 1 before prepare().
             model_obj = hydra.utils.instantiate(self.cfg.model, cfg=self.cfg, _recursive_=False)
             if not isinstance(model_obj, BaseModel):
                 raise TypeError(
@@ -951,28 +962,26 @@ class Trainer:
                     higher_is_better=higher_is_better,
                 )
                 if is_new_best:
-                    exported = self.model.export_weights(self.accelerator)
-                    best_sd = (
-                        exported["net_g_ema"]
-                        if (self.val_use_ema and "net_g_ema" in exported)
-                        else exported["net_g"]
-                    )
-                    self.checkpointer.save_best(
+                    best_weights = self.model.export_infer_weights(
                         self.accelerator,
-                        best_sd,
+                        use_ema=self.val_use_ema,
+                    )
+                    saved_best = self.checkpointer.save_best_weights(
+                        self.accelerator,
+                        best_weights,
                         self.primary_dataset,
                         self.primary_metric,
                         step=step,
                         metric_value=current_val,
                     )
                     prev_str = "None" if prev_best is None else f"{prev_best:.4f}"
+                    saved_names = ", ".join(p.name for p in saved_best.values())
                     self.logger.info(
-                        "[Best] Updated %s: %s -> %.4f (saved best_%s_%s.safetensors)",
+                        "[Best] Updated %s: %s -> %.4f (saved %s)",
                         best_key,
                         prev_str,
                         current_val,
-                        self.primary_dataset,
-                        self.primary_metric,
+                        saved_names or f"best_{self.primary_dataset}_{self.primary_metric}.safetensors",
                     )
         finally:
             if was_training:

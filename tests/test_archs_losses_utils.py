@@ -315,14 +315,28 @@ acc.end_training()
 if dist.is_initialized():
     dist.destroy_process_group()
 """
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        master_port = int(sock.getsockname()[1])
+
     env = os.environ.copy()
     env["ACCELERATE_USE_CPU"] = "true"
     env["OMP_NUM_THREADS"] = "1"
+    if sys.platform == "darwin" and "GLOO_SOCKET_IFNAME" not in env:
+        env["GLOO_SOCKET_IFNAME"] = "lo0"
+    extra_pp = f"{REPO_ROOT / 'src'}:{REPO_ROOT}"
+    existing_pp = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{extra_pp}:{existing_pp}" if existing_pp else extra_pp
     proc = subprocess.run(
         [
-            "torchrun",
-            "--standalone",
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
             "--nproc_per_node=2",
+            "--master_addr=127.0.0.1",
+            f"--master_port={master_port}",
             "--no_python",
             sys.executable,
             "-c",
@@ -366,8 +380,11 @@ def test_setup_experiment_dirs_and_resolved_config_io(tmp_path: Path) -> None:
     loaded = load_resolved_config(cfg_path)
     assert loaded.exp_name == "vosr2_onestep_text"
     assert loaded.work_dir == "experiments/vosr2_onestep_text"
-    assert loaded.arch._target_ == "archs.VOSR2OneStep"
-    assert loaded.arch.depth == 36
+    assert loaded.arch.vae._target_ == "archs.AutoencoderKLQwenImage2D"
+    assert loaded.arch.dit._target_ == "archs.VOSR2DiT"
+    assert loaded.arch.dino._target_ == "archs.DINOv2Encoder"
+    assert loaded.arch.dit.depth == 36
+    assert loaded.model._target_ == "models.VOSRModel"
     assert loaded.optim.scheduler.T_max == 10000
     assert list(loaded.optim.optimizer.betas) == [0.9, 0.95]
 
@@ -424,10 +441,12 @@ def test_flatten_config_for_tracker_and_real_tensorboard_init(
         assert isinstance(k, str)
         assert type(v) in (bool, int, float, str), f"Unsafe type {type(v)} for {k}={v!r}"
     assert flat["exp_name"] == "vosr2_onestep_text"
-    assert flat["arch._target_"] == "archs.VOSR2OneStep"
-    assert flat["arch.depth"] == 36
-    assert flat["model.pretrain_path"] == "null"
-    assert flat["data.sources.0.name"] == "df2k_gt"
+    assert flat["arch.vae._target_"] == "archs.AutoencoderKLQwenImage2D"
+    assert flat["arch.dit._target_"] == "archs.VOSR2DiT"
+    assert flat["arch.dino._target_"] == "archs.DINOv2Encoder"
+    assert flat["arch.dit.depth"] == 36
+    assert flat["model._target_"] == "models.VOSRModel"
+    assert flat["model.pretrain.dit.path"] == "null"
     assert flat["optim.optimizer.betas"] == "[0.9, 0.95]"
     assert yaml.safe_dump(flat)
 

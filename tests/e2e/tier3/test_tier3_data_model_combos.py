@@ -17,26 +17,29 @@ from typing import Any
 import pytest
 
 
-def test_t3_hydra_experiment_inheritance_into_srmodel_lpips_and_cosine_t_max(
+def test_t3_hydra_experiment_inheritance_into_vosr_model_lpips_and_cosine_t_max(
     hydra_compose: Callable[..., Any],
+    hydra_value_formatter: Callable[[Any], str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Seam A x B x E (F03-F06, F08, F12-F15, F43): experiment -> SRModel + LPIPS + Cosine LR."""
+    """Seam A x B x E (F03-F06, F08, F12-F15, F43): experiment -> VOSRModel + LPIPS + Cosine LR."""
     import hydra.utils
     import torch
     from accelerate import Accelerator
-    from tests.dummy_arch import DummySRNet
+    from tests.dummy_arch import get_dummy_vosr_arch_dict
     from tests.helpers.fake_backends import patch_lpips_offline
 
-    from models import SRModel
+    from models import VOSRModel, VOSRPipeline
 
     patch_lpips_offline(monkeypatch)
     cfg = hydra_compose(
         "train",
         overrides=[
             "experiment=vosr2_onestep_text",
-            "~arch",
-            "+arch={_target_:tests.dummy_arch.DummySRNet,num_in_ch:3,num_out_ch:3,num_feat:8,num_block:1,scale:2}",
+            "~arch/vae",
+            "~arch/dit",
+            "~arch/dino",
+            f"+arch={hydra_value_formatter(get_dummy_vosr_arch_dict())}",
             "scale=2",
             "loss=l1_lpips",
             "loss.lpips.weight=0.05",
@@ -48,10 +51,10 @@ def test_t3_hydra_experiment_inheritance_into_srmodel_lpips_and_cosine_t_max(
     )
 
     assert cfg.exp_name == "vosr2_onestep_text"
-    assert cfg.arch._target_ == "tests.dummy_arch.DummySRNet"
-    assert cfg.arch.scale == 2
-    assert cfg.arch.num_feat == 8
-    assert cfg.arch.num_block == 1
+    assert cfg.arch.vae._target_ == "tests.dummy_arch.DummyVAE"
+    assert cfg.arch.dit._target_ == "tests.dummy_arch.DummyDiT"
+    assert cfg.arch.dino._target_ == "tests.dummy_arch.DummyDino"
+    assert cfg.model.scale == 2
     assert cfg.data.scale == 2
     assert cfg.data.degradation.scale == 2
     assert cfg.optim.optimizer.lr == pytest.approx(1.0e-4)
@@ -61,11 +64,11 @@ def test_t3_hydra_experiment_inheritance_into_srmodel_lpips_and_cosine_t_max(
     assert cfg.loss.lpips.weight == pytest.approx(0.05)
 
     model = hydra.utils.instantiate(cfg.model, cfg=cfg, _recursive_=False)
-    assert isinstance(model, SRModel)
+    assert isinstance(model, VOSRModel)
     accelerator = Accelerator(cpu=True, mixed_precision="no")
     model.setup(accelerator)
 
-    assert isinstance(model.get_infer_network(use_ema=False), DummySRNet)
+    assert isinstance(model.get_infer_network(use_ema=False), VOSRPipeline)
     assert len(getattr(accelerator, "_schedulers", [])) == 0
 
     lr_0 = next(iter(model.get_lr_dict().values()))
@@ -104,7 +107,7 @@ def test_t3_hydra_experiment_inheritance_into_srmodel_lpips_and_cosine_t_max(
     assert lr_2 == pytest.approx(expected_lr_2, rel=1e-4)
 
 
-def test_t3_mixed_dataset_weighted_sampler_usm_pool_degrader_and_srmodel(
+def test_t3_mixed_dataset_weighted_sampler_usm_pool_degrader_and_vosr_model(
     e2e_workdir: dict[str, Path],
     gt_only_train_source_factory: Callable[..., dict[str, Any]],
     paired_train_source_factory: Callable[..., dict[str, Any]],
@@ -113,14 +116,14 @@ def test_t3_mixed_dataset_weighted_sampler_usm_pool_degrader_and_srmodel(
     weighted_sampler_factory: Callable[..., Any],
     minimal_train_cfg_factory: Callable[..., Any],
 ) -> None:
-    """Seam C x E (F21-F23, F25-F29, F43): Mixed sources + Sampler + USM + Pool + SRModel."""
+    """Seam C x E (F21-F23, F25-F29, F43): Mixed sources + Sampler + USM + Pool + VOSRModel."""
     import torch
     from accelerate import Accelerator
     from torch.utils.data import DataLoader
     from torch.utils.data._utils.collate import default_collate
 
     from data.degradation import RealESRGANDegrader
-    from models import SRModel
+    from models import VOSRModel
 
     # gt_size=64 ensures USMSharp default radius=50 satisfies reflect pad (50 < 64).
     gt_src = gt_only_train_source_factory(name="c_gt", n_samples=4, gt_h=64, gt_w=64, ratio=0.4)
@@ -158,7 +161,7 @@ def test_t3_mixed_dataset_weighted_sampler_usm_pool_degrader_and_srmodel(
     cfg.data.degradation.kernel_cfg.kernel_range = [7]
     cfg.optim.optimizer.lr = 1.0e-3
 
-    model = SRModel(cfg)
+    model = VOSRModel(cfg)
     model.setup(Accelerator(cpu=True, mixed_precision="no"))
     init_sd = {
         k: v.detach().cpu().clone()
@@ -211,7 +214,7 @@ def test_t3_mixed_dataset_weighted_sampler_usm_pool_degrader_and_srmodel(
     assert max_delta > 0.0
 
 
-def test_t3_pure_paired_degradation_null_toymodel_scale4_and_multistep_lr(
+def test_t3_pure_paired_degradation_null_vosr_scale4_and_multistep_lr(
     hydra_compose: Callable[..., Any],
     hydra_value_formatter: Callable[[Any], str],
     paired_train_source_factory: Callable[..., dict[str, Any]],
@@ -220,10 +223,10 @@ def test_t3_pure_paired_degradation_null_toymodel_scale4_and_multistep_lr(
     """Seam A x B x C x E (F04, F05, F07, F08, F13, F14, F21-F23, F43): degradation=null + MultiStepLR."""
     import torch
     from accelerate import Accelerator
-    from tests.dummy_arch import DummySRNet
+    from tests.dummy_arch import get_dummy_vosr_arch_dict
     from torch.utils.data import DataLoader
 
-    from models import SRModel
+    from models import VOSRModel, VOSRPipeline
 
     pair_src = paired_train_source_factory(
         name="pure_x4", n_samples=4, lq_h=16, lq_w=16, scale=4, ratio=1.0
@@ -231,9 +234,11 @@ def test_t3_pure_paired_degradation_null_toymodel_scale4_and_multistep_lr(
     cfg = hydra_compose(
         "train",
         overrides=[
+            "~experiment",
             "scale=4",
-            "~arch",
-            "+arch={_target_:tests.dummy_arch.DummySRNet,num_in_ch:3,num_out_ch:3,num_feat:8,num_block:1,scale:4}",
+            "~arch/vae",
+            "~arch/dit",
+            f"+arch={hydra_value_formatter(get_dummy_vosr_arch_dict())}",
             "loss=l1",
             "optim=adam_multistep",
             "optim.optimizer.lr=2.0e-4",
@@ -253,16 +258,16 @@ def test_t3_pure_paired_degradation_null_toymodel_scale4_and_multistep_lr(
     )
 
     assert cfg.data.degradation is None
-    assert cfg.arch.scale == 4
+    assert cfg.model.scale == 4
     assert cfg.optim.optimizer._target_ == "torch.optim.Adam"
     assert cfg.optim.scheduler._target_ == "torch.optim.lr_scheduler.MultiStepLR"
 
     ds = mixed_dataset_factory([pair_src], gt_size=64, scale=4, has_degradation=False)
     loader = DataLoader(ds, batch_size=2, shuffle=False, num_workers=0)
 
-    model = SRModel(cfg)
+    model = VOSRModel(cfg)
     model.setup(Accelerator(cpu=True, mixed_precision="no"))
-    assert isinstance(model.get_infer_network(use_ema=False), DummySRNet)
+    assert isinstance(model.get_infer_network(use_ema=False), VOSRPipeline)
     assert next(iter(model.get_lr_dict().values())) == pytest.approx(2.0e-4, rel=1e-6)
 
     init_sd = {
@@ -320,21 +325,21 @@ def test_t3_pretrain_basicsr_pth_with_ema_warmup_grad_clip_and_accum(
     """Seam B x E (F13, F19, F42, F43): BasicSR .pth pretrain + EMA warmup + grad_clip + grad_accum."""
     import torch
     from accelerate import Accelerator
-    from tests.dummy_arch import DummySRNet
+    from tests.dummy_arch import DummyDiT
 
-    from models import SRModel
+    from models import VOSRModel
 
     torch.manual_seed(34)
-    ref_net = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
+    ref_dit = DummyDiT(in_channels=8, out_channels=4, patch_size=2, hidden_ch=8, z_dims=8)
     sd_ema = {
         k: (v.detach().cpu() + 0.05 if torch.is_floating_point(v) else v.detach().cpu().clone())
-        for k, v in ref_net.state_dict().items()
+        for k, v in ref_dit.state_dict().items()
     }
     sd_params = {
         k: (torch.zeros_like(v.detach().cpu()) if torch.is_floating_point(v) else v.detach().cpu().clone())
-        for k, v in ref_net.state_dict().items()
+        for k, v in ref_dit.state_dict().items()
     }
-    pth_path = e2e_workdir["work"] / "basicsr_pretrain.pth"
+    pth_path = e2e_workdir["work"] / "basicsr_dit_pretrain.pth"
     torch.save({"params_ema": sd_ema, "params": sd_params}, pth_path)
 
     src = paired_train_source_factory(name="t3_pth_src", n_samples=2, lq_h=16, lq_w=16, scale=2)
@@ -349,22 +354,22 @@ def test_t3_pretrain_basicsr_pth_with_ema_warmup_grad_clip_and_accum(
         has_degradation=False,
         use_ema=True,
     )
-    cfg.model.pretrain_path = str(pth_path)
-    cfg.model.pretrain_strict = True
-    cfg.model.pretrain_key = "params_ema"
+    cfg.model.pretrain.dit.path = str(pth_path)
+    cfg.model.pretrain.dit.strict = True
+    cfg.model.pretrain.dit.key = "params_ema"
     cfg.model.ema.decay = 0.999
     cfg.model.ema.warmup_steps = 4
     cfg.trainer.grad_clip_norm = 0.5
     cfg.optim.optimizer.lr = 1.0e-2
 
     accelerator = Accelerator(cpu=True, mixed_precision="no", gradient_accumulation_steps=2)
-    model = SRModel(cfg)
+    model = VOSRModel(cfg)
     model.setup(accelerator)
 
     def _snapshot(use_ema: bool) -> dict[str, Any]:
         return {
             k: v.detach().cpu().clone()
-            for k, v in model.get_infer_network(use_ema=use_ema).state_dict().items()
+            for k, v in model.get_infer_network(use_ema=use_ema).dit.state_dict().items()
         }
 
     def _l1_drift(sd_a: dict[str, Any], sd_b: dict[str, Any]) -> float:
@@ -444,7 +449,7 @@ def test_t3_sampler_o1_resume_coupled_with_checkpointer_and_train_state(
     from torch.utils.data._utils.collate import default_collate
 
     from engine import Checkpointer, TrainState
-    from models import SRModel
+    from models import VOSRModel
 
     s0 = paired_train_source_factory(name="res_s0", n_samples=4, lq_h=16, lq_w=16, scale=2, ratio=0.6)
     s1 = paired_train_source_factory(name="res_s1", n_samples=4, lq_h=16, lq_w=16, scale=2, ratio=0.4)
@@ -478,7 +483,7 @@ def test_t3_sampler_o1_resume_coupled_with_checkpointer_and_train_state(
             gradient_accumulation_steps=2,
             project_config=proj_cfg,
         )
-        model = SRModel(cfg)
+        model = VOSRModel(cfg)
         model.setup(acc)
         train_state = TrainState()
         acc.register_for_checkpointing(train_state)
@@ -557,20 +562,20 @@ def test_t3_sampler_o1_resume_coupled_with_checkpointer_and_train_state(
         assert torch.allclose(resumed_ema_sd[k].detach().cpu(), cont_ema_sd[k], atol=1e-5)
 
 
-def test_t3_toymodel_scales_export_weights_safetensors_reload_parity(
+def test_t3_vosr_scales_export_weights_safetensors_reload_parity(
     e2e_workdir: dict[str, Path],
     paired_train_source_factory: Callable[..., dict[str, Any]],
     minimal_train_cfg_factory: Callable[..., Any],
     accelerate_state_resetter: Callable[[], None],
 ) -> None:
-    """Seam B x E (F13, F19, F42, F43, F45): ToyModel x2/x4 export -> safetensors -> reload parity."""
+    """Seam B x E (F13, F19, F42, F43, F45): VOSR x2/x4 per-arch export -> safetensors -> reload parity."""
     import torch
     from accelerate import Accelerator
     from safetensors import safe_open
-    from tests.dummy_arch import DummySRNet
+    from tests.dummy_arch import DummyDino, DummyDiT, DummyVAE
 
     from engine import Checkpointer
-    from models import SRModel
+    from models import VOSRModel, VOSRPipeline
     from utils.misc import load_weights
 
     for scale in (2, 4):
@@ -594,7 +599,7 @@ def test_t3_toymodel_scales_export_weights_safetensors_reload_parity(
         cfg.model.ema.decay = 0.9
 
         accelerator = Accelerator(cpu=True, mixed_precision="no")
-        model = SRModel(cfg)
+        model = VOSRModel(cfg)
         model.setup(accelerator)
 
         for step in range(2):
@@ -609,16 +614,16 @@ def test_t3_toymodel_scales_export_weights_safetensors_reload_parity(
             assert stepped is True
 
         x = torch.rand(1, 3, 13, 17, dtype=torch.float32)
-        net_g_live = model.get_infer_network(use_ema=False).eval()
-        net_ema_live = model.get_infer_network(use_ema=True).eval()
+        pipe_g_live = model.get_infer_network(use_ema=False).eval()
+        pipe_ema_live = model.get_infer_network(use_ema=True).eval()
         with torch.no_grad():
-            y_live_g = net_g_live(x)
-            y_live_ema = net_ema_live(x)
+            y_live_g = pipe_g_live(x)
+            y_live_ema = pipe_ema_live(x)
         assert (y_live_g - y_live_ema).abs().max().item() > 1e-6
 
         exported = model.export_weights(accelerator)
-        assert {"net_g", "net_g_ema"}.issubset(exported.keys())
-        for tag in ("net_g", "net_g_ema"):
+        assert {"vae", "dit", "dit_ema", "dino"} == set(exported.keys())
+        for tag in ("vae", "dit", "dit_ema", "dino"):
             assert len(exported[tag]) > 0
             for key in exported[tag]:
                 assert not key.startswith("module.") and not key.startswith("_orig_mod.")
@@ -628,10 +633,14 @@ def test_t3_toymodel_scales_export_weights_safetensors_reload_parity(
 
         weights_dir = work_dir / "weights"
         expected_files = (
-            "iter_000002.safetensors",
-            "iter_000002_ema.safetensors",
-            "latest.safetensors",
-            "latest_ema.safetensors",
+            "iter_000002_vae.safetensors",
+            "iter_000002_dit.safetensors",
+            "iter_000002_dit_ema.safetensors",
+            "iter_000002_dino.safetensors",
+            "latest_vae.safetensors",
+            "latest_dit.safetensors",
+            "latest_dit_ema.safetensors",
+            "latest_dino.safetensors",
         )
         for fname in expected_files:
             fpath = weights_dir / fname
@@ -642,25 +651,29 @@ def test_t3_toymodel_scales_export_weights_safetensors_reload_parity(
                 for sk in saved_keys:
                     assert not sk.startswith("module.") and not sk.startswith("_orig_mod.")
 
-        reloaded_g = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=scale)
-        reloaded_ema = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=scale)
-        for net_zero in (reloaded_g, reloaded_ema):
+        reloaded_vae = DummyVAE(z_dim=4, spatial_compression_ratio=2)
+        reloaded_dit = DummyDiT(in_channels=8, out_channels=4, patch_size=2, hidden_ch=8, z_dims=8)
+        reloaded_dit_ema = DummyDiT(in_channels=8, out_channels=4, patch_size=2, hidden_ch=8, z_dims=8)
+        reloaded_dino = DummyDino(embed_dim=8, image_size=16, patch_size=4)
+        for net_zero in (reloaded_vae, reloaded_dit, reloaded_dit_ema, reloaded_dino):
             with torch.no_grad():
                 for param in net_zero.parameters():
                     param.zero_()
 
-        miss_g, unexp_g = load_weights(reloaded_g, weights_dir / "latest.safetensors", strict=True)
-        miss_e, unexp_e = load_weights(
-            reloaded_ema, weights_dir / "latest_ema.safetensors", strict=True
-        )
-        assert miss_g == [] and unexp_g == []
-        assert miss_e == [] and unexp_e == []
+        assert load_weights(reloaded_vae, weights_dir / "latest_vae.safetensors", strict=True) == ([], [])
+        assert load_weights(reloaded_dit, weights_dir / "latest_dit.safetensors", strict=True) == ([], [])
+        assert load_weights(reloaded_dit_ema, weights_dir / "latest_dit_ema.safetensors", strict=True) == ([], [])
+        assert load_weights(reloaded_dino, weights_dir / "latest_dino.safetensors", strict=True) == ([], [])
 
-        reloaded_g.eval()
-        reloaded_ema.eval()
+        reloaded_pipe_g = VOSRPipeline(
+            vae=reloaded_vae, dit=reloaded_dit, dino=reloaded_dino, scale=scale, eval_seed=42
+        ).eval()
+        reloaded_pipe_ema = VOSRPipeline(
+            vae=reloaded_vae, dit=reloaded_dit_ema, dino=reloaded_dino, scale=scale, eval_seed=42
+        ).eval()
         with torch.no_grad():
-            y_reload_g = reloaded_g(x)
-            y_reload_ema = reloaded_ema(x)
+            y_reload_g = reloaded_pipe_g(x)
+            y_reload_ema = reloaded_pipe_ema(x)
 
         assert y_reload_g.shape == (1, 3, 13 * scale, 17 * scale)
         assert torch.allclose(y_reload_g, y_live_g, atol=1e-6)

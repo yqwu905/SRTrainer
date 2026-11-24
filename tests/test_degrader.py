@@ -835,7 +835,9 @@ def test_end_to_end_mixed_dataset_loader_and_degrader(tmp_path: Path) -> None:
     paired_json.write_text(json.dumps(paired_entries), encoding="utf-8")
 
     with hydra.initialize_config_dir(config_dir=CONFIGS_DIR, version_base=None):
-        cfg = hydra.compose(config_name="train", overrides=["experiment=vosr2_onestep_text", "scale=4"])
+        cfg = hydra.compose(
+            config_name="train", overrides=["experiment=vosr2_onestep_text", "scale=4"]
+        )
     degrader = instantiate(cfg.data.degradation)
 
     ds = MixedSRDataset(
