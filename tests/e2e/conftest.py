@@ -751,7 +751,7 @@ def make_minimal_train_cfg(
     primary_dataset: str | None = None,
     primary_metric: str | None = None,
     scale: int = CPU_SCALE,
-    gt_size: int = CPU_GT_SIZE,
+    gt_size: int | list[int] = CPU_GT_SIZE,
     batch_size: int = CPU_BATCH_SIZE,
     total_iters: int = CPU_TOTAL_ITERS,
     log_interval: int = 2,
@@ -774,7 +774,7 @@ def make_minimal_train_cfg(
     from omegaconf import OmegaConf
 
     work_path = Path(work_dir)
-    cfg = compose_hydra_cfg("train")
+    cfg = compose_hydra_cfg("train", overrides=["~experiment", "arch=vosr2", "loss=l1"])
     OmegaConf.set_struct(cfg, False)
 
     cfg.scale = scale
@@ -821,7 +821,7 @@ def make_minimal_train_cfg(
     cfg.trainer.val_max_save_images = val_max_save_images
     cfg.trainer.val_use_ema = val_use_ema
 
-    tile_size = gt_size // scale
+    tile_size = (gt_size if isinstance(gt_size, int) else min(gt_size)) // scale
     safe_overlap = min(4, max(0, (tile_size // 2) - 1))
     if cfg.trainer.get("val_tile") is not None:
         cfg.trainer.val_tile.overlap = safe_overlap

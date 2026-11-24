@@ -184,7 +184,7 @@ def _make_exp_dir(
     exp_dir: Path,
     *,
     scale: int = 2,
-    gt_size: int | None = 32,
+    gt_size: int | list[int] | None = 32,
     num_feat: int = 8,
     num_block: int = 1,
     primary_dataset: str | None = "set5",
@@ -244,6 +244,13 @@ def test_tiled_inferencer_tile_size_modes_and_validation(caplog: pytest.LogCaptu
     assert inf_auto.tile_size == (16, 16)
     assert inf_auto.weight_window is not None
     assert tuple(inf_auto.weight_window.shape) == (1, 1, 64, 64)
+
+    rectangular = TiledInferencer(
+        model=model, scale=4, tile_size="auto", tile_overlap=4, gt_size=[48, 80]
+    )
+    assert rectangular.tile_size == (12, 20)
+    image = torch.rand(1, 3, 29, 43)
+    torch.testing.assert_close(rectangular.infer_tensor(image), model(image))
 
     # tile_size="auto" without gt_size -> warning + untiled fallback
     with caplog.at_level(logging.WARNING, logger="srtrainer"):
@@ -320,7 +327,7 @@ def test_tiled_inferencer_tile_size_modes_and_validation(caplog: pytest.LogCaptu
         with pytest.raises(ValueError):
             TiledInferencer(model=model, scale=4, tile_size=16, tile_overlap=0, blend_mode=bad_mode)  # type: ignore[arg-type]
 
-    for bad_gt in (0, -16, True):
+    for bad_gt in (0, -16, True, [64], [64, 0], [65, 64], [64, 65], [64, True]):
         with pytest.raises(ValueError):
             TiledInferencer(model=model, scale=4, tile_size=16, tile_overlap=0, gt_size=bad_gt)  # type: ignore[arg-type]
 
@@ -333,14 +340,19 @@ def test_tiled_inferencer_tile_size_modes_and_validation(caplog: pytest.LogCaptu
     assert inf_from_infer.blend_mode == "cosine"
 
     with hydra.initialize_config_dir(config_dir=CONFIGS_DIR, version_base=None):
-        train_cfg = hydra.compose(config_name="train")
+        train_cfg = hydra.compose(config_name="train", overrides=[
+            "experiment=vosr2_onestep_text",
+            "scale=4",
+            "data.gt_size=[256,512]",
+            "trainer.val_tile.overlap=16",
+        ])
     inf_from_train = TiledInferencer.from_config(
         model=model,
         scale=4,
         tile_cfg=train_cfg.trainer.val_tile,
         gt_size=train_cfg.data.gt_size,
     )
-    assert inf_from_train.tile_size == (64, 64)
+    assert inf_from_train.tile_size == (64, 128)
 
     inf_from_dict = TiledInferencer.from_config(
         model=model,
@@ -658,7 +670,7 @@ def test_infer_mode1_exp_dir_auto_restore_and_weight_priority(tmp_path: Path) ->
     exp_dir = _make_exp_dir(
         tmp_path / "exp_val_ema_true",
         scale=2,
-        gt_size=32,
+        gt_size=[24, 32],
         primary_dataset="set5",
         primary_metric="psnr",
         val_use_ema=True,

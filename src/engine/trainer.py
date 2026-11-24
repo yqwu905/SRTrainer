@@ -45,6 +45,7 @@ from utils.logging import (
     log_images_to_trackers,
     setup_logger,
 )
+from utils.misc import normalize_gt_size
 
 __all__ = ["Trainer"]
 
@@ -327,14 +328,7 @@ class Trainer:
                 raise ValueError(
                     f"data.scale ({data_scale}) must match cfg.scale ({self.scale})."
                 )
-        self.gt_size: int = _require_positive_int(
-            OmegaConf.select(cfg_oc, "data.gt_size", default=None),
-            "data.gt_size",
-        )
-        if self.gt_size % self.scale != 0:
-            raise ValueError(
-                f"data.gt_size ({self.gt_size}) must be evenly divisible by scale ({self.scale})."
-            )
+        self.gt_size = normalize_gt_size(OmegaConf.select(cfg_oc, "data.gt_size"), self.scale)
         batch_size_per_gpu = _require_positive_int(
             OmegaConf.select(cfg_oc, "data.batch_size_per_gpu", default=None),
             "data.batch_size_per_gpu",

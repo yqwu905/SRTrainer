@@ -480,7 +480,7 @@ class TrainState:
 > `configs/data/` 仅负责**训练数据与在线退化**；验证集与对应评测指标统一在 `configs/metric/` 中配置（见第 7 节）。
 
 ```yaml
-gt_size: 256                  # 训练 GT 裁剪尺寸；LQ 输入尺寸自动为 gt_size // scale (= 64)
+gt_size: 256                  # 训练 GT 裁剪尺寸，也支持 [高, 宽]；每个维度须能被 scale 整除
 scale: ${scale}
 batch_size_per_gpu: 8
 num_workers: 8
@@ -807,7 +807,7 @@ tile:
 #### 自动 Tile 切块与羽化融合算法细节
 
 1. **`tile_size` 自动推导**：
-   - 当 `tile.size == "auto"` 时，自动计算 `tile_h = tile_w = train_cfg.data.gt_size // scale`（例如训练 `gt_size=256, scale=4` → 自动 `tile_size = 64`，与训练网络见过的 LQ patch 尺寸完全一致！）；
+   - 当 `tile.size == "auto"` 时，自动计算 `(tile_h, tile_w) = (gt_h // scale, gt_w // scale)`（例如训练 `gt_size=256, scale=4` → 自动 `tile_size = 64`，与训练网络见过的 LQ patch 尺寸完全一致！）；
    - 若独立模式无 `data.gt_size`，则提示用户显式指定 `tile.size` 或退回整图模式（并自动执行 `pad_multiple`）。
 2. **小图 / 边界保护**：
    - 若输入图 `H < tile_h` 或 `W < tile_w`，先用 `reflect` 模式（超边时降级 `replicate`）向右下方 padding 至至少 `(tile_h, tile_w)`，推理完毕后按 `(orig_H * scale, orig_W * scale)` 精确裁回。

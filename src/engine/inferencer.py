@@ -13,7 +13,7 @@ from omegaconf import DictConfig, OmegaConf
 from torch import nn
 
 from utils.config import normalize_mixed_precision
-from utils.misc import pad_to_min_size, pad_to_multiple, unpad_tensor
+from utils.misc import normalize_gt_size, pad_to_min_size, pad_to_multiple, unpad_tensor
 
 __all__ = [
     "TiledInferencer",
@@ -147,7 +147,7 @@ class TiledInferencer:
         tile_batch_size: int = 4,
         blend_mode: str = "cosine",
         pad_multiple: int = 8,
-        gt_size: int | None = None,
+        gt_size: int | Sequence[int] | None = None,
         mixed_precision: str = "no",
         device: torch.device | str | None = None,
     ) -> None:
@@ -173,13 +173,7 @@ class TiledInferencer:
         norm_blend_mode = _normalize_blend_mode(blend_mode)
         norm_mp = normalize_mixed_precision(mixed_precision)
 
-        if gt_size is not None:
-            if not _is_positive_int(gt_size):
-                raise ValueError(f"gt_size must be a positive integer or None, got {gt_size!r}.")
-            if gt_size % scale != 0:
-                raise ValueError(
-                    f"gt_size ({gt_size}) must be evenly divisible by scale ({scale})."
-                )
+        crop_size = None if gt_size is None else normalize_gt_size(gt_size, scale)
 
         resolved_device: torch.device | None
         if device is None:
@@ -209,7 +203,7 @@ class TiledInferencer:
         if not tile_enabled:
             return
 
-        resolved_tile_size = self._resolve_tile_size(tile_size, gt_size=gt_size, scale=scale)
+        resolved_tile_size = self._resolve_tile_size(tile_size, gt_size=crop_size, scale=scale)
         if resolved_tile_size is None:
             logging.getLogger("srtrainer").warning(
                 "TiledInferencer: tile_size='auto' requires gt_size, which is None; "
@@ -240,7 +234,7 @@ class TiledInferencer:
     @staticmethod
     def _resolve_tile_size(
         tile_size: str | int | Sequence[int] | None,
-        gt_size: int | None,
+        gt_size: tuple[int, int] | None,
         scale: int,
     ) -> tuple[int, int] | None:
         # Check str before Sequence, and bool before int.
@@ -248,8 +242,8 @@ class TiledInferencer:
             if tile_size.strip().lower() == "auto":
                 if gt_size is None:
                     return None
-                dim = gt_size // scale
-                return (dim, dim)
+                height, width = gt_size
+                return height // scale, width // scale
             raise ValueError(
                 f"Unsupported string tile_size={tile_size!r}; expected 'auto', int, or [H, W]."
             )
@@ -286,7 +280,7 @@ class TiledInferencer:
         model: nn.Module,
         scale: int,
         tile_cfg: DictConfig | Mapping[str, Any] | None,
-        gt_size: int | None = None,
+        gt_size: int | Sequence[int] | None = None,
         mixed_precision: str = "no",
         device: torch.device | str | None = None,
     ) -> TiledInferencer:

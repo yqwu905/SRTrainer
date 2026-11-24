@@ -22,7 +22,7 @@ from engine.inferencer import TiledInferencer
 from utils.config import load_resolved_config, normalize_mixed_precision
 from utils.image import IMAGE_EXTENSIONS, load_image, save_image
 from utils.logging import setup_logger
-from utils.misc import load_weights
+from utils.misc import load_weights, normalize_gt_size
 
 __all__ = [
     "ALLOWED_SAVE_FORMATS",
@@ -49,7 +49,7 @@ class ResolvedInferConfig:
     mode: Literal["exp_dir", "standalone"]
     arch_cfg: DictConfig
     scale: int
-    gt_size: int | None
+    gt_size: tuple[int, int] | None
     weights_path: Path
     weights_key: str | None
     exp_dir: Path | None = None
@@ -293,7 +293,7 @@ def resolve_infer_config(
 
         raw_gt_size = OmegaConf.select(train_cfg, "data.gt_size", default=None)
         gt_size = (
-            None if raw_gt_size is None else _validate_positive_int(raw_gt_size, "data.gt_size")
+            None if raw_gt_size is None else normalize_gt_size(raw_gt_size, scale)
         )
 
         weights_path = resolve_exp_weights(

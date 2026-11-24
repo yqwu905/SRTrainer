@@ -2,7 +2,7 @@ defaults:
   - degradation: realesrgan_2nd
   - _self_
 
-gt_size: 512                   # Training GT crop size; LQ input size is gt_size // scale
+gt_size: 512                   # Square side or [height, width]. Both dimensions must be divisible by scale.
 scale: ${scale}
 batch_size_per_gpu: 1
 num_workers: 8
