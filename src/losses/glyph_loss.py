@@ -40,7 +40,7 @@ class GlyphLoss(nn.Module):
     """Per-character TextVerifier Stage-3 glyph loss (``1 - max cosine similarity``).
 
     Adapted from ``yqwu905/VOSR`` (``models/glyph_loss.py::TextVerifierGlyphLoss``).
-    Sets ``needs_batch = True`` so ``SRModel.train_step`` automatically forwards ``batch``
+    Sets ``needs_batch = True`` so ``VOSRModel.train_step`` automatically forwards ``batch``
     carrying crop-relative ``text_lines`` (or ``glyphs``) annotations.
 
     Loads verified real TextVerifier Stage-3 weights and prototype banks exclusively via

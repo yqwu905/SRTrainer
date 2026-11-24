@@ -6,8 +6,9 @@ import logging
 import math
 import re
 import sys
+from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -133,20 +134,7 @@ def format_train_log(
     return f"{header} {' | '.join(parts)}"
 
 
-def log_images_to_trackers(
-    accelerator: Accelerator,
-    tag: str,
-    image: torch.Tensor,
-    step: int,
-) -> None:
-    """Log an RGB image tensor (``[3, H, W]`` or ``[1, 3, H, W]`` in ``[0, 1]``) to active Accelerate trackers."""
-    if not getattr(accelerator, "is_main_process", True):
-        return
-
-    trackers = getattr(accelerator, "trackers", None) or []
-    if not trackers:
-        return
-
+def _prepare_image_chw(image: torch.Tensor) -> torch.Tensor:
     img = image
     if img.ndim == 4 and img.shape[0] == 1:
         img = img.squeeze(0)
@@ -154,48 +142,92 @@ def log_images_to_trackers(
         raise ValueError(
             f"Expected image of shape [3, H, W] or [1, 3, H, W], got {tuple(image.shape)}."
         )
+    return torch.nan_to_num(
+        img.detach().to(device="cpu", dtype=torch.float32),
+        nan=0.0,
+        posinf=1.0,
+        neginf=0.0,
+    ).clamp(0.0, 1.0)
 
-    img_chw = img.detach().to(device="cpu", dtype=torch.float32).clamp(0.0, 1.0)
-    img_hwc_u8 = None
 
-    def _get_hwc_u8():
-        nonlocal img_hwc_u8
-        if img_hwc_u8 is None:
-            img_hwc_u8 = (
-                img_chw.mul(255.0)
-                .round()
-                .to(torch.uint8)
-                .permute(1, 2, 0)
-                .contiguous()
-                .numpy()
-            )
-        return img_hwc_u8
+def _chw_to_hwc_u8(img_chw: torch.Tensor) -> Any:
+    return (
+        img_chw.mul(255.0)
+        .round()
+        .to(torch.uint8)
+        .permute(1, 2, 0)
+        .contiguous()
+        .numpy()
+    )
+
+
+def log_image_dict_to_trackers(
+    accelerator: Accelerator,
+    images: Mapping[str, torch.Tensor],
+    step: int,
+) -> None:
+    """Log a mapping of ``{tag: RGB image tensor}`` to active Accelerate trackers at ``step``."""
+    if not getattr(accelerator, "is_main_process", True):
+        return
+    if not images:
+        return
+
+    trackers = getattr(accelerator, "trackers", None) or []
+    if not trackers:
+        return
+
+    prepared_chw: dict[str, torch.Tensor] = {
+        str(tag): _prepare_image_chw(image) for tag, image in images.items()
+    }
+    prepared_hwc_u8: dict[str, Any] | None = None
+
+    def _get_all_hwc_u8() -> dict[str, Any]:
+        nonlocal prepared_hwc_u8
+        if prepared_hwc_u8 is None:
+            prepared_hwc_u8 = {
+                tag: _chw_to_hwc_u8(img_chw) for tag, img_chw in prepared_chw.items()
+            }
+        return prepared_hwc_u8
 
     for tracker in trackers:
         name = str(getattr(tracker, "name", type(tracker).__name__)).lower()
         if name == "tensorboard":
             writer = getattr(tracker, "writer", None) or tracker.tracker
-            writer.add_image(tag, img_chw, global_step=step, dataformats="CHW")
+            for tag, img_chw in prepared_chw.items():
+                writer.add_image(tag, img_chw, global_step=step, dataformats="CHW")
             writer.flush()
         elif name == "wandb":
             import wandb
 
             run = tracker.tracker
-            run.log({tag: wandb.Image(_get_hwc_u8())}, step=step)
+            payload = {tag: wandb.Image(arr) for tag, arr in _get_all_hwc_u8().items()}
+            run.log(payload, step=step)
         elif name == "swanlab":
             import swanlab
 
-            tracker.tracker.log({tag: swanlab.Image(_get_hwc_u8())}, step=step)
+            payload = {tag: swanlab.Image(arr) for tag, arr in _get_all_hwc_u8().items()}
+            tracker.tracker.log(payload, step=step)
         elif name == "mlflow":
             import mlflow
             from PIL import Image
 
-            mlflow.log_image(Image.fromarray(_get_hwc_u8()), key=tag, step=step)
+            for tag, arr in _get_all_hwc_u8().items():
+                mlflow.log_image(Image.fromarray(arr), key=tag, step=step)
         else:
             if name not in _WARNED_UNSUPPORTED_TRACKERS:
                 _WARNED_UNSUPPORTED_TRACKERS.add(name)
                 logging.getLogger("srtrainer").warning(
-                    "Image logging is not implemented for tracker %r; skipping image tag %r.",
+                    "Image logging is not implemented for tracker %r; skipping image tags %r.",
                     name,
-                    tag,
+                    list(prepared_chw.keys()),
                 )
+
+
+def log_images_to_trackers(
+    accelerator: Accelerator,
+    tag: str,
+    image: torch.Tensor,
+    step: int,
+) -> None:
+    """Log an RGB image tensor (``[3, H, W]`` or ``[1, 3, H, W]`` in ``[0, 1]``) to active Accelerate trackers."""
+    log_image_dict_to_trackers(accelerator, {tag: image}, step=step)

@@ -1051,49 +1051,44 @@ def test_hydra_sr_default_metric_instantiation_and_compute(
     pred = torch.rand(1, 3, 64, 64)
     target = (pred + 0.05 * torch.randn(1, 3, 64, 64)).clamp(0.0, 1.0)
 
-    # Default scale=1 composition
-    cfg = _compose("train")
+    # Default experiment composition (configs/metric/sr_default.yaml)
+    cfg = _compose("train", overrides=["experiment=vosr2_onestep_text"])
 
-    set5_metrics = {
+    primary_suite = cfg.metric.primary_dataset
+    assert primary_suite in cfg.metric.val_suites
+    suite_metrics = {
         name: instantiate(m_cfg).to("cpu")
-        for name, m_cfg in cfg.metric.val_suites.set5.metrics.items()
+        for name, m_cfg in cfg.metric.val_suites[primary_suite].metrics.items()
     }
-    assert set(set5_metrics.keys()) == {"psnr", "ssim", "lpips"}
-    assert isinstance(set5_metrics["psnr"], PSNRMetric)
-    assert isinstance(set5_metrics["ssim"], SSIMMetric)
-    assert isinstance(set5_metrics["lpips"], LPIPSMetric)
-    assert set5_metrics["psnr"].crop_border == 1
-    assert set5_metrics["psnr"].test_y_channel is True
-    assert set5_metrics["psnr"].higher_is_better is True
-    assert set5_metrics["ssim"].crop_border == 1
-    assert set5_metrics["ssim"].test_y_channel is True
-    assert set5_metrics["ssim"].higher_is_better is True
-    assert set5_metrics["lpips"].net == "alex"
-    assert set5_metrics["lpips"].higher_is_better is False
+    assert set(suite_metrics.keys()) == {"psnr", "ssim", "lpips"}
+    assert isinstance(suite_metrics["psnr"], PSNRMetric)
+    assert isinstance(suite_metrics["ssim"], SSIMMetric)
+    assert isinstance(suite_metrics["lpips"], LPIPSMetric)
+    assert suite_metrics["psnr"].test_y_channel is True
+    assert suite_metrics["psnr"].higher_is_better is True
+    assert suite_metrics["ssim"].test_y_channel is True
+    assert suite_metrics["ssim"].higher_is_better is True
+    assert suite_metrics["lpips"].net == "alex"
+    assert suite_metrics["lpips"].higher_is_better is False
 
-    urban_metrics = {
-        name: instantiate(m_cfg).to("cpu")
-        for name, m_cfg in cfg.metric.val_suites.urban100.metrics.items()
-    }
-    assert set(urban_metrics.keys()) == {"psnr", "ssim"}
-    assert isinstance(urban_metrics["psnr"], PSNRMetric)
-    assert isinstance(urban_metrics["ssim"], SSIMMetric)
-    assert urban_metrics["psnr"].crop_border == 1
-    assert urban_metrics["ssim"].crop_border == 1
+    for name, metric in suite_metrics.items():
+        val = metric.compute(pred, target)
+        assert type(val) is float, f"Expected float for {name}, got {type(val)}"
+        assert math.isfinite(val), f"Expected finite score for {name}, got {val}"
 
-    for suite_metrics in (set5_metrics, urban_metrics):
-        for name, metric in suite_metrics.items():
-            val = metric.compute(pred, target)
-            assert type(val) is float, f"Expected float for {name}, got {type(val)}"
-            assert math.isfinite(val), f"Expected finite score for {name}, got {val}"
-
-    # Verify scale=2 interpolation propagates to crop_border across both suites
-    cfg_x2 = _compose("train", overrides=["scale=2"])
-    for suite_name in ("set5", "urban100"):
-        suite_cfg = cfg_x2.metric.val_suites[suite_name].metrics
-        psnr_m = instantiate(suite_cfg.psnr)
-        ssim_m = instantiate(suite_cfg.ssim)
-        assert isinstance(psnr_m, PSNRMetric) and psnr_m.crop_border == 2
-        assert isinstance(ssim_m, SSIMMetric) and ssim_m.crop_border == 2
-        assert math.isfinite(psnr_m.compute(pred, target))
-        assert math.isfinite(ssim_m.compute(pred, target))
+    # Verify CLI crop_border override propagates cleanly
+    cfg_cb2 = _compose(
+        "train",
+        overrides=[
+            "experiment=vosr2_onestep_text",
+            f"metric.val_suites.{primary_suite}.metrics.psnr.crop_border=2",
+            f"metric.val_suites.{primary_suite}.metrics.ssim.crop_border=2",
+        ],
+    )
+    suite_cfg = cfg_cb2.metric.val_suites[primary_suite].metrics
+    psnr_m = instantiate(suite_cfg.psnr)
+    ssim_m = instantiate(suite_cfg.ssim)
+    assert isinstance(psnr_m, PSNRMetric) and psnr_m.crop_border == 2
+    assert isinstance(ssim_m, SSIMMetric) and ssim_m.crop_border == 2
+    assert math.isfinite(psnr_m.compute(pred, target))
+    assert math.isfinite(ssim_m.compute(pred, target))

@@ -11,7 +11,13 @@ from .config import (
     setup_experiment_dirs,
 )
 from .image import IMAGE_EXTENSIONS, load_image, make_comparison_image, save_image
-from .logging import format_eta, format_train_log, log_images_to_trackers, setup_logger
+from .logging import (
+    format_eta,
+    format_train_log,
+    log_image_dict_to_trackers,
+    log_images_to_trackers,
+    setup_logger,
+)
 from .misc import (
     load_weights,
     pad_to_min_size,
@@ -35,6 +41,7 @@ __all__ = [
     "setup_logger",
     "format_eta",
     "format_train_log",
+    "log_image_dict_to_trackers",
     "log_images_to_trackers",
     "strip_state_dict_prefix",
     "load_weights",

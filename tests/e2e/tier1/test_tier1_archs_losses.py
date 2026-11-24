@@ -58,18 +58,19 @@ def test_t1_dummysrnet_scales_arbitrary_dims_and_backward() -> None:
 
 
 def test_t1_archs_and_losses_export_exclusivity() -> None:
-    """F02, F13-F15, Req #5: archs exports ONLY VOSR2OneStep; losses export built-ins."""
+    """F02, F13-F15, Req #5: archs exports 3 independent VOSR2 archs; losses export built-ins."""
     import hydra.utils
 
     import archs as archs_pkg
     import losses as losses_pkg
 
     assert hasattr(archs_pkg, "__all__")
-    assert set(archs_pkg.__all__) == {"VOSR2OneStep"}, (
+    assert set(archs_pkg.__all__) == {"AutoencoderKLQwenImage2D", "VOSR2DiT", "DINOv2Encoder"}, (
         f"Unexpected archs.__all__: {archs_pkg.__all__!r}"
     )
-    assert hydra.utils.get_class("archs.VOSR2OneStep") is archs_pkg.VOSR2OneStep
-    for forbidden_arch in ("ToyModel", "RRDBNet", "SwinIR", "TinySRNet"):
+    for sym in ("AutoencoderKLQwenImage2D", "VOSR2DiT", "DINOv2Encoder"):
+        assert hydra.utils.get_class(f"archs.{sym}") is getattr(archs_pkg, sym)
+    for forbidden_arch in ("VOSR2OneStep", "ToyModel", "RRDBNet", "SwinIR", "TinySRNet"):
         assert not hasattr(archs_pkg, forbidden_arch), (
             f"Forbidden architecture {forbidden_arch!r} exposed in archs"
         )

@@ -16,16 +16,16 @@ from typing import Any
 import pytest
 
 
-def test_t2_e01_srmodel_empty_or_nonpositive_loss_fails_fast(
+def test_t2_e01_vosr_model_empty_or_nonpositive_loss_fails_fast(
     e2e_workdir: dict[str, Path],
     paired_train_source_factory: Callable[..., dict[str, Any]],
     minimal_train_cfg_factory: Callable[..., Any],
     accelerate_state_resetter: Callable[[], None],
 ) -> None:
-    """F43: SRModel fails fast with ValueError when cfg.loss is empty or has no positive weights."""
+    """F43: VOSRModel fails fast with ValueError when cfg.loss is empty or has no positive weights."""
     from accelerate import Accelerator
 
-    from models import SRModel
+    from models import VOSRModel
 
     src = paired_train_source_factory(name="loss_fail_src", n_samples=2, lq_h=16, lq_w=16, scale=2)
     invalid_loss_cfgs: list[dict[str, Any]] = [
@@ -56,29 +56,29 @@ def test_t2_e01_srmodel_empty_or_nonpositive_loss_fails_fast(
         )
         acc = Accelerator(cpu=True, mixed_precision="no")
         with pytest.raises(ValueError, match="."):
-            model = SRModel(cfg)
+            model = VOSRModel(cfg)
             model.setup(acc)
 
 
-def test_t2_e02_srmodel_pretrain_path_edge_cases(
+def test_t2_e02_vosr_model_pretrain_edge_cases(
     e2e_workdir: dict[str, Path],
     paired_train_source_factory: Callable[..., dict[str, Any]],
     minimal_train_cfg_factory: Callable[..., Any],
     accelerate_state_resetter: Callable[[], None],
 ) -> None:
-    """F43: SRModel pretrain_path enforces missing file/key/strict errors and partial load into EMA."""
+    """F43: VOSRModel model.pretrain.dit enforces missing file/key/strict errors and partial load into EMA."""
     import torch
     from accelerate import Accelerator
-    from tests.dummy_arch import DummySRNet
+    from tests.dummy_arch import DummyDiT
 
-    from models import SRModel
+    from models import VOSRModel
     from utils.misc import save_safetensors
 
     torch.manual_seed(42)
-    ref_net = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
+    ref_dit = DummyDiT(in_channels=8, out_channels=4, patch_size=2, hidden_ch=8, z_dims=8)
     ref_sd = {
         k: (v.detach().cpu() + 0.25 if torch.is_floating_point(v) else v.detach().cpu().clone())
-        for k, v in ref_net.state_dict().items()
+        for k, v in ref_dit.state_dict().items()
     }
 
     pth_no_key = e2e_workdir["work"] / "pretrain_no_ema_key.pth"
@@ -98,24 +98,24 @@ def test_t2_e02_srmodel_pretrain_path_edge_cases(
     cfg_a = minimal_train_cfg_factory(
         e2e_workdir["work"] / "pt_missing", [src], val_suites={}, has_degradation=False, use_ema=True
     )
-    cfg_a.model.pretrain_path = str(e2e_workdir["work"] / "no_such_weights.safetensors")
-    cfg_a.model.pretrain_strict = True
-    cfg_a.model.pretrain_key = None
+    cfg_a.model.pretrain.dit.path = str(e2e_workdir["work"] / "no_such_weights.safetensors")
+    cfg_a.model.pretrain.dit.strict = True
+    cfg_a.model.pretrain.dit.key = None
     with pytest.raises(FileNotFoundError):
-        SRModel(cfg_a).setup(Accelerator(cpu=True, mixed_precision="no"))
+        VOSRModel(cfg_a).setup(Accelerator(cpu=True, mixed_precision="no"))
 
-    # (b) Missing pretrain_key in .pth -> KeyError / ValueError
+    # (b) Missing pretrain key in .pth -> KeyError / ValueError
     accelerate_state_resetter()
     cfg_b = minimal_train_cfg_factory(
         e2e_workdir["work"] / "pt_bad_key", [src], val_suites={}, has_degradation=False, use_ema=True
     )
-    cfg_b.model.pretrain_path = str(pth_no_key)
-    cfg_b.model.pretrain_strict = True
-    cfg_b.model.pretrain_key = "params_ema"
+    cfg_b.model.pretrain.dit.path = str(pth_no_key)
+    cfg_b.model.pretrain.dit.strict = True
+    cfg_b.model.pretrain.dit.key = "params_ema"
     with pytest.raises((KeyError, ValueError)):
-        SRModel(cfg_b).setup(Accelerator(cpu=True, mixed_precision="no"))
+        VOSRModel(cfg_b).setup(Accelerator(cpu=True, mixed_precision="no"))
 
-    # (c) Key mismatch with pretrain_strict=True -> RuntimeError
+    # (c) Key mismatch with strict=True -> RuntimeError
     accelerate_state_resetter()
     cfg_c = minimal_train_cfg_factory(
         e2e_workdir["work"] / "pt_strict_fail",
@@ -124,13 +124,13 @@ def test_t2_e02_srmodel_pretrain_path_edge_cases(
         has_degradation=False,
         use_ema=True,
     )
-    cfg_c.model.pretrain_path = str(st_mismatch)
-    cfg_c.model.pretrain_strict = True
-    cfg_c.model.pretrain_key = None
+    cfg_c.model.pretrain.dit.path = str(st_mismatch)
+    cfg_c.model.pretrain.dit.strict = True
+    cfg_c.model.pretrain.dit.key = None
     with pytest.raises(RuntimeError):
-        SRModel(cfg_c).setup(Accelerator(cpu=True, mixed_precision="no"))
+        VOSRModel(cfg_c).setup(Accelerator(cpu=True, mixed_precision="no"))
 
-    # (d) Partial mismatch with pretrain_strict=False succeeds & clones into EMA
+    # (d) Partial mismatch with strict=False succeeds & clones into DiT EMA
     accelerate_state_resetter()
     cfg_d = minimal_train_cfg_factory(
         e2e_workdir["work"] / "pt_non_strict",
@@ -139,20 +139,20 @@ def test_t2_e02_srmodel_pretrain_path_edge_cases(
         has_degradation=False,
         use_ema=True,
     )
-    cfg_d.model.pretrain_path = str(st_mismatch)
-    cfg_d.model.pretrain_strict = False
-    cfg_d.model.pretrain_key = None
-    model_d = SRModel(cfg_d)
+    cfg_d.model.pretrain.dit.path = str(st_mismatch)
+    cfg_d.model.pretrain.dit.strict = False
+    cfg_d.model.pretrain.dit.key = None
+    model_d = VOSRModel(cfg_d)
     model_d.setup(Accelerator(cpu=True, mixed_precision="no"))
 
-    main_sd = model_d.get_infer_network(use_ema=False).state_dict()
-    ema_sd = model_d.get_infer_network(use_ema=True).state_dict()
+    main_sd = model_d.get_infer_network(use_ema=False).dit.state_dict()
+    ema_sd = model_d.get_infer_network(use_ema=True).dit.state_dict()
     for k in shared_keys:
         assert torch.allclose(main_sd[k].detach().cpu(), ref_sd[k], atol=1e-6)
         assert torch.allclose(ema_sd[k].detach().cpu(), ref_sd[k], atol=1e-6)
 
 
-def test_t2_e03_srmodel_optimizer_step_was_skipped_gating(
+def test_t2_e03_vosr_model_optimizer_step_was_skipped_gating(
     e2e_workdir: dict[str, Path],
     paired_train_source_factory: Callable[..., dict[str, Any]],
     minimal_train_cfg_factory: Callable[..., Any],
@@ -161,7 +161,7 @@ def test_t2_e03_srmodel_optimizer_step_was_skipped_gating(
     import torch
     from accelerate import Accelerator
 
-    from models import SRModel
+    from models import VOSRModel
 
     class _OverflowSimAccelerator(Accelerator):
         """Genuine Accelerator subclass simulating FP16 GradScaler overflow on CPU."""
@@ -195,7 +195,7 @@ def test_t2_e03_srmodel_optimizer_step_was_skipped_gating(
     cfg.model.ema.warmup_steps = 0
 
     acc = _OverflowSimAccelerator(cpu=True, mixed_precision="no", gradient_accumulation_steps=1)
-    model = SRModel(cfg)
+    model = VOSRModel(cfg)
     model.setup(acc)
 
     lr_init = next(iter(model.get_lr_dict().values()))
@@ -344,8 +344,8 @@ def test_t2_e05_checkpointer_and_trainer_resume_auto_empty_vs_missing_path(
     )
     Trainer(cfg_auto).fit()
     assert (work_auto / "checkpoints" / "state_iter_000002").is_dir()
-    assert (work_auto / "weights" / "iter_000002.safetensors").is_file()
-    assert (work_auto / "weights" / "latest.safetensors").is_file()
+    assert (work_auto / "weights" / "iter_000002_dit.safetensors").is_file()
+    assert (work_auto / "weights" / "latest_dit.safetensors").is_file()
 
     accelerate_state_resetter()
     cfg_bad = minimal_train_cfg_factory(
@@ -392,8 +392,8 @@ def test_t2_e06_trainer_resume_already_completed_run_is_noop(
     Trainer(cfg_init).fit()
     assert (work_dir / "checkpoints" / "state_iter_000004").is_dir()
 
-    sd_main_4 = load_file(str(work_dir / "weights" / "latest.safetensors"))
-    sd_ema_4 = load_file(str(work_dir / "weights" / "latest_ema.safetensors"))
+    sd_main_4 = load_file(str(work_dir / "weights" / "latest_dit.safetensors"))
+    sd_ema_4 = load_file(str(work_dir / "weights" / "latest_dit_ema.safetensors"))
 
     for target_iters in (4, 2):
         accelerate_state_resetter()
@@ -413,10 +413,10 @@ def test_t2_e06_trainer_resume_already_completed_run_is_noop(
 
         ckpt_dirs = {p.name for p in (work_dir / "checkpoints").iterdir() if p.is_dir()}
         assert ckpt_dirs == {"state_iter_000004"}
-        assert not (work_dir / "weights" / "iter_000005.safetensors").exists()
+        assert not (work_dir / "weights" / "iter_000005_dit.safetensors").exists()
 
-        sd_main_now = load_file(str(work_dir / "weights" / "latest.safetensors"))
-        sd_ema_now = load_file(str(work_dir / "weights" / "latest_ema.safetensors"))
+        sd_main_now = load_file(str(work_dir / "weights" / "latest_dit.safetensors"))
+        sd_ema_now = load_file(str(work_dir / "weights" / "latest_dit_ema.safetensors"))
         assert set(sd_main_now.keys()) == set(sd_main_4.keys())
         assert set(sd_ema_now.keys()) == set(sd_ema_4.keys())
         assert all(torch.equal(sd_main_now[k], sd_main_4[k]) for k in sd_main_4)
@@ -476,14 +476,14 @@ def test_t2_e07_trainer_lower_is_better_and_nan_metric_best_guard(
     cfg_low.optim.optimizer.lr = 1.0e-2
     Trainer(cfg_low).fit()
 
-    sd_1 = load_file(str(work_low / "weights" / "iter_000001.safetensors"))
-    sd_2 = load_file(str(work_low / "weights" / "iter_000002.safetensors"))
-    sd_3 = load_file(str(work_low / "weights" / "iter_000003.safetensors"))
-    sd_best = load_file(str(work_low / "weights" / "best_low_suite_err.safetensors"))
+    sd_1 = load_file(str(work_low / "weights" / "iter_000001_dit.safetensors"))
+    sd_2 = load_file(str(work_low / "weights" / "iter_000002_dit.safetensors"))
+    sd_3 = load_file(str(work_low / "weights" / "iter_000003_dit.safetensors"))
+    sd_best = load_file(str(work_low / "weights" / "best_low_suite_err_dit.safetensors"))
     assert any(not torch.equal(sd_1[k], sd_2[k]) for k in sd_1)
     assert any(not torch.equal(sd_2[k], sd_3[k]) for k in sd_2)
     assert all(torch.equal(sd_best[k], sd_2[k]) for k in sd_best), (
-        "Expected best_low_suite_err.safetensors to hold step-2 weights (lowest error 0.2)"
+        "Expected best_low_suite_err_dit.safetensors to hold step-2 weights (lowest error 0.2)"
     )
 
     # Part B1: Fresh run with MockNaNMetric never writes best_*.safetensors
@@ -511,7 +511,7 @@ def test_t2_e07_trainer_lower_is_better_and_nan_metric_best_guard(
         val_save_visuals=False,
     )
     Trainer(cfg_nan_fresh).fit()
-    assert not (work_nan_fresh / "weights" / "best_nan_suite_nan_m.safetensors").exists()
+    assert list((work_nan_fresh / "weights").glob("best_*.safetensors")) == []
 
     # Part B2: Resumed run with MockNaNMetric never overwrites existing finite best weights/state
     accelerate_state_resetter()
@@ -546,7 +546,7 @@ def test_t2_e07_trainer_lower_is_better_and_nan_metric_best_guard(
     cfg_p1.optim.optimizer.lr = 1.0e-2
     Trainer(cfg_p1).fit()
 
-    best_path = work_nan_keep / "weights" / "best_s1_score.safetensors"
+    best_path = work_nan_keep / "weights" / "best_s1_score_dit.safetensors"
     assert best_path.is_file()
     sd_best_step1 = load_file(str(best_path))
 
@@ -577,7 +577,7 @@ def test_t2_e07_trainer_lower_is_better_and_nan_metric_best_guard(
     trainer2 = Trainer(cfg_p2)
     trainer2.fit()
 
-    sd_step2 = load_file(str(work_nan_keep / "weights" / "iter_000002.safetensors"))
+    sd_step2 = load_file(str(work_nan_keep / "weights" / "iter_000002_dit.safetensors"))
     sd_best_after = load_file(str(best_path))
     assert any(not torch.equal(sd_step2[k], sd_best_step1[k]) for k in sd_step2)
     assert all(torch.equal(sd_best_after[k], sd_best_step1[k]) for k in sd_best_after)
@@ -652,7 +652,7 @@ def test_t2_e08_trainer_val_suites_config_boundaries_and_val_interval_zero(
         has_degradation=False,
     )
     Trainer(cfg_noval).fit()
-    assert (work_noval / "weights" / "latest.safetensors").is_file()
+    assert (work_noval / "weights" / "latest_dit.safetensors").is_file()
     assert (work_noval / "checkpoints" / "state_iter_000002").is_dir()
     assert list((work_noval / "weights").glob("best_*.safetensors")) == []
     assert list((work_noval / "visuals").rglob("*.png")) == []
@@ -692,7 +692,7 @@ def test_t2_e08_trainer_val_suites_config_boundaries_and_val_interval_zero(
         val_save_visuals=True,
     )
     Trainer(cfg_v0).fit()
-    assert (work_v0 / "weights" / "iter_000003.safetensors").is_file()
+    assert (work_v0 / "weights" / "iter_000003_dit.safetensors").is_file()
     assert not (work_v0 / "visuals" / "iter_000001").exists()
     assert not (work_v0 / "visuals" / "iter_000002").exists()
     if val0_state.exists():

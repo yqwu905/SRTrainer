@@ -40,3 +40,4 @@ htmlcov/
 *.swo
 
 fusion_result.json
+kernel_meta

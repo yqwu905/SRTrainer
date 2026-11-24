@@ -85,7 +85,7 @@ def build_subprocess_env(
 ) -> dict[str, str]:
     """Build deterministic CPU-safe subprocess environment with repo on PYTHONPATH."""
     env = os.environ.copy()
-    py_paths = [str(REPO_ROOT), str(REPO_ROOT / "src")]
+    py_paths = [str(REPO_ROOT / "src"), str(REPO_ROOT)]
     if env.get("PYTHONPATH"):
         py_paths.append(env["PYTHONPATH"])
     env["PYTHONPATH"] = os.pathsep.join(py_paths)
@@ -96,6 +96,8 @@ def build_subprocess_env(
     if distributed_cpu:
         env["ACCELERATE_USE_CPU"] = "true"
         env["MASTER_ADDR"] = "127.0.0.1"
+        if sys.platform == "darwin" and "GLOO_SOCKET_IFNAME" not in env:
+            env["GLOO_SOCKET_IFNAME"] = "lo0"
     if extra:
         env.update(extra)
     return env
@@ -176,8 +178,8 @@ def run_torchrun_cpu(
         sys.executable,
         "-m",
         "torch.distributed.run",
-        "--standalone",
         f"--nproc_per_node={nproc_per_node}",
+        "--master_addr=127.0.0.1",
         f"--master_port={port}",
         str(script_path),
         *args,
@@ -621,7 +623,7 @@ def make_bias_tagged_exp_dir(
     weights_dir.mkdir(parents=True, exist_ok=True)
 
     arch_dict = get_toy_model_arch_dict(scale=scale)
-    cfg = compose_hydra_cfg("train")
+    cfg = compose_hydra_cfg("train", overrides=["experiment=vosr2_onestep_text"])
     OmegaConf.set_struct(cfg, False)
     cfg.scale = scale
     cfg.exp_name = exp_path.name
@@ -770,11 +772,12 @@ def make_minimal_train_cfg(
     val_max_save_images: int = 2,
     val_use_ema: bool = True,
 ) -> Any:
-    """Build a compact CPU-safe OmegaConf DictConfig for in-process ``Trainer``/``SRModel`` tests."""
+    """Build a compact CPU-safe OmegaConf DictConfig for in-process ``Trainer``/``VOSRModel`` tests."""
     from omegaconf import OmegaConf
+    from tests.dummy_arch import get_dummy_vosr_arch_dict
 
     work_path = Path(work_dir)
-    cfg = compose_hydra_cfg("train")
+    cfg = compose_hydra_cfg("train", overrides=["experiment=vosr2_onestep_text"])
     OmegaConf.set_struct(cfg, False)
 
     cfg.scale = scale
@@ -783,11 +786,29 @@ def make_minimal_train_cfg(
     cfg.work_dir = str(work_path)
 
     cfg.arch = OmegaConf.create(
-        dict(arch_cfg) if arch_cfg is not None else get_toy_model_arch_dict(scale=scale)
+        dict(arch_cfg) if arch_cfg is not None else get_dummy_vosr_arch_dict()
     )
     if loss_cfg is not None:
         cfg.loss = OmegaConf.create(dict(loss_cfg))
+    else:
+        cfg.loss = OmegaConf.create(
+            {
+                "l1": {
+                    "weight": 1.0,
+                    "criterion": {"_target_": "losses.L1Loss", "reduction": "mean"},
+                }
+            }
+        )
 
+    cfg.model.scale = scale
+    cfg.model.trainable = OmegaConf.create({"vae": False, "dit": True, "dino": False})
+    cfg.model.pretrain = OmegaConf.create(
+        {
+            "vae": {"path": None, "strict": True, "key": None},
+            "dit": {"path": None, "strict": True, "key": None},
+            "dino": {"path": None, "strict": True, "key": None},
+        }
+    )
     cfg.model.ema.enabled = bool(use_ema)
 
     cfg.data.scale = scale
@@ -854,21 +875,30 @@ def make_minimal_train_overrides(
     experiment: str | None = None,
     extra_overrides: Sequence[str] | None = None,
 ) -> list[str]:
-    """Build compact CPU-safe ToyModel Hydra CLI overrides for ``tools/train.py`` runs."""
+    """Build compact CPU-safe VOSR Hydra CLI overrides for ``tools/train.py`` runs."""
+    from tests.dummy_arch import get_dummy_vosr_arch_dict
+
+    del arch_num_feat, arch_num_block
     tile_size = gt_size // scale
     safe_overlap = min(4, max(0, (tile_size // 2) - 1))
 
-    overrides: list[str] = []
-    if experiment is not None:
-        overrides.append(f"experiment={fmt_hydra_value(experiment)}")
+    exp_name_cfg = experiment if experiment is not None else "vosr2_onestep_text"
+    has_loss_override = any(
+        ov.startswith(("loss=", "~loss", "+loss=")) for ov in (extra_overrides or ())
+    )
+    overrides: list[str] = [f"experiment={fmt_hydra_value(exp_name_cfg)}"]
+    if not has_loss_override:
+        overrides.append("loss=l1")
 
     overrides.extend(
         [
             f"scale={scale}",
             f"output_root={fmt_hydra_value(str(output_root))}",
             f"exp_name={fmt_hydra_value(exp_name)}",
-            "~arch",
-            f"+arch={fmt_hydra_value(get_toy_model_arch_dict(scale=scale, num_feat=arch_num_feat, num_block=arch_num_block))}",
+            "~arch/vae",
+            "~arch/dit",
+            "~arch/dino",
+            f"+arch={fmt_hydra_value(get_dummy_vosr_arch_dict())}",
             f"data.gt_size={gt_size}",
             f"data.batch_size_per_gpu={batch_size}",
             f"data.num_workers={CPU_NUM_WORKERS}",

@@ -15,7 +15,7 @@ import hydra
 import torch
 from accelerate import Accelerator
 from accelerate.state import AcceleratorState, GradientState, PartialState
-from accelerate.utils import ProjectConfiguration, set_seed
+from accelerate.utils import ProjectConfiguration, set_seed, DistributedDataParallelKwargs
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
@@ -39,7 +39,12 @@ from utils.config import (
     setup_experiment_dirs,
 )
 from utils.image import load_image, make_comparison_image, save_image
-from utils.logging import format_train_log, log_images_to_trackers, setup_logger
+from utils.logging import (
+    format_train_log,
+    log_image_dict_to_trackers,
+    log_images_to_trackers,
+    setup_logger,
+)
 
 __all__ = ["Trainer"]
 
@@ -95,6 +100,23 @@ def _optional_stripped_str(value: Any, name: str) -> str | None:
         raise ValueError(f"{name} must be a string or None, got {type(value).__name__}: {value!r}.")
     stripped = value.strip()
     return stripped if stripped else None
+
+
+_VALID_TRAIN_LOG_IMAGE_MODES: frozenset[str] = frozenset({"comparison", "separate"})
+
+
+def _require_train_log_image_mode(value: Any, name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(
+            f"{name} must be one of {sorted(_VALID_TRAIN_LOG_IMAGE_MODES)}, "
+            f"got {type(value).__name__}: {value!r}."
+        )
+    normalized = value.strip().lower()
+    if normalized not in _VALID_TRAIN_LOG_IMAGE_MODES:
+        raise ValueError(
+            f"{name} must be one of {sorted(_VALID_TRAIN_LOG_IMAGE_MODES)}, got {value!r}."
+        )
+    return normalized
 
 
 def _normalize_log_with(raw: Any) -> list[str] | None:
@@ -182,7 +204,7 @@ def _validate_resume_early(raw_resume: Any) -> None:
     if not explicit.is_dir():
         raise ValueError(
             f"Resume path must be a checkpoint state directory, got file: {explicit} "
-            "(use model.pretrain_path for weight files)."
+            "(use model.pretrain.<arch>.path for weight files)."
         )
 
 
@@ -260,6 +282,18 @@ class Trainer:
         )
         self.mixed_precision: str = normalize_mixed_precision(
             OmegaConf.select(cfg_oc, "trainer.mixed_precision", default="no")
+        )
+        self.train_log_image_interval: int = _require_interval(
+            OmegaConf.select(cfg_oc, "trainer.train_log_image_interval", default=0),
+            "trainer.train_log_image_interval",
+        )
+        self.train_max_log_images: int = _require_non_negative_int(
+            OmegaConf.select(cfg_oc, "trainer.train_max_log_images", default=4),
+            "trainer.train_max_log_images",
+        )
+        self.train_log_image_mode: str = _require_train_log_image_mode(
+            OmegaConf.select(cfg_oc, "trainer.train_log_image_mode", default="comparison"),
+            "trainer.train_log_image_mode",
         )
         self.val_save_visuals: bool = _require_bool(
             OmegaConf.select(cfg_oc, "trainer.val_save_visuals", default=True),
@@ -426,11 +460,22 @@ class Trainer:
                 logging_dir=str(self.work_dir / "trackers"),
                 automatic_checkpoint_naming=False,
             )
+            ddp_kwargs = DistributedDataParallelKwargs(
+                # 默认 True 最稳（保守，兼容任意自定义 arch）。
+                # 若所用 arch 已通过 ``freeze_unused_parameters()`` 冻结前向旁路参数
+                # （如 VOSR2PBDiT 的 ``context_embedder``），可设为 False 去掉每步图遍历开销。
+                find_unused_parameters=bool(
+                    OmegaConf.select(
+                        cfg_oc, "trainer.ddp_find_unused_parameters", default=True
+                    )
+                ),
+            )
             self.accelerator = Accelerator(
                 mixed_precision=self.mixed_precision,
                 gradient_accumulation_steps=self.grad_accum_steps,
                 log_with=normalized_log_with,
                 project_config=project_config,
+                kwargs_handlers=[ddp_kwargs],
             )
 
             # Step 4: Rank-0 experiment directory creation & config_resolved.yaml persistence.
@@ -477,8 +522,8 @@ class Trainer:
 
             # Step 7: Instantiate & setup model, TrainState, Checkpointer, and deterministic registration.
             # NOTE: Never wrap model.setup() in main_process_first() because setup() invokes
-            # collective accelerator.prepare() (DDP sync). Pretrained loss downloads are guarded
-            # inside SRModel.setup() Step 1 before prepare().
+            # collective accelerator.prepare() (DDP sync). Pretrained loss/arch downloads are guarded
+            # inside VOSRModel.setup() Step 1 before prepare().
             model_obj = hydra.utils.instantiate(self.cfg.model, cfg=self.cfg, _recursive_=False)
             if not isinstance(model_obj, BaseModel):
                 raise TypeError(
@@ -658,6 +703,81 @@ class Trainer:
         self.checkpointer.save_state(self.accelerator, step)
         exported = self.model.export_weights(self.accelerator)
         self.checkpointer.save_weights(self.accelerator, exported, step)
+
+    def _should_log_train_images(self, step: int) -> bool:
+        return (
+            self.accelerator is not None
+            and self.accelerator.is_main_process
+            and bool(self.accelerator.trackers)
+            and self.train_log_image_interval > 0
+            and self.train_max_log_images > 0
+            and (step % self.train_log_image_interval == 0 or step == self.total_iters)
+        )
+
+    def _log_train_images(self, step: int) -> None:
+        assert self.accelerator is not None
+        visuals = self.model.pop_train_visuals()
+        if not visuals:
+            return
+        if not self.accelerator.is_main_process or not self.accelerator.trackers:
+            return
+
+        lq = visuals.get("lq")
+        gt = visuals.get("gt")
+        pred = visuals.get("pred")
+        if (
+            not isinstance(lq, torch.Tensor)
+            or not isinstance(gt, torch.Tensor)
+            or not isinstance(pred, torch.Tensor)
+            or lq.ndim != 4
+            or gt.ndim != 4
+            or pred.ndim != 4
+        ):
+            return
+
+        num_images = min(
+            self.train_max_log_images,
+            int(lq.shape[0]),
+            int(gt.shape[0]),
+            int(pred.shape[0]),
+        )
+        if num_images <= 0:
+            return
+
+        lq_clean = torch.nan_to_num(
+            lq[:num_images].detach().to(device="cpu", dtype=torch.float32),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0)
+        pred_clean = torch.nan_to_num(
+            pred[:num_images].detach().to(device="cpu", dtype=torch.float32),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0)
+        gt_clean = torch.nan_to_num(
+            gt[:num_images].detach().to(device="cpu", dtype=torch.float32),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0)
+
+        image_payload: dict[str, torch.Tensor] = {}
+        if self.train_log_image_mode == "comparison":
+            for idx in range(num_images):
+                image_payload[f"train/lq_pred_gt/sample_{idx:02d}"] = make_comparison_image(
+                    lq=lq_clean[idx],
+                    sr=pred_clean[idx],
+                    gt=gt_clean[idx],
+                )
+        else:
+            for idx in range(num_images):
+                image_payload[f"train/sample_{idx:02d}/lq"] = lq_clean[idx]
+                image_payload[f"train/sample_{idx:02d}/pred"] = pred_clean[idx]
+                image_payload[f"train/sample_{idx:02d}/gt"] = gt_clean[idx]
+
+        log_image_dict_to_trackers(self.accelerator, image_payload, step=step)
 
     def validate(self, step: int) -> dict[str, dict[str, float]]:
         """Run distributed exact validation across all ``metric.val_suites`` using ``TiledInferencer``."""
@@ -848,28 +968,26 @@ class Trainer:
                     higher_is_better=higher_is_better,
                 )
                 if is_new_best:
-                    exported = self.model.export_weights(self.accelerator)
-                    best_sd = (
-                        exported["net_g_ema"]
-                        if (self.val_use_ema and "net_g_ema" in exported)
-                        else exported["net_g"]
-                    )
-                    self.checkpointer.save_best(
+                    best_weights = self.model.export_infer_weights(
                         self.accelerator,
-                        best_sd,
+                        use_ema=self.val_use_ema,
+                    )
+                    saved_best = self.checkpointer.save_best_weights(
+                        self.accelerator,
+                        best_weights,
                         self.primary_dataset,
                         self.primary_metric,
                         step=step,
                         metric_value=current_val,
                     )
                     prev_str = "None" if prev_best is None else f"{prev_best:.4f}"
+                    saved_names = ", ".join(p.name for p in saved_best.values())
                     self.logger.info(
-                        "[Best] Updated %s: %s -> %.4f (saved best_%s_%s.safetensors)",
+                        "[Best] Updated %s: %s -> %.4f (saved %s)",
                         best_key,
                         prev_str,
                         current_val,
-                        self.primary_dataset,
-                        self.primary_metric,
+                        saved_names or f"best_{self.primary_dataset}_{self.primary_metric}.safetensors",
                     )
         finally:
             if was_training:
@@ -913,6 +1031,12 @@ class Trainer:
             while self.train_state.global_step < self.total_iters:
                 batch = next(train_iter)
                 batch = self.model.preprocess_batch(batch)
+                next_step = self.train_state.global_step + 1
+                capture_train_visuals = self._should_log_train_images(next_step)
+                self.model.set_capture_train_visuals(
+                    capture_train_visuals,
+                    max_images=self.train_max_log_images if capture_train_visuals else 0,
+                )
                 step_scalars, stepped = self.model.train_step(batch, self.train_state.global_step)
 
                 if self.log_interval > 0:
@@ -967,10 +1091,17 @@ class Trainer:
                     window_steps = 0
                     window_start = time.perf_counter()
 
-                # 2) Periodic / final validation BEFORE checkpoint save so best_metrics & RNG stay synced.
+                # 2) Periodic training visuals, validation, and checkpointing (paused from it/s).
                 pause_start = time.perf_counter()
                 did_pause = False
 
+                if self._should_log_train_images(step):
+                    self._log_train_images(step)
+                    did_pause = True
+                else:
+                    self.model.pop_train_visuals()
+
+                # 3) Periodic / final validation BEFORE checkpoint save so best_metrics & RNG stay synced.
                 should_val = bool(self.val_suites) and (
                     (self.val_interval > 0 and step % self.val_interval == 0)
                     or step == self.total_iters
@@ -980,7 +1111,7 @@ class Trainer:
                     last_val_step = step
                     did_pause = True
 
-                # 3) Periodic / final dual-track checkpoint save.
+                # 4) Periodic / final dual-track checkpoint save.
                 should_save = (
                     (self.save_interval > 0 and step % self.save_interval == 0)
                     or step == self.total_iters
@@ -1011,6 +1142,7 @@ class Trainer:
             )
             return self.train_state
         finally:
+            self.model.set_capture_train_visuals(False, max_images=0)
             self._flush_logger()
             if not self._training_ended:
                 self._training_ended = True
