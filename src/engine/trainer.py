@@ -15,7 +15,7 @@ import hydra
 import torch
 from accelerate import Accelerator
 from accelerate.state import AcceleratorState, GradientState, PartialState
-from accelerate.utils import ProjectConfiguration, set_seed
+from accelerate.utils import ProjectConfiguration, set_seed, DistributedDataParallelKwargs
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
@@ -460,11 +460,23 @@ class Trainer:
                 logging_dir=str(self.work_dir / "trackers"),
                 automatic_checkpoint_naming=False,
             )
+            ddp_kwargs = DistributedDataParallelKwargs(
+                # 默认 True：VOSR2PBOneStep 当前有两处参数不参与反向图
+                #   context_embedder.*（joint_attention_dim 占位，永远不会被调用）
+                #   adapter.*（DINO 条件分支在 _PBBackends.extract_cond 的 no_grad 里）
+                # 把它们从接收梯度的集合里去掉后，可改设为 False 去掉每步的图遍历开销。
+                find_unused_parameters=bool(
+                    OmegaConf.select(
+                        cfg_oc, "trainer.ddp_find_unused_parameters", default=True
+                    )
+                ),
+            )
             self.accelerator = Accelerator(
                 mixed_precision=self.mixed_precision,
                 gradient_accumulation_steps=self.grad_accum_steps,
                 log_with=normalized_log_with,
                 project_config=project_config,
+                kwargs_handlers=[ddp_kwargs],
             )
 
             # Step 4: Rank-0 experiment directory creation & config_resolved.yaml persistence.
