@@ -39,7 +39,7 @@ from metrics import (
 )
 from metrics.ocr_metrics import (
     DEFAULT_OCR_MODEL,
-    PaddleTextRecognizer,
+    RapidOCRTextRecognizer,
     clear_ocr_caches,
     crop_text_region,
     edit_distance,
@@ -148,7 +148,7 @@ def _install_fake_recognizer(
     _ScopedRecognizer.instances = []
     _ScopedRecognizer.scripted_outputs = list(scripted_outputs or [])
     _ScopedRecognizer.default_fn = staticmethod(default_fn) if default_fn is not None else None
-    monkeypatch.setattr(ocr_mod, "PaddleTextRecognizer", _ScopedRecognizer)
+    monkeypatch.setattr(ocr_mod, "RapidOCRTextRecognizer", _ScopedRecognizer)
     return _ScopedRecognizer
 
 
@@ -751,112 +751,116 @@ def test_crop_text_region_cv2_contract_and_real_cv2_if_installed(
     assert vertical_real_crop.shape == (20, 30, 3)
 
 
-def test_paddle_text_recognizer_cls_180_rotation_local_dirs_and_count_errors(
+def test_rapidocr_text_recognizer_cls_180_rotation_local_paths_and_count_errors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify optional 180-deg orientation cls, local model dirs, and strict output count checks."""
     rec_dir = tmp_path / "rec_model"
-    cls_dir = tmp_path / "cls_model"
     rec_dir.mkdir()
-    cls_dir.mkdir()
+    rec_path = rec_dir / "inference.onnx"
+    rec_path.touch()
+    dict_path = rec_dir / "dict.txt"
+    dict_path.touch()
+    cls_path = tmp_path / "cls.onnx"
+    cls_path.touch()
 
-    rec_init_calls: list[dict[str, Any]] = []
-    cls_init_calls: list[dict[str, Any]] = []
+    init_calls: list[dict[str, Any]] = []
     rec_seen_crops: list[np.ndarray] = []
+    counts = {"texts": 2, "scores": 2, "cls": 2}
 
-    rec_mode = {"count_delta": 0}
-    cls_mode = {"count_delta": 0}
+    class _FakeRapidOCR:
+        def __init__(self, *, params: dict[str, Any]) -> None:
+            init_calls.append(params)
 
-    class _FakeTextRecognition:
-        def __init__(self, **kwargs: Any) -> None:
-            rec_init_calls.append(kwargs)
+        def recognize_txt(self, crops: list[np.ndarray]) -> types.SimpleNamespace:
+            rec_seen_crops[:] = [crop.copy() for crop in crops]
+            return types.SimpleNamespace(
+                txts=("t0", "", "extra")[: counts["texts"]],
+                scores=(0.9, 0.0, 0.5)[: counts["scores"]],
+            )
 
-        def predict(self, crops: list[np.ndarray], batch_size: int = 1) -> list[dict[str, Any]]:
-            del batch_size
-            rec_seen_crops.clear()
-            rec_seen_crops.extend(crop.copy() for crop in crops)
-            out = [{"rec_text": f"t{idx}", "rec_score": 0.9} for idx in range(len(crops))]
-            if rec_mode["count_delta"] < 0:
-                return out[: rec_mode["count_delta"]]
-            if rec_mode["count_delta"] > 0:
-                return out + [{"rec_text": "extra", "rec_score": 0.5}] * rec_mode["count_delta"]
-            return out
+        def cls_and_rotate(
+            self, crops: list[np.ndarray]
+        ) -> tuple[list[np.ndarray], types.SimpleNamespace]:
+            oriented = [crops[0], np.ascontiguousarray(crops[1][::-1, ::-1])]
+            predictions = [("0", 0.9), ("180", 0.6), ("0", 0.5)][: counts["cls"]]
+            return oriented, types.SimpleNamespace(cls_res=predictions)
 
-    class _FakeOrientationCls:
-        def __init__(self, **kwargs: Any) -> None:
-            cls_init_calls.append(kwargs)
+    rapidocr = types.SimpleNamespace(
+        RapidOCR=_FakeRapidOCR,
+        OCRVersion=str,
+        ModelType=str,
+        EngineType=types.SimpleNamespace(ONNXRUNTIME="onnxruntime"),
+    )
+    onnxruntime = types.SimpleNamespace(get_available_providers=lambda: ["CPUExecutionProvider"])
+    monkeypatch.setattr(ocr_mod, "_import_rapidocr", lambda: (rapidocr, onnxruntime))
 
-        def predict(self, crops: list[np.ndarray], batch_size: int = 1) -> list[dict[str, Any]]:
-            del batch_size
-            out = [{"class_ids": np.array([idx % 2])} for idx in range(len(crops))]
-            if cls_mode["count_delta"] < 0:
-                return out[: cls_mode["count_delta"]]
-            if cls_mode["count_delta"] > 0:
-                return out + [{"class_ids": np.array([0])}] * cls_mode["count_delta"]
-            return out
-
-    fake_paddleocr = types.ModuleType("paddleocr")
-    fake_paddleocr.TextRecognition = _FakeTextRecognition  # type: ignore[attr-defined]
-    fake_paddleocr.TextLineOrientationClassification = _FakeOrientationCls  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "paddleocr", fake_paddleocr)
-
-    with pytest.raises(FileNotFoundError):
-        PaddleTextRecognizer(model_dir=tmp_path / "does_not_exist")
-    with pytest.raises(FileNotFoundError):
-        PaddleTextRecognizer(
+    with pytest.raises(FileNotFoundError, match="ONNX"):
+        RapidOCRTextRecognizer(model_dir=tmp_path / "does_not_exist")
+    with pytest.raises(FileNotFoundError, match="ONNX"):
+        RapidOCRTextRecognizer(
             cls_model_name="PP-LCNet_x1_0_textline_ori", cls_model_dir=tmp_path / "missing_cls"
         )
+    with pytest.raises(ValueError, match="Unknown OCR recognition model"):
+        RapidOCRTextRecognizer(model_name="other_model")
+    with pytest.raises(ValueError, match="requires CANNExecutionProvider"):
+        RapidOCRTextRecognizer(device="npu:1")
 
-    recognizer = PaddleTextRecognizer(
-        model_name="PP-OCRv5_server_rec",
+    recognizer = RapidOCRTextRecognizer(
         model_dir=rec_dir,
         cls_model_name="PP-LCNet_x1_0_textline_ori",
-        cls_model_dir=cls_dir,
+        cls_model_dir=cls_path,
         device="cpu",
         batch_size=2,
     )
-    assert rec_init_calls == [
-        {"model_name": "PP-OCRv5_server_rec", "model_dir": str(rec_dir), "device": "cpu"}
-    ]
-    assert cls_init_calls == [
-        {"model_name": "PP-LCNet_x1_0_textline_ori", "model_dir": str(cls_dir), "device": "cpu"}
-    ]
+    (params,) = init_calls
+    assert params["Global.use_det"] is False
+    assert params["Global.use_cls"] is True
+    assert params["Rec.engine_type"] == params["Cls.engine_type"] == "onnxruntime"
+    assert params["Rec.ocr_version"] == params["Cls.ocr_version"] == "PP-OCRv5"
+    assert params["Rec.model_type"] == params["Cls.model_type"] == "server"
+    assert params["Rec.lang_type"] == "ch"
+    assert params["Rec.model_path"] == str(rec_path)
+    assert params["Rec.rec_keys_path"] == str(dict_path)
+    assert params["Cls.model_path"] == str(cls_path)
+    assert params["Rec.rec_batch_num"] == params["Cls.cls_batch_num"] == 2
+    assert params["Cls.cls_thresh"] < 0.6
 
     crop0 = np.arange(2 * 3 * 3, dtype=np.uint8).reshape(2, 3, 3)
     crop1 = np.arange(100, 100 + 2 * 3 * 3, dtype=np.uint8).reshape(2, 3, 3)
-    outputs = recognizer([crop0, crop1])
-    assert outputs == [("t0", 0.9), ("t1", 0.9)]
+    assert recognizer([]) == []
+    assert recognizer([crop0, crop1]) == [("t0", 0.9), ("", 0.0)]
     np.testing.assert_array_equal(rec_seen_crops[0], crop0)
     np.testing.assert_array_equal(rec_seen_crops[1], crop1[::-1, ::-1])
 
-    for delta in (-1, 1):
-        rec_mode["count_delta"] = delta
-        with pytest.raises(RuntimeError, match="returned"):
-            recognizer([crop0, crop1])
-    rec_mode["count_delta"] = 0
+    for output in counts:
+        for count in (1, 3):
+            counts[output] = count
+            with pytest.raises(RuntimeError, match="returned"):
+                recognizer([crop0, crop1])
+        counts[output] = 2
 
-    for delta in (-1, 1):
-        cls_mode["count_delta"] = delta
-        with pytest.raises(RuntimeError, match="returned"):
-            recognizer([crop0, crop1])
-    cls_mode["count_delta"] = 0
+    onnxruntime.get_available_providers = lambda: ["CUDAExecutionProvider"]
+    RapidOCRTextRecognizer(device="gpu:2")
+    assert init_calls[-1]["EngineConfig.onnxruntime.use_cuda"] is True
+    assert init_calls[-1]["EngineConfig.onnxruntime.cuda_ep_cfg.device_id"] == 2
+    assert init_calls[-1]["Global.use_cls"] is False
+    assert init_calls[-1]["Rec.model_path"] is None
 
 
 def test_missing_optional_dependencies_raise_actionable_import_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify ordinary import/instantiation works without Paddle/OpenCV and missing deps error clearly."""
+    """Verify ordinary import/instantiation works without OCR dependencies and missing deps error clearly."""
     real_import = builtins.__import__
 
     def _block_optional(name: str, *args: Any, **kwargs: Any) -> Any:
-        if name == "paddleocr" or name.startswith("paddleocr."):
-            raise ImportError("No module named 'paddleocr'")
+        if name in {"rapidocr", "onnxruntime"}:
+            raise ImportError(f"No module named {name!r}")
         if name == "cv2" or name.startswith("cv2."):
             raise ImportError("No module named 'cv2'")
         return real_import(name, *args, **kwargs)
 
-    monkeypatch.delitem(sys.modules, "paddleocr", raising=False)
     monkeypatch.delitem(sys.modules, "cv2", raising=False)
     monkeypatch.setattr(builtins, "__import__", _block_optional)
 
@@ -960,7 +964,7 @@ def test_shared_model_single_recognition_invalidation_inference_mode_and_bounded
 
 
 def test_hydra_text_ocr_config_compose_and_instantiate() -> None:
-    """Verify configs/metric/text_ocr.yaml composes and instantiates lazily without Paddle."""
+    """Verify configs/metric/text_ocr.yaml composes and instantiates lazily without OCR dependencies."""
     with hydra.initialize_config_dir(version_base=None, config_dir=CONFIGS_DIR):
         cfg = hydra.compose(
             config_name="train",
@@ -1258,6 +1262,7 @@ def test_distributed_2proc_cpu_odd_samples_with_zero_box_exact_ocr_parity(
     stub_dir.mkdir()
     (stub_dir / "sitecustomize.py").write_text(
         """
+from importlib.machinery import ModuleSpec
 import sys
 import types
 import numpy as np
@@ -1272,32 +1277,26 @@ WIDTH_TO_TEXT = {
     32: "HELLO",
 }
 
-class _DeterministicTextRec:
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
+class _DeterministicRapidOCR:
+    def __init__(self, *, params):
+        self.params = params
 
-    def predict(self, crops, batch_size=1):
-        del batch_size
-        outputs = []
-        for crop in crops:
-            width = int(crop.shape[1])
-            if width not in WIDTH_TO_TEXT:
-                raise RuntimeError(f"Unexpected crop width {width} in DDP OCR test stub")
-            outputs.append({"rec_text": WIDTH_TO_TEXT[width], "rec_score": 0.99})
-        return outputs
+    def recognize_txt(self, crops):
+        widths = [int(crop.shape[1]) for crop in crops]
+        return types.SimpleNamespace(
+            txts=tuple(WIDTH_TO_TEXT[width] for width in widths),
+            scores=(0.99,) * len(crops),
+        )
 
-class _DeterministicCls:
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-
-    def predict(self, crops, batch_size=1):
-        del batch_size
-        return [{"class_ids": np.array([0])} for _ in crops]
-
-fake_paddleocr = types.ModuleType("paddleocr")
-fake_paddleocr.TextRecognition = _DeterministicTextRec
-fake_paddleocr.TextLineOrientationClassification = _DeterministicCls
-sys.modules["paddleocr"] = fake_paddleocr
+fake_rapidocr = types.ModuleType("rapidocr")
+fake_rapidocr.RapidOCR = _DeterministicRapidOCR
+fake_rapidocr.OCRVersion = str
+fake_rapidocr.ModelType = str
+fake_rapidocr.EngineType = types.SimpleNamespace(ONNXRUNTIME="onnxruntime")
+sys.modules["rapidocr"] = fake_rapidocr
+fake_onnxruntime = types.ModuleType("onnxruntime")
+fake_onnxruntime.__spec__ = ModuleSpec("onnxruntime", loader=None)
+sys.modules["onnxruntime"] = fake_onnxruntime
 
 try:
     import cv2 as _cv2_check
@@ -1390,6 +1389,7 @@ except ImportError:
     env = os.environ.copy()
     env["ACCELERATE_USE_CPU"] = "true"
     env["OMP_NUM_THREADS"] = "1"
+    env["XDG_CACHE_HOME"] = str(tmp_path / "cache")
     if sys.platform == "darwin" and "GLOO_SOCKET_IFNAME" not in env:
         env["GLOO_SOCKET_IFNAME"] = "lo0"
     extra_pp = f"{stub_dir}:{REPO_ROOT}:{REPO_ROOT / 'src'}"

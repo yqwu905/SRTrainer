@@ -646,7 +646,7 @@ class BaseMetric(ABC):
   - `OCRAccuracyMetric`（**OCR-A**，`higher_is_better = True`）、`CERMetric`（**CER**，`higher_is_better = False`，不截断允许 `> 1`）、`OneMinusNEDMetric`（**1-NED**，`higher_is_better = True`）；
   - 与 `yqwu905/VOSR` `evaluate.py` 对齐 NFKC/空白规范化、Unicode 单位代价 Levenshtein 编辑距离与 OpenCV `INTER_CUBIC` / `BORDER_REPLICATE` 透视裁剪（高宽比 `>= 1.5` 逆时针旋转 90°）；
   - 支持单行整图 `label` 与多框 `text_lines`（`points`/`quad`/`bbox`/`box` + 可选 `annotation_size` 显式缩放），不依赖 `target`（支持 GT-less）；
-  - 延迟导入可选依赖（`uv sync --extra ocr`），默认 `ocr_device="cpu"`（`.to(torch_device)` 安全空操作），同进程同配置三指标共享模型并有界缓存最后一个样本的一次识别结果；多进程运行前建议单进程预下载权重并统一配置只读本地 `ocr_model_dir`。
+  - RapidOCR 和 ONNX Runtime 作为可选依赖延迟导入（`uv sync --extra ocr`）。`ocr_device` 默认 CPU，独立于训练设备。同进程同配置的三项指标共享模型和最后一个样本的识别结果。模型首次使用时下载，离线运行可通过 `ocr_model_dir` 指定本地 ONNX 权重。
 
 #### 验证套件与指标 Hydra 配置：`configs/metric/sr_default.yaml`
 ```yaml
