@@ -646,7 +646,7 @@ class BaseMetric(ABC):
   - `OCRAccuracyMetric`（**OCR-A**，`higher_is_better = True`）、`CERMetric`（**CER**，`higher_is_better = False`，不截断允许 `> 1`）、`OneMinusNEDMetric`（**1-NED**，`higher_is_better = True`）；
   - 与 `yqwu905/VOSR` `evaluate.py` 对齐 NFKC/空白规范化、Unicode 单位代价 Levenshtein 编辑距离与 OpenCV `INTER_CUBIC` / `BORDER_REPLICATE` 透视裁剪（高宽比 `>= 1.5` 逆时针旋转 90°）；
   - 支持单行整图 `label` 与多框 `text_lines`（`points`/`quad`/`bbox`/`box` + 可选 `annotation_size` 显式缩放），不依赖 `target`（支持 GT-less）；
-  - RapidOCR 和 ONNX Runtime 作为可选依赖延迟导入（`uv sync --extra ocr`）。`ocr_device` 默认 CPU，独立于训练设备。同进程同配置的三项指标共享模型和最后一个样本的识别结果。模型首次使用时下载，离线运行可通过 `ocr_model_dir` 指定本地 ONNX 权重。
+  - RapidOCR（PyTorch 后端）与 OpenCV 作为可选依赖延迟导入（`uv sync --extra ocr`）。`ocr_device` 默认 CPU，支持 `cpu` / `gpu[:ID]` / `cuda[:ID]` / `npu[:ID]` / `mps`，独立于训练设备。同进程同配置的三项指标共享模型和最后一个样本的识别结果。模型与字典首次使用时下载，离线运行可通过 `ocr_model_dir` 指定本地 RapidOCR PyTorch `.pth` 权重及同目录字典文件。
 
 #### 验证套件与指标 Hydra 配置：`configs/metric/sr_default.yaml`
 ```yaml

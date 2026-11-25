@@ -32,7 +32,7 @@ uv sync
 # 可选：安装额外实验看板依赖（wandb / mlflow / swanlab）
 uv sync --extra trackers
 
-# 可选：安装文本 OCR 评测依赖（RapidOCR + ONNX Runtime + OpenCV）
+# 可选：安装文本 OCR 评测依赖（RapidOCR + OpenCV，复用项目 PyTorch 后端）
 uv sync --extra ocr
 ```
 
@@ -82,10 +82,10 @@ uv sync --extra ocr
   ]
   ```
   > **OCR 指标说明（`configs/metric/text_ocr.yaml`）**：
-  > - 提供 `metrics.OCRAccuracyMetric`（OCR-A，越大越好）、`metrics.CERMetric`（CER，越小越好，允许 `> 1`）与 `metrics.OneMinusNEDMetric`（1-NED，越大越好）。RapidOCR 通过 ONNX Runtime 运行 `PP-OCRv5_server_rec`，默认 `ocr_batch_size=1`、`ocr_device="cpu"`。包括 Ascend NPU 在内的训练设备可独立配置。显式设置 `ocr_device=gpu[:ID]`（或 `cuda[:ID]`）或 `npu[:ID]` 时，OCR 进程需要相应的 CUDA 或 CANN ONNX Runtime 执行提供程序。
+  > - 提供 `metrics.OCRAccuracyMetric`（OCR-A，越大越好）、`metrics.CERMetric`（CER，越小越好，允许 `> 1`）与 `metrics.OneMinusNEDMetric`（1-NED，越大越好）。RapidOCR 通过 PyTorch 后端运行 `PP-OCRv5_server_rec`，默认 `ocr_batch_size=1`、`ocr_device="cpu"`。包括 Ascend NPU 在内的训练设备可独立配置。显式设置 `ocr_device=gpu[:ID]`（或 `cuda[:ID]`）、`npu[:ID]` 或 `mps` 时，将直接复用当前环境的 PyTorch / `torch_npu` / MPS 设备，无需安装 ONNX Runtime。
   > - 同进程、同配置的三项指标共享一个识别模型并复用同一样本的一次识别结果。缓存仅保留最后一个样本的文本与缓存键。
   > - 通过 `BaseMetric.compute_stats()` 返回可加和的 `(numerator, denominator)`，在多卡 `gather_for_metrics` 后按全局有效框/字符数加权归约，避免先求每图均值再平均带来的偏差。
-  > - 默认权重在首次验证时下载到 `${XDG_CACHE_HOME:-$HOME/.cache}/srtrainer/rapidocr`。离线环境可通过 `ocr_model_dir` 和可选的 `ocr_cls_model_dir` 指定 `.onnx` 文件或包含该模型的目录。原有 Paddle 推理目录需要提供相同权重的 ONNX 导出。自定义识别模型需要在 ONNX 元数据中嵌入 `character` 字典，或在同目录提供 `dict.txt`。配置 `ocr_cls_model: PP-LCNet_x1_0_textline_ori` 可启用 0/180 度方向分类。
+  > - 默认权重与字典在首次验证时下载到 `${XDG_CACHE_HOME:-$HOME/.cache}/srtrainer/rapidocr`。离线环境可通过 `ocr_model_dir` 和可选的 `ocr_cls_model_dir` 指定 RapidOCR PyTorch `.pth` 权重文件或包含该文件的目录（文件名需与 RapidOCR 内置架构名一致，如 `ch_PP-OCRv5_rec_server.pth`），并在同目录提供 `dict.txt` 或 `ppocrv5_dict.txt` 字典文件。配置 `ocr_cls_model: ch_ppocr_mobile_v2.0_cls` 可启用 0/180 度方向分类。
 
 ## 快速开始
 

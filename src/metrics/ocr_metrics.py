@@ -7,7 +7,7 @@ and exact dataset-level weighted reduction via :meth:`BaseMetric.compute_stats`.
 
 Differences documented by design:
 - ``ocr_device`` defaults to ``"cpu"`` independently of the training device.
-- OpenCV, RapidOCR, and ONNX Runtime are optional dependencies imported lazily.
+- OpenCV and RapidOCR (PyTorch backend) are optional dependencies imported lazily.
 - Same-process metrics sharing identical OCR configuration share one recognizer instance
   and a bounded 1-sample recognition cache keyed by image/annotation/config digest.
 """
@@ -41,8 +41,9 @@ from utils.rapidocr import (
     create_rapidocr_engine,
     get_rapidocr_model_root,
     import_rapidocr,
-    onnx_device_params,
-    resolve_onnx_model,
+    resolve_rec_dict_path,
+    resolve_torch_model,
+    torch_device_params,
 )
 from utils.text_geometry import canonical_quad
 
@@ -149,7 +150,7 @@ def _import_cv2() -> Any:
     return cv2
 
 
-def _import_rapidocr() -> tuple[Any, Any]:
+def _import_rapidocr() -> Any:
     return import_rapidocr(context="OCR metrics")
 
 
@@ -589,44 +590,44 @@ class RapidOCRTextRecognizer:
         if cls_model_dir is not None and cls_model_name is None:
             raise ValueError("cls_model_dir requires cls_model_name to be specified.")
 
-        rec_version, rec_type, rec_path = resolve_onnx_model(
+        rec_version, rec_type, rec_path = resolve_torch_model(
             clean_model_name, model_dir, "recognition", _REC_MODELS
         )
         cls_model = (
-            resolve_onnx_model(cls_model_name, cls_model_dir, "orientation", _CLS_MODELS)
+            resolve_torch_model(cls_model_name, cls_model_dir, "orientation", _CLS_MODELS)
             if cls_model_name is not None
             else None
         )
         self.use_cls = cls_model is not None
-        rapidocr, onnxruntime = _import_rapidocr()
+        rapidocr = _import_rapidocr()
         model_root = get_rapidocr_model_root()
         params: dict[str, Any] = {
             "Global.use_det": False,
             "Global.use_cls": self.use_cls,
             "Global.model_root_dir": str(model_root),
-            "Rec.engine_type": rapidocr.EngineType.ONNXRUNTIME,
+            "Rec.engine_type": rapidocr.EngineType.TORCH,
             "Rec.ocr_version": rapidocr.OCRVersion(rec_version),
             "Rec.model_type": rapidocr.ModelType(rec_type),
             "Rec.lang_type": "ch",
             "Rec.model_path": str(rec_path) if rec_path is not None else None,
             "Rec.rec_batch_num": self.batch_size,
-            **onnx_device_params(device, onnxruntime, cpu_fallback_hint='ocr_device="cpu"'),
+            **torch_device_params(device, cpu_fallback_hint='ocr_device="cpu"'),
         }
         if rec_path is not None:
-            dict_path = rec_path.with_name("dict.txt")
-            if dict_path.is_file():
+            dict_path = resolve_rec_dict_path(rec_path, rec_version)
+            if dict_path is not None:
                 params["Rec.rec_keys_path"] = str(dict_path)
 
         download_keys: list[str] = []
         if rec_path is None:
-            download_keys.append(f"rec:{rec_version}:{rec_type}:ch")
+            download_keys.append(f"torch:rec:{rec_version}:{rec_type}:ch")
         if cls_model is not None:
             cls_version, cls_type, cls_path = cls_model
             if cls_path is None:
-                download_keys.append(f"cls:{cls_version}:{cls_type}")
+                download_keys.append(f"torch:cls:{cls_version}:{cls_type}")
             params.update(
                 {
-                    "Cls.engine_type": rapidocr.EngineType.ONNXRUNTIME,
+                    "Cls.engine_type": rapidocr.EngineType.TORCH,
                     "Cls.ocr_version": rapidocr.OCRVersion(cls_version),
                     "Cls.model_type": rapidocr.ModelType(cls_type),
                     "Cls.model_path": str(cls_path) if cls_path is not None else None,

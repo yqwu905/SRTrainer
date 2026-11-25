@@ -59,6 +59,7 @@ def test_shared_rapidocr_engine_caches_download_and_avoids_serialized_gpu_init(
     model_root = tmp_path / "rapidocr_cache"
     lock_entries = 0
     init_calls: list[dict[str, Any]] = []
+    eager_loads: list[str] = []
 
     class _FakeLock:
         def __init__(self, _path: Any) -> None:
@@ -74,50 +75,73 @@ def test_shared_rapidocr_engine_caches_download_and_avoids_serialized_gpu_init(
     class _FakeRapidOCR:
         def __init__(self, *, params: dict[str, Any]) -> None:
             init_calls.append(dict(params))
-            # Simulate downloading an ONNX model into model_root during CPU prefetch
+
+        def _load_det_model(self) -> None:
+            eager_loads.append("det")
+            # Simulate RapidOCR 3.10 lazy download of PyTorch weights into model_root.
             model_root.mkdir(parents=True, exist_ok=True)
-            (model_root / "det_v5.onnx").write_bytes(b"fake-onnx-model-bytes")
+            (model_root / "ch_PP-OCRv5_det_server.pth").write_bytes(b"fake-pth-det-bytes")
+
+        def _load_rec_model(self) -> None:
+            eager_loads.append("rec")
+            model_root.mkdir(parents=True, exist_ok=True)
+            (model_root / "ch_PP-OCRv5_rec_server.pth").write_bytes(b"fake-pth-rec-bytes")
+            (model_root / "ppocrv5_dict.txt").write_text("a\nb\n", encoding="utf-8")
 
     monkeypatch.setattr("huggingface_hub.utils.WeakFileLock", _FakeLock)
     fake_rapidocr = types.SimpleNamespace(RapidOCR=_FakeRapidOCR)
 
     gpu0_params = {
+        "Global.use_det": True,
+        "Global.use_rec": True,
+        "Global.use_cls": False,
         "Global.model_root_dir": str(model_root),
-        "EngineConfig.onnxruntime.use_cuda": True,
-        "EngineConfig.onnxruntime.cuda_ep_cfg.device_id": 0,
+        "EngineConfig.torch.use_cuda": True,
+        "EngineConfig.torch.cuda_ep_cfg.device_id": 0,
     }
     gpu1_params = {
+        "Global.use_det": True,
+        "Global.use_rec": True,
+        "Global.use_cls": False,
         "Global.model_root_dir": str(model_root),
-        "EngineConfig.onnxruntime.use_cuda": True,
-        "EngineConfig.onnxruntime.cuda_ep_cfg.device_id": 1,
+        "EngineConfig.torch.use_cuda": True,
+        "EngineConfig.torch.cuda_ep_cfg.device_id": 1,
     }
-    assert "EngineConfig.onnxruntime.use_cuda" not in strip_accelerator_device_params(gpu0_params)
+    assert "EngineConfig.torch.use_cuda" not in strip_accelerator_device_params(gpu0_params)
+    assert "EngineConfig.torch.use_npu" not in strip_accelerator_device_params(
+        {"EngineConfig.torch.use_npu": True, "EngineConfig.torch.npu_ep_cfg.device_id": 2}
+    )
+    assert "EngineConfig.torch.use_mps" not in strip_accelerator_device_params(
+        {"EngineConfig.torch.use_mps": True}
+    )
 
     # First cold-start call acquires WeakFileLock once for CPU download, then initializes GPU outside lock.
     create_rapidocr_engine(
         gpu0_params,
         rapidocr=fake_rapidocr,
         model_root=model_root,
-        download_keys=("det:PP-OCRv5:server:ch",),
+        download_keys=("torch:det:PP-OCRv5:server:ch", "torch:rec:PP-OCRv5:server:ch"),
     )
     assert lock_entries == 1
+    assert eager_loads == ["det", "rec"]
     assert len(init_calls) == 2
-    assert "EngineConfig.onnxruntime.use_cuda" not in init_calls[0]
-    assert init_calls[1]["EngineConfig.onnxruntime.cuda_ep_cfg.device_id"] == 0
+    assert "EngineConfig.torch.use_cuda" not in init_calls[0]
+    assert init_calls[1]["EngineConfig.torch.cuda_ep_cfg.device_id"] == 0
 
     # Subsequent calls on other GPUs hit the ready cache and NEVER acquire WeakFileLock or run CPU init!
     create_rapidocr_engine(
         gpu1_params,
         rapidocr=fake_rapidocr,
         model_root=model_root,
-        download_keys=("det:PP-OCRv5:server:ch",),
+        download_keys=("torch:det:PP-OCRv5:server:ch", "torch:rec:PP-OCRv5:server:ch"),
     )
     assert lock_entries == 1
+    assert eager_loads == ["det", "rec"]
     assert len(init_calls) == 3
-    assert init_calls[2]["EngineConfig.onnxruntime.cuda_ep_cfg.device_id"] == 1
+    assert init_calls[2]["EngineConfig.torch.cuda_ep_cfg.device_id"] == 1
 
 
-def test_parse_devices_and_rapidocr_params() -> None:
+def test_parse_devices_and_rapidocr_params(monkeypatch: pytest.MonkeyPatch) -> None:
     mod = _load_detect_module()
 
     assert mod.parse_devices("cuda:0,cuda:2", workers_per_device=1) == ["cuda:0", "cuda:2"]
@@ -128,45 +152,63 @@ def test_parse_devices_and_rapidocr_params() -> None:
         "cuda:3",
     ]
     assert mod.parse_devices("0,1,2", device_type="npu") == ["npu:0", "npu:1", "npu:2"]
+    assert mod.parse_devices("mps,mps:0") == ["mps", "mps"]
     assert mod.parse_devices("cpu", workers_per_device=3) == ["cpu", "cpu", "cpu"]
 
     with pytest.raises(ValueError, match="Invalid device entry"):
         mod.parse_devices("tpu:0")
+    with pytest.raises(ValueError, match="Invalid device entry"):
+        mod.parse_devices("mps:1")
     with pytest.raises(ValueError, match="workers_per_device"):
         mod.parse_devices("cpu", workers_per_device=0)
 
     fake_rapidocr = types.SimpleNamespace(
-        EngineType=types.SimpleNamespace(ONNXRUNTIME="onnxruntime"),
+        EngineType=types.SimpleNamespace(TORCH="torch"),
         OCRVersion=lambda v: f"ver:{v}",
         ModelType=lambda m: f"type:{m}",
         LangDet=lambda lang: f"lang:{lang}",
     )
-    fake_ort = types.SimpleNamespace(
-        get_available_providers=lambda: [
-            "CPUExecutionProvider",
-            "CUDAExecutionProvider",
-            "CANNExecutionProvider",
-        ]
-    )
+    monkeypatch.setattr("utils.rapidocr._is_npu_available", lambda: (True, 8))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
 
     cfg = mod.DetectConfig(det_only=False, use_cls=True, limit_side_len=1280, intra_threads=2)
-    params, download_keys, _ = mod.build_rapidocr_params(cfg, "npu:3", fake_rapidocr, fake_ort)
-    assert len(download_keys) == 3
+    params, download_keys, _ = mod.build_rapidocr_params(cfg, "npu:3", fake_rapidocr)
+    assert download_keys == (
+        "torch:det:PP-OCRv5:server:ch",
+        "torch:rec:PP-OCRv5:server:ch",
+        "torch:cls:PP-OCRv4:mobile",
+    )
     assert params["Global.use_det"] is True
     assert params["Global.use_rec"] is True
     assert params["Global.use_cls"] is True
+    assert params["Det.engine_type"] == "torch"
+    assert params["Rec.engine_type"] == "torch"
+    assert params["Cls.engine_type"] == "torch"
+    assert params["Cls.ocr_version"] == "ver:PP-OCRv4"
+    assert params["Cls.model_type"] == "type:mobile"
     assert params["Det.limit_side_len"] == 1280
-    assert params["EngineConfig.onnxruntime.use_cann"] is True
-    assert params["EngineConfig.onnxruntime.cann_ep_cfg.device_id"] == 3
-    assert params["EngineConfig.onnxruntime.intra_op_num_threads"] == 2
+    assert params["EngineConfig.torch.use_npu"] is True
+    assert params["EngineConfig.torch.npu_ep_cfg.device_id"] == 3
 
     cfg_det_only = mod.DetectConfig(det_only=True)
-    params_det, det_keys, _ = mod.build_rapidocr_params(cfg_det_only, "cuda:1", fake_rapidocr, fake_ort)
-    assert len(det_keys) == 1
+    params_det, det_keys, _ = mod.build_rapidocr_params(cfg_det_only, "cuda:1", fake_rapidocr)
+    assert det_keys == ("torch:det:PP-OCRv5:server:ch",)
     assert params_det["Global.use_rec"] is False
     assert "Rec.model_path" not in params_det
-    assert params_det["EngineConfig.onnxruntime.use_cuda"] is True
-    assert params_det["EngineConfig.onnxruntime.cuda_ep_cfg.device_id"] == 1
+    assert params_det["EngineConfig.torch.use_cuda"] is True
+    assert params_det["EngineConfig.torch.cuda_ep_cfg.device_id"] == 1
+
+    params_mps, _, _ = mod.build_rapidocr_params(cfg_det_only, "mps", fake_rapidocr)
+    assert params_mps["EngineConfig.torch.use_mps"] is True
+
+    thread_calls: list[int] = []
+    monkeypatch.setattr(torch, "set_num_threads", lambda n: thread_calls.append(n))
+    monkeypatch.setattr(mod, "import_rapidocr", lambda **_kw: fake_rapidocr)
+    monkeypatch.setattr(mod, "create_rapidocr_engine", lambda *a, **kw: "fake_engine")
+    assert mod._create_rapidocr_engine(cfg, "cpu", skip_download_lock=True) == "fake_engine"
+    assert thread_calls == [2]
 
 
 def test_extract_valid_text_lines_clamps_and_drops_degenerate_boxes() -> None:
@@ -412,10 +454,6 @@ def test_cli_multiprocess_spawn_auto_resume_and_order_with_stub_rapidocr(tmp_pat
     """Exercise true multiprocessing ('spawn') CLI execution + auto-resume across 2 workers."""
     stub_dir = tmp_path / "stub_pkgs"
     stub_dir.mkdir(parents=True, exist_ok=True)
-    (stub_dir / "onnxruntime.py").write_text(
-        "def get_available_providers():\n    return ['CPUExecutionProvider']\n",
-        encoding="utf-8",
-    )
     (stub_dir / "rapidocr.py").write_text(
         """
 import os
@@ -423,7 +461,7 @@ from types import SimpleNamespace
 
 
 class EngineType:
-    ONNXRUNTIME = "onnxruntime"
+    TORCH = "torch"
 
 
 class OCRVersion(str):
@@ -471,10 +509,12 @@ class RapidOCR:
     out_json = tmp_path / "out.json"
     in_json.write_text(json.dumps(records), encoding="utf-8")
 
-    dummy_det = tmp_path / "det.onnx"
-    dummy_rec = tmp_path / "rec.onnx"
+    dummy_det = tmp_path / "ch_PP-OCRv5_det_server.pth"
+    dummy_rec = tmp_path / "ch_PP-OCRv5_rec_server.pth"
+    dummy_dict = tmp_path / "ppocrv5_dict.txt"
     dummy_det.write_bytes(b"stub")
     dummy_rec.write_bytes(b"stub")
+    dummy_dict.write_text("a\nb\n", encoding="utf-8")
 
     base_env = os.environ.copy()
     existing_pp = base_env.get("PYTHONPATH", "")
