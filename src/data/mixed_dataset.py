@@ -25,6 +25,7 @@ from data.transforms import (
     random_crop_with_coords,
 )
 from utils.image import load_image
+from utils.text_geometry import canonical_quad
 
 __all__ = ["MixedSRDataset", "train_collate_fn"]
 
@@ -74,6 +75,71 @@ def _pick_text_focus_center(
     return random.choice(centers)
 
 
+def _polygon_area_2d(pts: np.ndarray) -> float:
+    return (
+        abs(
+            float(
+                np.sum(
+                    pts[:, 0] * np.roll(pts[:, 1], -1) - pts[:, 1] * np.roll(pts[:, 0], -1)
+                )
+            )
+        )
+        * 0.5
+    )
+
+
+def _crop_line_quad(
+    quad: Any,
+    offset: np.ndarray,
+    extent: np.ndarray,
+    *,
+    min_side: float = 4.0,
+    min_axis_retention: float = 0.7,
+    min_area_retention: float = 0.25,
+    min_rectangularity: float = 0.85,
+) -> list[list[float]] | None:
+    """Translate a line quad into crop coordinates, clipping near-axis-aligned boundary boxes."""
+    pts = np.asarray(quad, dtype=np.float64) - offset
+    if pts.shape != (4, 2) or not np.isfinite(pts).all():
+        return None
+    if (pts >= 0.0).all() and (pts <= extent).all():
+        return pts.tolist()
+
+    x0, y0 = float(pts[:, 0].min()), float(pts[:, 1].min())
+    x1, y1 = float(pts[:, 0].max()), float(pts[:, 1].max())
+    aabb_w = x1 - x0
+    aabb_h = y1 - y0
+    if aabb_w <= 0.0 or aabb_h <= 0.0:
+        return None
+
+    # Only clip boxes that are close to axis-aligned; rotated boxes clipped as AABBs pull in
+    # excessive background corners, so keep rotated boxes only when fully inside the crop.
+    poly_area = _polygon_area_2d(pts)
+    aabb_area = aabb_w * aabb_h
+    if poly_area / aabb_area < min_rectangularity:
+        return None
+
+    ix0 = max(0.0, x0)
+    iy0 = max(0.0, y0)
+    ix1 = min(float(extent[0]), x1)
+    iy1 = min(float(extent[1]), y1)
+    iw = ix1 - ix0
+    ih = iy1 - iy0
+    if iw < min_side or ih < min_side:
+        return None
+
+    # Keep horizontal lines truncated left/right (preserving line height) or vertical lines
+    # truncated top/bottom (preserving line width), provided enough of the box remains visible.
+    major_axis_ok = (ih / aabb_h >= min_axis_retention) if aabb_w >= aabb_h else (
+        iw / aabb_w >= min_axis_retention
+    )
+    if not major_axis_ok or (iw * ih) / aabb_area < min_area_retention:
+        return None
+
+    clipped = canonical_quad([ix0, iy0, ix1, iy1], name="cropped line quad")
+    return clipped.tolist()
+
+
 def _crop_text_lines(
     text_lines: tuple[dict[str, Any], ...] | None,
     *,
@@ -83,7 +149,7 @@ def _crop_text_lines(
     orig_h: int,
     orig_w: int,
 ) -> list[dict[str, Any]]:
-    """Translate HR glyph quads to crop-relative coordinates, keeping only fully visible glyphs."""
+    """Translate HR line quads and glyph quads to crop-relative coordinates."""
     if not text_lines:
         return []
     max_x = float(min(crop_size, orig_w - crop_left))
@@ -97,13 +163,22 @@ def _crop_text_lines(
     for line in text_lines:
         if not line.get("valid", True) or not line.get("alignment_valid", True):
             continue
+        kept_line: dict[str, Any] = {}
+        if "quad" in line and line["quad"] is not None:
+            kept_quad = _crop_line_quad(line["quad"], offset, extent)
+            if kept_quad is not None:
+                kept_line["quad"] = kept_quad
+
         kept_glyphs: list[dict[str, Any]] = []
         for glyph in line.get("glyphs", ()):
             pts = np.asarray(glyph["quad"], dtype=np.float64) - offset
             if (pts >= 0.0).all() and (pts <= extent).all():
                 kept_glyphs.append({"char": glyph["char"], "quad": pts.tolist()})
         if kept_glyphs:
-            visible_lines.append({"glyphs": kept_glyphs})
+            kept_line["glyphs"] = kept_glyphs
+
+        if kept_line:
+            visible_lines.append(kept_line)
     return visible_lines
 
 

@@ -7,3 +7,12 @@ ocr_kl:
     strip_stride: 32
     temperature: 1.0
     input_range: "0_1"
+    use_text_lines: true
+    strip_batch_size: 4
+    max_lines_per_image: 8
+    max_strip_width: 512
+    width_bucket_step: 32
+    amp_dtype: bf16
+    use_checkpoint: true
+    sync_ddp_counts: true
+    fallback_to_strips: false
