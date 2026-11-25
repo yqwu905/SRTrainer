@@ -26,6 +26,7 @@ __all__ = [
     "PretrainEntryConfig",
     "VOSRTrainableConfig",
     "VOSRPretrainConfig",
+    "LoRAConfig",
     "EMAConfig",
     "VOSRModelConfig",
     "ArchGroupConfig",
@@ -157,6 +158,16 @@ class VOSRPretrainConfig:
 
 
 @dataclass
+class LoRAConfig:
+    """LoRA fine-tuning settings applied exclusively to DiT when trainable."""
+
+    enable: bool = False
+    lora_rank: int = 32
+    lora_alpha: float = 32.0
+    checkpoint: Optional[str] = None
+
+
+@dataclass
 class EMAConfig:
     """Exponential moving average settings applied to trainable components."""
 
@@ -172,6 +183,7 @@ class VOSRModelConfig:
     _target_: str = "models.VOSRModel"
     scale: int = 1
     trainable: VOSRTrainableConfig = field(default_factory=VOSRTrainableConfig)
+    lora: LoRAConfig = field(default_factory=LoRAConfig)
     noise_input: NoiseInput = NoiseInput.gaussian
     posterior_mode: bool = True
     clamp_decode_in_train: bool = True

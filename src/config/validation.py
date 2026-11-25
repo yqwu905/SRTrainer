@@ -22,6 +22,7 @@ from config.schema import (
     InferRootConfig,
     InferSettingsConfig,
     KernelConfig,
+    LoRAConfig,
     LossEntryConfig,
     MetricConfig,
     OptimConfig,
@@ -181,6 +182,18 @@ def _validate_ema_config(ema: EMAConfig) -> None:
         )
 
 
+def _validate_lora_config(lora: LoRAConfig) -> None:
+    if lora.lora_rank < 1:
+        raise ConfigValidationError(
+            f"model.lora.lora_rank must be >= 1, got {lora.lora_rank!r}."
+        )
+    if not math.isfinite(lora.lora_alpha) or lora.lora_alpha <= 0.0:
+        raise ConfigValidationError(
+            f"model.lora.lora_alpha must be finite and > 0, got {lora.lora_alpha!r}."
+        )
+    _require_optional_non_empty_str(lora.checkpoint, "model.lora.checkpoint")
+
+
 def _validate_pretrain_entry(entry: PretrainEntryConfig, comp_name: str) -> None:
     _require_optional_non_empty_str(entry.path, f"model.pretrain.{comp_name}.path")
     if entry.key is not None and not entry.key.strip():
@@ -197,6 +210,7 @@ def _validate_vosr_model_and_arch(
     if model.scale < 1:
         raise ConfigValidationError(f"model.scale must be >= 1, got {model.scale!r}.")
     _validate_ema_config(model.ema)
+    _validate_lora_config(model.lora)
     for comp_name in VOSR_COMPONENTS:
         _validate_pretrain_entry(model.pretrain.get(comp_name), comp_name)
 
@@ -513,6 +527,7 @@ def validate_infer_config(cfg: InferRootConfig) -> InferRootConfig:
         if cfg.model.scale < 1:
             raise ConfigValidationError(f"model.scale must be >= 1, got {cfg.model.scale!r}.")
         _validate_ema_config(cfg.model.ema)
+        _validate_lora_config(cfg.model.lora)
     return cfg
 
 
