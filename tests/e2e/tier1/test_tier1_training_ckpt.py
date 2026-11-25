@@ -37,7 +37,6 @@ def test_t1_base_model_abc_and_vosr_model_setup_contracts(
     minimal_train_cfg_factory: Callable[..., Any],
 ) -> None:
     """F41, F43: BaseModel ABC enforcement and VOSRModel setup/export/lr contracts."""
-    import hydra.utils
     import torch
     import torch.nn as nn
     from accelerate import Accelerator
@@ -73,11 +72,15 @@ def test_t1_base_model_abc_and_vosr_model_setup_contracts(
             del accelerator
             return {}
 
-    dummy = _MinimalConcreteModel(cfg)
+    from config import load_train_config
+    from models.base_model import build_model
+
+    typed_cfg = load_train_config(cfg)
+    dummy = _MinimalConcreteModel(typed_cfg)
     sentinel_batch = {"lq": torch.zeros(1, 3, 4, 4)}
     assert dummy.preprocess_batch(sentinel_batch) is sentinel_batch
 
-    model = hydra.utils.instantiate(cfg.model, cfg=cfg, _recursive_=False)
+    model = build_model(typed_cfg)
     assert isinstance(model, VOSRModel)
     assert isinstance(model, BaseModel)
 
@@ -183,8 +186,6 @@ def test_t1_vosr_model_named_loss_dict_raw_values_and_skip_nonpositive(
     from accelerate import Accelerator
     from tests.helpers.fake_backends import patch_lpips_offline
 
-    from models import VOSRModel
-
     patch_lpips_offline(monkeypatch)
     # gt_size=64 so AlexNet LPIPS runs cleanly at 64x64.
     src = paired_train_source_factory(name="loss_src", n_samples=2, lq_h=32, lq_w=32, scale=2)
@@ -216,8 +217,11 @@ def test_t1_vosr_model_named_loss_dict_raw_values_and_skip_nonpositive(
         loss_cfg=loss_cfg,
     )
 
+    from config import load_train_config
+    from models.base_model import build_model
+
     accelerator = Accelerator(cpu=True, mixed_precision="no")
-    model = VOSRModel(cfg)
+    model = build_model(load_train_config(cfg))
     model.setup(accelerator)
 
     torch.manual_seed(12)
@@ -251,7 +255,6 @@ def test_t1_vosr_model_pretrain_safetensors_and_basicsr_pth_cloned_to_ema(
     from accelerate.state import AcceleratorState, GradientState
     from tests.dummy_arch import DummyDiT
 
-    from models import VOSRModel
     from utils.misc import save_safetensors
 
     torch.manual_seed(21)
@@ -286,8 +289,11 @@ def test_t1_vosr_model_pretrain_safetensors_and_basicsr_pth_cloned_to_ema(
     cfg_st.model.pretrain.dit.strict = True
     cfg_st.model.pretrain.dit.key = None
 
+    from config import load_train_config
+    from models.base_model import build_model
+
     acc1 = Accelerator(cpu=True, mixed_precision="no")
-    model_st = VOSRModel(cfg_st)
+    model_st = build_model(load_train_config(cfg_st))
     model_st.setup(acc1)
     for use_ema in (False, True):
         dit_sd = model_st.get_infer_network(use_ema=use_ema).dit.state_dict()
@@ -313,7 +319,7 @@ def test_t1_vosr_model_pretrain_safetensors_and_basicsr_pth_cloned_to_ema(
     cfg_pth.model.pretrain.dit.key = "params_ema"
 
     acc2 = Accelerator(cpu=True, mixed_precision="no")
-    model_pth = VOSRModel(cfg_pth)
+    model_pth = build_model(load_train_config(cfg_pth))
     model_pth.setup(acc2)
     for use_ema in (False, True):
         dit_sd = model_pth.get_infer_network(use_ema=use_ema).dit.state_dict()
@@ -331,8 +337,6 @@ def test_t1_vosr_model_grad_accum_and_lr_scheduler_step_cadence(
     """F43: grad_accum=2 cadence, lr_scheduler NOT prepared, Step 7 checkpointing of LR & EMA."""
     import torch
     from accelerate import Accelerator
-
-    from models import VOSRModel
 
     base_lr = 2.0e-4
     eta_min = 1.0e-6
@@ -352,8 +356,11 @@ def test_t1_vosr_model_grad_accum_and_lr_scheduler_step_cadence(
     cfg.optim.scheduler.T_max = t_max
     cfg.optim.scheduler.eta_min = eta_min
 
+    from config import load_train_config
+    from models.base_model import build_model
+
     accelerator = Accelerator(cpu=True, mixed_precision="no", gradient_accumulation_steps=2)
-    model = VOSRModel(cfg)
+    model = build_model(load_train_config(cfg))
     model.setup(accelerator)
 
     # Guardrail #5: lr_scheduler must NEVER be passed to accelerator.prepare().

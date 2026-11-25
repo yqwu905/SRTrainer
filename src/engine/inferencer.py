@@ -9,9 +9,11 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from torch import nn
 
+from config.schema import BlendMode, MixedPrecision, TileConfig
+from config.validation import load_tile_config
 from utils.config import normalize_mixed_precision
 from utils.misc import normalize_gt_size, pad_to_min_size, pad_to_multiple, unpad_tensor
 
@@ -21,7 +23,7 @@ __all__ = [
     "compute_tile_starts",
 ]
 
-_VALID_BLEND_MODES: frozenset[str] = frozenset({"cosine", "linear", "mean"})
+_VALID_BLEND_MODES: frozenset[str] = frozenset(m.value for m in BlendMode)
 
 
 def _is_positive_int(value: Any) -> bool:
@@ -33,6 +35,8 @@ def _is_non_negative_int(value: Any) -> bool:
 
 
 def _normalize_blend_mode(blend_mode: Any) -> str:
+    if isinstance(blend_mode, BlendMode):
+        return blend_mode.value
     if not isinstance(blend_mode, str):
         raise ValueError(
             f"blend_mode must be a string in {sorted(_VALID_BLEND_MODES)}, "
@@ -96,7 +100,7 @@ def build_blend_window(
     tile_w: int,
     scale: int,
     overlap: int,
-    blend_mode: str,
+    blend_mode: str | BlendMode,
     eps: float = 1e-3,
 ) -> torch.Tensor:
     """Build a 2D HR feathering window of shape ``[1, 1, tile_h * scale, tile_w * scale]``."""
@@ -129,7 +133,7 @@ class TiledInferencer:
     """Shared tiled/untiled inference engine used by both validation and ``tools/infer.py``.
 
     Supports:
-    - Auto tile size derivation (``tile_size="auto"`` -> ``gt_size // scale``) with graceful
+    - Auto tile size derivation (divide each GT dimension by scale when ``tile_size=None``) with graceful
       untiled fallback + warning when ``gt_size`` is unavailable.
     - Explicit square (``int``) or rectangular (``[tile_h, tile_w]``) tile sizes.
     - Overlap validation (``0 <= tile_overlap < min(tile_h, tile_w) // 2``; ``0`` = hard stitch).
@@ -142,13 +146,13 @@ class TiledInferencer:
         model: nn.Module,
         scale: int,
         tile_enabled: bool = True,
-        tile_size: str | int | Sequence[int] | None = "auto",
+        tile_size: int | Sequence[int] | None = None,
         tile_overlap: int = 16,
         tile_batch_size: int = 4,
-        blend_mode: str = "cosine",
+        blend_mode: str | BlendMode = BlendMode.cosine,
         pad_multiple: int = 8,
         gt_size: int | Sequence[int] | None = None,
-        mixed_precision: str = "no",
+        mixed_precision: str | MixedPrecision = MixedPrecision.no,
         device: torch.device | str | None = None,
     ) -> None:
         if not isinstance(model, nn.Module):
@@ -206,7 +210,7 @@ class TiledInferencer:
         resolved_tile_size = self._resolve_tile_size(tile_size, gt_size=crop_size, scale=scale)
         if resolved_tile_size is None:
             logging.getLogger("srtrainer").warning(
-                "TiledInferencer: tile_size='auto' requires gt_size, which is None; "
+                "TiledInferencer: tile_size=None (auto) requires gt_size, which is None; "
                 "falling back to untiled whole-image inference with pad_multiple=%d.",
                 self.pad_multiple,
             )
@@ -233,20 +237,15 @@ class TiledInferencer:
 
     @staticmethod
     def _resolve_tile_size(
-        tile_size: str | int | Sequence[int] | None,
+        tile_size: int | Sequence[int] | None,
         gt_size: tuple[int, int] | None,
         scale: int,
     ) -> tuple[int, int] | None:
-        # Check str before Sequence, and bool before int.
-        if isinstance(tile_size, str):
-            if tile_size.strip().lower() == "auto":
-                if gt_size is None:
-                    return None
-                height, width = gt_size
-                return height // scale, width // scale
-            raise ValueError(
-                f"Unsupported string tile_size={tile_size!r}; expected 'auto', int, or [H, W]."
-            )
+        if tile_size is None:
+            if gt_size is None:
+                return None
+            height, width = gt_size
+            return height // scale, width // scale
 
         if isinstance(tile_size, bool):
             raise ValueError(f"tile_size cannot be a bool, got {tile_size!r}.")
@@ -256,7 +255,7 @@ class TiledInferencer:
                 raise ValueError(f"tile_size must be a positive integer, got {tile_size!r}.")
             return (tile_size, tile_size)
 
-        if isinstance(tile_size, Sequence) and not isinstance(tile_size, (bytes, bytearray)):
+        if isinstance(tile_size, Sequence) and not isinstance(tile_size, (str, bytes, bytearray)):
             if len(tile_size) != 2:
                 raise ValueError(
                     f"Sequence tile_size must have length 2 ([tile_h, tile_w]), "
@@ -271,7 +270,7 @@ class TiledInferencer:
 
         raise ValueError(
             f"Unsupported tile_size={tile_size!r} ({type(tile_size).__name__}); "
-            "expected 'auto', positive int, or 2-element sequence [tile_h, tile_w]."
+            "expected None (auto), positive int, or 2-element sequence [tile_h, tile_w]."
         )
 
     @classmethod
@@ -279,37 +278,27 @@ class TiledInferencer:
         cls,
         model: nn.Module,
         scale: int,
-        tile_cfg: DictConfig | Mapping[str, Any] | None,
+        tile_cfg: TileConfig | DictConfig | Mapping[str, Any] | None,
         gt_size: int | Sequence[int] | None = None,
-        mixed_precision: str = "no",
+        mixed_precision: str | MixedPrecision = MixedPrecision.no,
         device: torch.device | str | None = None,
     ) -> TiledInferencer:
-        """Instantiate ``TiledInferencer`` from a Hydra ``tile``/``val_tile`` config mapping."""
-        if tile_cfg is None:
-            cfg_dict: dict[str, Any] = {}
-        elif isinstance(tile_cfg, DictConfig):
-            resolved = OmegaConf.to_container(tile_cfg, resolve=True)
-            if not isinstance(resolved, Mapping):
-                raise TypeError(
-                    f"Expected mapping for tile_cfg, got {type(resolved).__name__}."
-                )
-            cfg_dict = dict(resolved)
-        elif isinstance(tile_cfg, Mapping):
-            cfg_dict = dict(tile_cfg)
-        else:
+        """Instantiate ``TiledInferencer`` from a typed ``TileConfig`` (or structured mapping)."""
+        if tile_cfg is not None and not isinstance(tile_cfg, (TileConfig, DictConfig, Mapping)):
             raise TypeError(
-                f"Expected DictConfig, Mapping, or None for tile_cfg, got {type(tile_cfg).__name__}."
+                f"Expected TileConfig, DictConfig, Mapping, or None for tile_cfg, "
+                f"got {type(tile_cfg).__name__}."
             )
-
+        tile = tile_cfg if isinstance(tile_cfg, TileConfig) else load_tile_config(tile_cfg)
         return cls(
             model=model,
             scale=scale,
-            tile_enabled=cfg_dict.get("enabled", True),
-            tile_size=cfg_dict.get("size", "auto"),
-            tile_overlap=cfg_dict.get("overlap", 16),
-            tile_batch_size=cfg_dict.get("batch_size", 4),
-            blend_mode=cfg_dict.get("blend_mode", "cosine"),
-            pad_multiple=cfg_dict.get("pad_multiple", 8),
+            tile_enabled=tile.enabled,
+            tile_size=tile.size,
+            tile_overlap=tile.overlap,
+            tile_batch_size=tile.batch_size,
+            blend_mode=tile.blend_mode,
+            pad_multiple=tile.pad_multiple,
             gt_size=gt_size,
             mixed_precision=mixed_precision,
             device=device,

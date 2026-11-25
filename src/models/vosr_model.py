@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import inspect
 import logging
-import math
-import numbers
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import is_dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -17,6 +15,15 @@ import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from torch import nn
 
+from config.schema import (
+    VOSR_COMPONENTS,
+    LoRAConfig,
+    NoiseInput,
+    TrainConfig,
+    VOSRModelConfig,
+    VOSRPretrainConfig,
+    VOSRTrainableConfig,
+)
 from models.base_model import BaseModel
 from models.ema import ModelEMA, unwrap_model_for_ema
 from utils.misc import load_weights, pad_to_multiple, strip_state_dict_prefix, unpad_tensor
@@ -24,19 +31,7 @@ from utils.misc import load_weights, pad_to_multiple, strip_state_dict_prefix, u
 if TYPE_CHECKING:
     from accelerate import Accelerator
 
-__all__ = ["VOSRModel", "VOSRPipeline"]
-
-_UNSET: Any = object()
-_COMPONENT_ORDER: tuple[str, ...] = ("vae", "dit", "dino")
-_REQUIRED_COMPONENTS: frozenset[str] = frozenset({"vae", "dit"})
-_VALID_NOISE_INPUTS: frozenset[str] = frozenset({"gaussian", "zero"})
-
-
-@dataclass(frozen=True)
-class _PretrainSpec:
-    path: Path | None = None
-    strict: bool = True
-    key: str | None = None
+__all__ = ["VOSRModel", "VOSRPipeline", "attach_dit_lora", "should_attach_dit_lora"]
 
 
 def _move_to_device(obj: Any, device: torch.device, non_blocking: bool = True) -> Any:
@@ -51,128 +46,6 @@ def _move_to_device(obj: Any, device: torch.device, non_blocking: bool = True) -
     if isinstance(obj, tuple):
         return tuple(_move_to_device(v, device, non_blocking=non_blocking) for v in obj)
     return obj
-
-
-def _validate_target_mapping(cfg_node: Any, name: str) -> Any:
-    if not isinstance(cfg_node, (DictConfig, Mapping)):
-        raise ValueError(
-            f"{name} must be a mapping containing '_target_', got {type(cfg_node).__name__}."
-        )
-    target = cfg_node.get("_target_", None)
-    if not isinstance(target, str) or not target.strip():
-        raise ValueError(f"{name} must define a non-empty string '_target_'.")
-    return cfg_node
-
-
-def _parse_positive_int(value: Any, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError(f"{name} must be a positive integer, got {value!r}.")
-    return int(value)
-
-
-def _parse_optional_path(value: Any, name: str) -> Path | None:
-    if value is None:
-        return None
-    if isinstance(value, Path):
-        if not str(value).strip():
-            raise ValueError(f"{name} cannot be an empty path.")
-        return value
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
-            raise ValueError(f"{name} cannot be an empty string; pass None to disable.")
-        return Path(stripped)
-    raise TypeError(f"{name} must be a str, Path, or None, got {type(value).__name__}.")
-
-
-def _parse_optional_key(value: Any, name: str) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        stripped = value.strip()
-        return stripped if stripped else None
-    raise TypeError(f"{name} must be a str or None, got {type(value).__name__}.")
-
-
-def _parse_bool(value: Any, name: str) -> bool:
-    if not isinstance(value, bool):
-        raise ValueError(f"{name} must be a bool, got {type(value).__name__}: {value!r}.")
-    return value
-
-
-def _parse_positive_real_or_none(value: Any, name: str) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, numbers.Real):
-        raise ValueError(f"{name} must be a positive finite real or None, got {value!r}.")
-    val = float(value)
-    if not math.isfinite(val) or val <= 0.0:
-        raise ValueError(f"{name} must be > 0 and finite, got {value!r}.")
-    return val
-
-
-def _parse_trainable_map(raw: Any) -> dict[str, bool]:
-    defaults: dict[str, bool] = {"vae": False, "dit": True, "dino": False}
-    if raw is None:
-        return defaults
-    if not isinstance(raw, (DictConfig, Mapping)):
-        raise TypeError(
-            f"model.trainable must be a mapping or None, got {type(raw).__name__}."
-        )
-    parsed = dict(defaults)
-    for key, val in raw.items():
-        k_str = str(key)
-        if k_str not in _COMPONENT_ORDER:
-            raise ValueError(
-                f"Unknown component {k_str!r} in model.trainable; "
-                f"expected subset of {list(_COMPONENT_ORDER)}."
-            )
-        parsed[k_str] = _parse_bool(val, f"model.trainable.{k_str}")
-    return parsed
-
-
-def _parse_pretrain_map(raw: Any) -> dict[str, _PretrainSpec]:
-    specs: dict[str, _PretrainSpec] = {name: _PretrainSpec() for name in _COMPONENT_ORDER}
-    if raw is None:
-        return specs
-    if not isinstance(raw, (DictConfig, Mapping)):
-        raise TypeError(
-            f"model.pretrain must be a mapping or None, got {type(raw).__name__}."
-        )
-    for key, entry in raw.items():
-        k_str = str(key)
-        if k_str not in _COMPONENT_ORDER:
-            raise ValueError(
-                f"Unknown component {k_str!r} in model.pretrain; "
-                f"expected subset of {list(_COMPONENT_ORDER)}."
-            )
-        if entry is None:
-            specs[k_str] = _PretrainSpec()
-        elif isinstance(entry, (str, Path)):
-            specs[k_str] = _PretrainSpec(
-                path=_parse_optional_path(entry, f"model.pretrain.{k_str}"),
-                strict=True,
-                key=None,
-            )
-        elif isinstance(entry, (DictConfig, Mapping)):
-            allowed = {"path", "strict", "key"}
-            unknown = set(map(str, entry.keys())) - allowed
-            if unknown:
-                raise ValueError(
-                    f"Unknown keys {sorted(unknown)} in model.pretrain.{k_str}; "
-                    f"expected subset of {sorted(allowed)}."
-                )
-            specs[k_str] = _PretrainSpec(
-                path=_parse_optional_path(entry.get("path", None), f"model.pretrain.{k_str}.path"),
-                strict=_parse_bool(entry.get("strict", True), f"model.pretrain.{k_str}.strict"),
-                key=_parse_optional_key(entry.get("key", None), f"model.pretrain.{k_str}.key"),
-            )
-        else:
-            raise TypeError(
-                f"model.pretrain.{k_str} must be a mapping, path, or None, "
-                f"got {type(entry).__name__}."
-            )
-    return specs
 
 
 def _module_accepts_kwarg(module: nn.Module, kwarg_name: str) -> bool:
@@ -217,6 +90,62 @@ def _load_component_weights(
     return load_weights(module, path, strict=strict, key=key)
 
 
+def attach_dit_lora(
+    dit: nn.Module,
+    lora_cfg: LoRAConfig,
+) -> nn.Module:
+    """Attach LoRA adapters to DiT (stub placeholder for custom LoRA injection).
+
+    Args:
+        dit: Instantiated DiT module (with base pretrained weights already loaded).
+        lora_cfg: Typed ``LoRAConfig`` specifying ``lora_rank``, ``lora_alpha``, etc.
+
+    Returns:
+        The DiT module with LoRA layers attached (modified in-place or wrapped).
+    """
+    # TODO: Implement custom DiT LoRA injection logic here.
+    del lora_cfg
+    return dit
+
+
+def should_attach_dit_lora(model_cfg: VOSRModelConfig) -> bool:
+    """Return ``True`` iff DiT is trainable and ``model.lora.enable`` is ``True``."""
+    return bool(model_cfg.trainable.dit and model_cfg.lora.enable)
+
+
+def _apply_dit_lora(dit: nn.Module, lora_cfg: LoRAConfig) -> nn.Module:
+    """Invoke ``attach_dit_lora`` and validate/normalize its return value."""
+    attached = attach_dit_lora(dit, lora_cfg)
+    if attached is None:
+        return dit
+    if not isinstance(attached, nn.Module):
+        raise TypeError(
+            f"attach_dit_lora() must return an nn.Module or None, got {type(attached).__name__}."
+        )
+    return attached
+
+
+def _set_dit_lora_trainable_params(
+    dit: nn.Module,
+    base_param_ids: set[int],
+) -> list[nn.Parameter]:
+    """Freeze all non-LoRA parameters on ``dit`` and unfreeze only LoRA parameters."""
+    named_params = list(dit.named_parameters())
+    has_named_lora = any("lora" in name.lower() for name, _ in named_params)
+
+    trainable_params: list[nn.Parameter] = []
+    for name, param in named_params:
+        is_lora_param = (
+            ("lora" in name.lower())
+            if has_named_lora
+            else (id(param) not in base_param_ids)
+        )
+        param.requires_grad_(is_lora_param)
+        if is_lora_param:
+            trainable_params.append(param)
+    return trainable_params
+
+
 class VOSRPipeline(nn.Module):
     """Composable end-to-end VOSR pipeline wiring independent ``vae``, ``dit``, and optional ``dino``.
 
@@ -232,11 +161,11 @@ class VOSRPipeline(nn.Module):
         dino: nn.Module | None = None,
         *,
         scale: int = 1,
-        noise_input: str = "gaussian",
+        noise_input: NoiseInput | str = NoiseInput.gaussian,
         posterior_mode: bool = True,
         clamp_decode_in_train: bool = True,
         eval_seed: int | None = 42,
-        trainable: Mapping[str, bool] | None = None,
+        trainable: VOSRTrainableConfig | Mapping[str, bool] | None = None,
     ) -> None:
         super().__init__()
         if not isinstance(vae, nn.Module):
@@ -246,19 +175,12 @@ class VOSRPipeline(nn.Module):
         if dino is not None and not isinstance(dino, nn.Module):
             raise TypeError(f"dino must be an nn.Module or None, got {type(dino).__name__}.")
 
-        self.scale: int = _parse_positive_int(scale, "scale")
-        if noise_input not in _VALID_NOISE_INPUTS:
-            raise ValueError(
-                f"Unsupported noise_input={noise_input!r}; expected one of {sorted(_VALID_NOISE_INPUTS)}."
-            )
-        if eval_seed is not None and (isinstance(eval_seed, bool) or not isinstance(eval_seed, int)):
-            raise ValueError(f"eval_seed must be an int or None, got {eval_seed!r}.")
-
-        self.noise_input: str = noise_input
-        self.posterior_mode: bool = _parse_bool(posterior_mode, "posterior_mode")
-        self.clamp_decode_in_train: bool = _parse_bool(
-            clamp_decode_in_train, "clamp_decode_in_train"
-        )
+        if scale < 1:
+            raise ValueError(f"scale must be a positive integer, got {scale!r}.")
+        self.scale: int = int(scale)
+        self.noise_input: str = NoiseInput(noise_input).value
+        self.posterior_mode: bool = bool(posterior_mode)
+        self.clamp_decode_in_train: bool = bool(clamp_decode_in_train)
         self.eval_seed: int | None = eval_seed
 
         raw_vae = unwrap_model_for_ema(vae)
@@ -284,11 +206,13 @@ class VOSRPipeline(nn.Module):
                 f"DiT expects conditioning features (z_dims={dit_z_dims}), but arch.dino is None."
             )
 
-        vae_factor = getattr(raw_vae, "spatial_compression_ratio", 1)
-        dit_patch = getattr(raw_dit, "patch_size", 1)
-        self._spatial_quantum: int = _parse_positive_int(
-            int(vae_factor), "vae.spatial_compression_ratio"
-        ) * _parse_positive_int(int(dit_patch), "dit.patch_size")
+        vae_factor = int(getattr(raw_vae, "spatial_compression_ratio", 1))
+        dit_patch = int(getattr(raw_dit, "patch_size", 1))
+        if vae_factor < 1 or dit_patch < 1:
+            raise ValueError(
+                f"vae.spatial_compression_ratio ({vae_factor}) and dit.patch_size ({dit_patch}) must be >= 1."
+            )
+        self._spatial_quantum: int = vae_factor * dit_patch
         self._dit_accepts_z: bool = _module_accepts_kwarg(raw_dit, "z")
         self._dit_uses_z: bool = raw_dino is not None and (
             dit_z_dims is not None or not hasattr(raw_dit, "z_dims")
@@ -297,22 +221,47 @@ class VOSRPipeline(nn.Module):
         self.vae: nn.Module = vae
         self.dit: nn.Module = dit
         self.dino: nn.Module | None = dino
-        self.trainable: dict[str, bool] = (
-            {name: bool(trainable.get(name, False)) for name in _COMPONENT_ORDER}
-            if trainable is not None
-            else {name: False for name in _COMPONENT_ORDER}
+        if isinstance(trainable, VOSRTrainableConfig):
+            self.trainable: dict[str, bool] = trainable.as_dict()
+        elif trainable is not None:
+            self.trainable = {name: bool(trainable.get(name, False)) for name in VOSR_COMPONENTS}
+        else:
+            self.trainable = {name: False for name in VOSR_COMPONENTS}
+
+    @classmethod
+    def from_model_config(
+        cls,
+        vae: nn.Module,
+        dit: nn.Module,
+        dino: nn.Module | None,
+        model_cfg: VOSRModelConfig,
+        *,
+        scale: int | None = None,
+        trainable: VOSRTrainableConfig | None = None,
+    ) -> VOSRPipeline:
+        """Build a ``VOSRPipeline`` directly from a typed ``VOSRModelConfig``."""
+        return cls(
+            vae=vae,
+            dit=dit,
+            dino=dino,
+            scale=model_cfg.scale if scale is None else scale,
+            noise_input=model_cfg.noise_input,
+            posterior_mode=model_cfg.posterior_mode,
+            clamp_decode_in_train=model_cfg.clamp_decode_in_train,
+            eval_seed=model_cfg.eval_seed,
+            trainable=trainable,
         )
 
     def iter_components(self) -> Iterator[tuple[str, nn.Module]]:
         """Yield ``(name, module)`` for active components in canonical order ``(vae, dit, dino)``."""
-        for name in _COMPONENT_ORDER:
+        for name in VOSR_COMPONENTS:
             mod = getattr(self, name)
             if mod is not None:
                 yield name, mod
 
     def get_component(self, name: str) -> nn.Module | None:
-        if name not in _COMPONENT_ORDER:
-            raise KeyError(f"Unknown VOSR component {name!r}; expected one of {_COMPONENT_ORDER}.")
+        if name not in VOSR_COMPONENTS:
+            raise KeyError(f"Unknown VOSR component {name!r}; expected one of {VOSR_COMPONENTS}.")
         return getattr(self, name)
 
     def train(self, mode: bool = True) -> VOSRPipeline:
@@ -428,120 +377,25 @@ class VOSRPipeline(nn.Module):
 
 
 class VOSRModel(BaseModel):
-    """Composable multi-arch VOSR training paradigm with per-arch trainability, EMA, and saving."""
+    """Composable multi-arch VOSR training paradigm receiving typed ``TrainConfig`` directly."""
 
-    def __init__(
-        self,
-        cfg: DictConfig | Mapping[str, Any],
-        scale: int | None = _UNSET,
-        trainable: DictConfig | Mapping[str, Any] | None = _UNSET,
-        noise_input: str | None = _UNSET,
-        posterior_mode: bool | None = _UNSET,
-        clamp_decode_in_train: bool | None = _UNSET,
-        eval_seed: int | None = _UNSET,
-        ema: DictConfig | Mapping[str, Any] | None = _UNSET,
-        save_frozen_weights: bool | None = _UNSET,
-        pretrain: DictConfig | Mapping[str, Any] | None = _UNSET,
-    ) -> None:
+    def __init__(self, cfg: TrainConfig) -> None:
         super().__init__(cfg)
+        m: VOSRModelConfig = cfg.model
 
-        raw_scale = (
-            OmegaConf.select(self.cfg, "model.scale", default=None) if scale is _UNSET else scale
-        )
-        if raw_scale is None:
-            raw_scale = OmegaConf.select(self.cfg, "scale", default=1)
-        self.scale: int = _parse_positive_int(raw_scale, "model.scale")
-
-        raw_trainable = (
-            OmegaConf.select(self.cfg, "model.trainable", default=None)
-            if trainable is _UNSET
-            else trainable
-        )
-        self.trainable: dict[str, bool] = _parse_trainable_map(raw_trainable)
-
-        raw_noise_input = (
-            OmegaConf.select(self.cfg, "model.noise_input", default="gaussian")
-            if noise_input is _UNSET
-            else noise_input
-        )
-        if raw_noise_input not in _VALID_NOISE_INPUTS:
-            raise ValueError(
-                f"model.noise_input must be one of {sorted(_VALID_NOISE_INPUTS)}, got {raw_noise_input!r}."
-            )
-        self.noise_input: str = str(raw_noise_input)
-
-        raw_posterior = (
-            OmegaConf.select(self.cfg, "model.posterior_mode", default=True)
-            if posterior_mode is _UNSET
-            else posterior_mode
-        )
-        self.posterior_mode: bool = _parse_bool(raw_posterior, "model.posterior_mode")
-
-        raw_clamp_train = (
-            OmegaConf.select(self.cfg, "model.clamp_decode_in_train", default=True)
-            if clamp_decode_in_train is _UNSET
-            else clamp_decode_in_train
-        )
-        self.clamp_decode_in_train: bool = _parse_bool(
-            raw_clamp_train, "model.clamp_decode_in_train"
-        )
-
-        raw_eval_seed = (
-            OmegaConf.select(self.cfg, "model.eval_seed", default=42)
-            if eval_seed is _UNSET
-            else eval_seed
-        )
-        if raw_eval_seed is not None and (
-            isinstance(raw_eval_seed, bool) or not isinstance(raw_eval_seed, int)
-        ):
-            raise ValueError(f"model.eval_seed must be an int or None, got {raw_eval_seed!r}.")
-        self.eval_seed: int | None = raw_eval_seed
-
-        raw_ema = (
-            OmegaConf.select(self.cfg, "model.ema", default=None) if ema is _UNSET else ema
-        )
-        if raw_ema is None:
-            self.ema_enabled: bool = False
-            self.ema_decay: float = 0.999
-            self.ema_warmup_steps: int = 0
-        elif isinstance(raw_ema, (DictConfig, Mapping)):
-            self.ema_enabled = _parse_bool(raw_ema.get("enabled", True), "model.ema.enabled")
-            raw_decay = raw_ema.get("decay", 0.999)
-            if isinstance(raw_decay, bool) or not isinstance(raw_decay, numbers.Real):
-                raise ValueError(
-                    f"model.ema.decay must be a finite real in (0, 1], got {raw_decay!r}."
-                )
-            decay_f = float(raw_decay)
-            if not math.isfinite(decay_f) or not (0.0 < decay_f <= 1.0):
-                raise ValueError(f"model.ema.decay must be in (0, 1], got {raw_decay!r}.")
-            self.ema_decay = decay_f
-
-            raw_warmup = raw_ema.get("warmup_steps", 0)
-            if isinstance(raw_warmup, bool) or not isinstance(raw_warmup, int) or raw_warmup < 0:
-                raise ValueError(
-                    f"model.ema.warmup_steps must be a non-negative integer, got {raw_warmup!r}."
-                )
-            self.ema_warmup_steps = int(raw_warmup)
-        else:
-            raise TypeError(
-                f"model.ema must be a mapping or None, got {type(raw_ema).__name__}."
-            )
-
-        raw_save_frozen = (
-            OmegaConf.select(self.cfg, "model.save_frozen_weights", default=True)
-            if save_frozen_weights is _UNSET
-            else save_frozen_weights
-        )
-        self.save_frozen_weights: bool = _parse_bool(
-            raw_save_frozen, "model.save_frozen_weights"
-        )
-
-        raw_pretrain = (
-            OmegaConf.select(self.cfg, "model.pretrain", default=None)
-            if pretrain is _UNSET
-            else pretrain
-        )
-        self.pretrain: dict[str, _PretrainSpec] = _parse_pretrain_map(raw_pretrain)
+        self.model_cfg: VOSRModelConfig = m
+        self.scale: int = m.scale
+        self.trainable: dict[str, bool] = m.trainable.as_dict()
+        self.lora: LoRAConfig = m.lora
+        self.noise_input: str = m.noise_input.value
+        self.posterior_mode: bool = m.posterior_mode
+        self.clamp_decode_in_train: bool = m.clamp_decode_in_train
+        self.eval_seed: int | None = m.eval_seed
+        self.ema_enabled: bool = m.ema.enabled
+        self.ema_decay: float = m.ema.decay
+        self.ema_warmup_steps: int = m.ema.warmup_steps
+        self.save_frozen_weights: bool = m.save_frozen_weights
+        self.pretrain: VOSRPretrainConfig = m.pretrain
 
         self.pipeline: nn.Module | None = None
         self.emas: dict[str, ModelEMA] = {}
@@ -580,12 +434,16 @@ class VOSRModel(BaseModel):
     def trainable_components(self) -> tuple[str, ...]:
         return tuple(name for name in self._active_components if self.trainable.get(name, False))
 
+    @property
+    def dit_lora_enabled(self) -> bool:
+        return should_attach_dit_lora(self.model_cfg)
+
     def get_component(self, name: str, *, use_ema: bool = False) -> nn.Module | None:
         """Return an unwrapped component arch (``vae`` / ``dit`` / ``dino``), optionally EMA."""
         self._require_setup()
         assert self.pipeline is not None
-        if name not in _COMPONENT_ORDER:
-            raise KeyError(f"Unknown VOSR component {name!r}; expected one of {_COMPONENT_ORDER}.")
+        if name not in VOSR_COMPONENTS:
+            raise KeyError(f"Unknown VOSR component {name!r}; expected one of {VOSR_COMPONENTS}.")
         if use_ema and name in self.emas:
             return self.emas[name].module
         raw_pipe = unwrap_model_for_ema(self.pipeline)
@@ -653,43 +511,17 @@ class VOSRModel(BaseModel):
         if self._is_setup:
             raise RuntimeError("VOSRModel.setup() has already been called.")
 
-        grad_clip_norm = _parse_positive_real_or_none(
-            OmegaConf.select(self.cfg, "trainer.grad_clip_norm", default=None),
-            "trainer.grad_clip_norm",
-        )
-        use_compile = _parse_bool(
-            OmegaConf.select(self.cfg, "trainer.compile", default=False),
-            "trainer.compile",
-        )
+        grad_clip_norm = self.cfg.trainer.grad_clip_norm
+        use_compile = self.cfg.trainer.compile
         logger = logging.getLogger("srtrainer")
 
-        # Step 1: Validate & instantiate independent arch components (vae, dit, optional dino).
-        arch_root = OmegaConf.select(self.cfg, "arch", default=None)
-        if not isinstance(arch_root, (DictConfig, Mapping)):
-            raise ValueError(
-                "cfg.arch must be a mapping containing 'vae', 'dit', and optional 'dino' configs."
-            )
-
+        # Step 1: Instantiate independent arch components (vae, dit, optional dino).
         raw_components: dict[str, nn.Module] = {}
-        for comp_name in _COMPONENT_ORDER:
-            comp_cfg = arch_root.get(comp_name, None)
+        for comp_name in VOSR_COMPONENTS:
+            comp_cfg = self.cfg.arch.get(comp_name)
             if comp_cfg is None:
-                if comp_name in _REQUIRED_COMPONENTS:
-                    raise ValueError(
-                        f"cfg.arch.{comp_name} is required for VOSRModel and cannot be None."
-                    )
-                if self.trainable[comp_name]:
-                    raise ValueError(
-                        f"Cannot set model.trainable.{comp_name}=True when cfg.arch.{comp_name} is None."
-                    )
-                if self.pretrain[comp_name].path is not None:
-                    raise ValueError(
-                        f"Cannot set model.pretrain.{comp_name}.path when cfg.arch.{comp_name} is None."
-                    )
                 continue
-
-            _validate_target_mapping(comp_cfg, f"cfg.arch.{comp_name}")
-            spec = self.pretrain[comp_name]
+            spec = self.pretrain.get(comp_name)
             inst_cfg = (
                 _clone_arch_cfg_skip_pretrained(comp_cfg)
                 if (spec.path is not None and spec.strict)
@@ -704,48 +536,22 @@ class VOSRModel(BaseModel):
                 )
             raw_components[comp_name] = comp_mod
 
-        active_components = tuple(name for name in _COMPONENT_ORDER if name in raw_components)
+        active_components = tuple(name for name in VOSR_COMPONENTS if name in raw_components)
 
         # Instantiate active losses and optional degrader.
-        loss_cfg = OmegaConf.select(self.cfg, "loss", default=None)
-        if not isinstance(loss_cfg, (DictConfig, Mapping)) or len(loss_cfg) == 0:
-            raise ValueError("cfg.loss must be a non-empty mapping of named loss entries.")
-
         active_losses: dict[str, tuple[float, Callable[..., torch.Tensor]]] = {}
-        for loss_name, entry in loss_cfg.items():
-            if entry is None:
-                continue
-            if not isinstance(entry, (DictConfig, Mapping)):
-                raise ValueError(
-                    f"cfg.loss[{loss_name!r}] must be a mapping with 'weight' and 'criterion', "
-                    f"got {type(entry).__name__}."
-                )
-            if "weight" not in entry:
-                raise ValueError(f"cfg.loss[{loss_name!r}] is missing required key 'weight'.")
-            raw_weight = entry["weight"]
-            if isinstance(raw_weight, bool) or not isinstance(raw_weight, numbers.Real):
-                raise ValueError(
-                    f"cfg.loss[{loss_name!r}].weight must be a finite real number, got {raw_weight!r}."
-                )
-            weight_val = float(raw_weight)
-            if not math.isfinite(weight_val):
-                raise ValueError(
-                    f"cfg.loss[{loss_name!r}].weight must be finite, got {raw_weight!r}."
-                )
+        for loss_name, entry in self.cfg.loss.items():
+            weight_val = float(entry.weight)
             if weight_val <= 0.0:
                 if weight_val < 0.0 and accelerator.is_main_process:
                     logger.warning(
                         "[Model] Skipping loss %r with non-positive weight=%.6g.",
-                        str(loss_name),
+                        loss_name,
                         weight_val,
                     )
                 continue
-
-            crit_cfg = _validate_target_mapping(
-                entry.get("criterion", None), f"cfg.loss[{loss_name!r}].criterion"
-            )
             with accelerator.main_process_first():
-                criterion = hydra.utils.instantiate(crit_cfg)
+                criterion = hydra.utils.instantiate(entry.criterion)
             if not callable(criterion):
                 raise TypeError(
                     f"Instantiated cfg.loss[{loss_name!r}].criterion must be callable, "
@@ -753,18 +559,13 @@ class VOSRModel(BaseModel):
                 )
             if isinstance(criterion, nn.Module):
                 criterion = criterion.to(accelerator.device)
-            active_losses[str(loss_name)] = (weight_val, criterion)
+            active_losses[loss_name] = (weight_val, criterion)
 
-        if not active_losses:
-            raise ValueError(
-                "cfg.loss must contain at least one active loss entry with weight > 0."
-            )
-
-        deg_cfg = OmegaConf.select(self.cfg, "data.degradation", default=None)
+        deg_cfg = self.cfg.data.degradation
         degrader: Any = None
         if deg_cfg is not None:
-            _validate_target_mapping(deg_cfg, "cfg.data.degradation")
-            degrader = hydra.utils.instantiate(deg_cfg)
+            deg_node = OmegaConf.structured(deg_cfg) if is_dataclass(deg_cfg) else deg_cfg
+            degrader = hydra.utils.instantiate(deg_node)
             if not callable(degrader):
                 raise TypeError(
                     f"Instantiated cfg.data.degradation must be callable, got {type(degrader).__name__}."
@@ -775,12 +576,12 @@ class VOSRModel(BaseModel):
 
         # Step 2: Optional per-arch pretrain loading onto raw modules BEFORE EMA / compile / DDP.
         for comp_name in active_components:
-            spec = self.pretrain[comp_name]
+            spec = self.pretrain.get(comp_name)
             if spec.path is None:
                 continue
             missing_keys, unexpected_keys = _load_component_weights(
                 raw_components[comp_name],
-                spec.path,
+                Path(spec.path),
                 strict=spec.strict,
                 key=spec.key,
             )
@@ -802,33 +603,67 @@ class VOSRModel(BaseModel):
                         unexpected_keys,
                     )
 
+        # Step 2.5: Optional DiT LoRA attachment & checkpoint loading (only when dit is trainable).
+        dit_lora_active = should_attach_dit_lora(self.model_cfg)
+        dit_base_param_ids: set[int] = set()
+        if dit_lora_active:
+            dit_mod = raw_components["dit"]
+            dit_base_param_ids = {id(p) for p in dit_mod.parameters()}
+            dit_mod.requires_grad_(False)
+            dit_mod = _apply_dit_lora(dit_mod, self.lora)
+            raw_components["dit"] = dit_mod
+            if self.lora.checkpoint is not None:
+                missing_keys, unexpected_keys = load_weights(
+                    dit_mod,
+                    Path(self.lora.checkpoint),
+                    strict=False,
+                )
+                if accelerator.is_main_process:
+                    logger.info(
+                        "[Model] Loaded DiT LoRA checkpoint from %s (rank=%d, alpha=%g).",
+                        self.lora.checkpoint,
+                        self.lora.lora_rank,
+                        self.lora.lora_alpha,
+                    )
+                    if missing_keys or unexpected_keys:
+                        logger.warning(
+                            "[Model] DiT LoRA checkpoint load summary: missing=%d %s, unexpected=%d %s.",
+                            len(missing_keys),
+                            missing_keys,
+                            len(unexpected_keys),
+                            unexpected_keys,
+                        )
+
         # Step 3: Apply per-arch trainability switches BEFORE EMA / compile / DDP.
         trainable_names: list[str] = []
         trainable_params: list[nn.Parameter] = []
         for comp_name in active_components:
             comp_mod = raw_components[comp_name]
             if self.trainable[comp_name]:
-                comp_mod.requires_grad_(True)
-                freeze_unused = getattr(comp_mod, "freeze_unused_parameters", None)
-                if callable(freeze_unused):
-                    freeze_unused()
-                comp_params = [p for p in comp_mod.parameters() if p.requires_grad]
-                if not comp_params:
-                    raise ValueError(
-                        f"Component {comp_name!r} is marked trainable=True but has no parameters "
-                        "with requires_grad=True."
-                    )
+                if comp_name == "dit" and dit_lora_active:
+                    comp_params = _set_dit_lora_trainable_params(comp_mod, dit_base_param_ids)
+                    if not comp_params:
+                        raise ValueError(
+                            "Component 'dit' has trainable=True and model.lora.enable=True, "
+                            "but no trainable LoRA parameters were found after attach_dit_lora(). "
+                            "Implement attach_dit_lora() to inject LoRA parameters into DiT."
+                        )
+                else:
+                    comp_mod.requires_grad_(True)
+                    freeze_unused = getattr(comp_mod, "freeze_unused_parameters", None)
+                    if callable(freeze_unused):
+                        freeze_unused()
+                    comp_params = [p for p in comp_mod.parameters() if p.requires_grad]
+                    if not comp_params:
+                        raise ValueError(
+                            f"Component {comp_name!r} is marked trainable=True but has no parameters "
+                            "with requires_grad=True."
+                        )
                 trainable_names.append(comp_name)
                 trainable_params.extend(comp_params)
             else:
                 comp_mod.requires_grad_(False)
                 comp_mod.eval()
-
-        if not trainable_names or not trainable_params:
-            raise ValueError(
-                "At least one active VOSR arch component must be trainable "
-                f"(model.trainable={self.trainable})."
-            )
 
         # Step 4: Clone FP32 EMA shadow ONLY for trainable components BEFORE compile and prepare().
         emas: dict[str, ModelEMA] = {}
@@ -847,26 +682,17 @@ class VOSRModel(BaseModel):
                 raw_components[comp_name] = torch.compile(raw_components[comp_name])
 
         # Assemble composable pipeline (validates cross-component channel / conditioning contracts).
-        raw_pipeline = VOSRPipeline(
+        raw_pipeline = VOSRPipeline.from_model_config(
             vae=raw_components["vae"],
             dit=raw_components["dit"],
             dino=raw_components.get("dino"),
-            scale=self.scale,
-            noise_input=self.noise_input,
-            posterior_mode=self.posterior_mode,
-            clamp_decode_in_train=self.clamp_decode_in_train,
-            eval_seed=self.eval_seed,
-            trainable=self.trainable,
+            model_cfg=self.model_cfg,
+            trainable=self.model_cfg.trainable,
         )
 
         # Step 6: Instantiate partial optimizer and optional partial lr_scheduler over trainable params.
-        optim_root = OmegaConf.select(self.cfg, "optim", default=None)
-        if not isinstance(optim_root, (DictConfig, Mapping)):
-            raise ValueError("cfg.optim must be a mapping containing 'optimizer'.")
-        opt_cfg = _validate_target_mapping(optim_root.get("optimizer", None), "cfg.optim.optimizer")
-
         opt_params = [p for p in raw_pipeline.parameters() if p.requires_grad]
-        opt_factory = hydra.utils.instantiate(opt_cfg, _convert_="all")
+        opt_factory = hydra.utils.instantiate(self.cfg.optim.optimizer, _convert_="all")
         optimizer = opt_factory(opt_params) if callable(opt_factory) else opt_factory
         if not isinstance(optimizer, torch.optim.Optimizer):
             raise TypeError(
@@ -874,10 +700,9 @@ class VOSRModel(BaseModel):
                 f"got {type(optimizer).__name__}."
             )
 
-        sched_cfg = optim_root.get("scheduler", None)
+        sched_cfg = self.cfg.optim.scheduler
         lr_scheduler: Any = None
         if sched_cfg is not None:
-            _validate_target_mapping(sched_cfg, "cfg.optim.scheduler")
             sched_factory = hydra.utils.instantiate(sched_cfg, _convert_="all")
             lr_scheduler = sched_factory(optimizer) if callable(sched_factory) else sched_factory
             for required_attr in ("step", "state_dict", "load_state_dict"):
@@ -893,18 +718,19 @@ class VOSRModel(BaseModel):
         # Deterministic registration for Accelerate checkpointing (lr_scheduler -> per-arch EMAs).
         if lr_scheduler is not None:
             accelerator.register_for_checkpointing(lr_scheduler)
-        for comp_name in _COMPONENT_ORDER:
+        for comp_name in VOSR_COMPONENTS:
             if comp_name in emas:
                 accelerator.register_for_checkpointing(emas[comp_name])
 
         if accelerator.is_main_process:
             frozen_names = [n for n in active_components if n not in trainable_names]
             logger.info(
-                "[Model] VOSRModel ready | active=%s | trainable=%s | frozen=%s | ema=%s",
+                "[Model] VOSRModel ready | active=%s | trainable=%s | frozen=%s | ema=%s | dit_lora=%s",
                 list(active_components),
                 trainable_names,
                 frozen_names,
                 list(emas.keys()),
+                dit_lora_active,
             )
 
         self.accelerator = accelerator
@@ -1085,15 +911,11 @@ class VOSRModel(BaseModel):
             if "dino" in self.emas
             else (unwrap_model_for_ema(raw_pipe.dino) if raw_pipe.dino is not None else None)
         )
-        infer_pipe = VOSRPipeline(
+        infer_pipe = VOSRPipeline.from_model_config(
             vae=vae_mod,
             dit=dit_mod,
             dino=dino_mod,
-            scale=self.scale,
-            noise_input=self.noise_input,
-            posterior_mode=self.posterior_mode,
-            clamp_decode_in_train=self.clamp_decode_in_train,
-            eval_seed=self.eval_seed,
+            model_cfg=self.model_cfg,
             trainable=None,
         )
         infer_pipe.eval()

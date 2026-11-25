@@ -6,33 +6,67 @@ for SRTrainer's RGB ``[0, 1]`` tensor convention.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import math
 import numbers
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import load_file
+from torch.utils.checkpoint import checkpoint
+
+from utils.text_geometry import canonical_quad, rectify_text_roi
 
 __all__ = [
     "PPOCR_CHECKPOINT",
     "PPOCRv5ServerRec",
     "load_ppocr_recognizer",
-    "extract_text_strips",
     "OCRKLLoss",
     "KLOCRLoss",
 ]
 
 PPOCR_CHECKPOINT = "PaddlePaddle/PP-OCRv5_server_rec_safetensors"
 _VALID_INPUT_RANGES: frozenset[str] = frozenset({"0_1", "-1_1"})
+_GEOMETRY_KEYS: tuple[str, ...] = ("quad", "points", "bbox", "box")
+_IGNORED_TRANSCRIPTIONS: frozenset[str] = frozenset({"###", "*"})
 
 
 def _is_positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def _normalize_amp_dtype(value: Any) -> str:
+    """Normalize OCR-KL autocast mode to ``'bf16' | 'fp16' | 'fp32' | 'inherit'``."""
+    if value is None:
+        return "fp32"
+    if isinstance(value, bool):
+        raise ValueError(
+            f"amp_dtype must be 'bf16', 'fp16', 'fp32', 'inherit', or None, got bool {value!r}."
+        )
+    if not isinstance(value, str):
+        raise ValueError(
+            f"amp_dtype must be a string or None, got {type(value).__name__}: {value!r}."
+        )
+    norm = value.strip().lower()
+    if norm in {"bf16", "bfloat16"}:
+        return "bf16"
+    if norm in {"fp16", "float16"}:
+        return "fp16"
+    if norm in {"fp32", "float32", "no", "none", "off", ""}:
+        return "fp32"
+    if norm in {"inherit", "auto"}:
+        return "inherit"
+    raise ValueError(
+        f"Unsupported amp_dtype={value!r}; expected 'bf16', 'fp16', 'fp32', or 'inherit'."
+    )
 
 
 class ConvBN(nn.Module):
@@ -306,42 +340,40 @@ def load_ppocr_recognizer(
     return model
 
 
-def extract_text_strips(images: torch.Tensor, height: int, stride: int) -> torch.Tensor:
-    """Slice 4D images into overlapping full-width horizontal strips covering every row."""
-    full = int(images.shape[-2])
-    eff_height = min(height, full)
-    starts = list(range(0, full - eff_height + 1, stride))
-    if not starts or starts[-1] + eff_height < full:
-        starts.append(full - eff_height)
-    return torch.cat([images[..., start : start + eff_height, :] for start in starts], dim=0)
-
-
 class OCRKLLoss(nn.Module):
-    """KL(OCR(target) || OCR(pred)) over frozen PP-OCRv5 per-frame CTC distributions.
+    """KL(OCR(target) || OCR(pred)) over frozen PP-OCRv5 per-frame CTC distributions on text lines.
 
-    Cuts ``pred`` and ``target`` into matching overlapping horizontal strips, resizes each
-    strip to the recognizer's line height (48 px for PP-OCRv5), and computes temperature-scaled
-    frame-averaged KL divergence in FP32 outside autocast. Recognizer weights are frozen and
-    permanently locked in ``eval()`` mode so BatchNorm statistics never mutate; gradients flow
-    exclusively into ``pred``.
+    Sets ``needs_batch = True`` and operates exclusively on samples carrying crop-relative
+    ``text_lines`` annotations (from ``text_lines=...`` or ``batch['text_lines']``). Each line
+    geometry (``quad`` / ``points`` / ``bbox`` / ``box``, or the bounding hull of ``glyphs``) is
+    differentiably rectified via :func:`rectify_text_roi`, auto-rotated when vertical
+    (``height / width >= 1.5``), sorted by width, grouped into chunks of ``strip_batch_size``,
+    right-padded to a bucket width, and scored strictly over valid (unpadded) CTC frames.
 
-    By default ``input_range="0_1"`` rescales SRTrainer ``[0, 1]`` RGB images to ``[-1, 1]``
-    before passing them to ``PPOCRv5ServerRec`` (use ``input_range="-1_1"`` for raw ``[-1, 1]``).
+    Samples or batches without ``text_lines`` annotations are skipped cleanly (returning a
+    graph-connected zero loss when no valid text lines exist in the local batch while still
+    participating in DDP frame-count synchronization). Recognizer weights are frozen in ``eval()``
+    mode and run under ``amp_dtype`` (default ``"bf16"``) while ``log_softmax`` / ``kl_div`` run
+    in FP32 for numerical stability. When ``use_checkpoint=True``, each chunk's recognizer forward
+    and KL reduction are activation-checkpointed to cap peak memory at one ``strip_batch_size``.
     """
+
+    needs_batch: bool = True
 
     def __init__(
         self,
         checkpoint: str | Path = PPOCR_CHECKPOINT,
-        strip_height: int = 64,
-        strip_stride: int = 32,
         temperature: float = 1.0,
         input_range: str = "0_1",
+        strip_batch_size: int = 4,
+        max_lines_per_image: int | None = None,
+        max_strip_width: int = 512,
+        width_bucket_step: int | None = 32,
+        amp_dtype: str | None = "bf16",
+        use_checkpoint: bool = True,
+        sync_ddp_counts: bool = True,
     ) -> None:
         super().__init__()
-        if not _is_positive_int(strip_height):
-            raise ValueError(f"strip_height must be a positive integer, got {strip_height!r}.")
-        if not _is_positive_int(strip_stride):
-            raise ValueError(f"strip_stride must be a positive integer, got {strip_stride!r}.")
         if isinstance(temperature, bool) or not isinstance(temperature, numbers.Real):
             raise ValueError(f"temperature must be a positive finite real, got {temperature!r}.")
         temp_f = float(temperature)
@@ -351,12 +383,48 @@ class OCRKLLoss(nn.Module):
             raise ValueError(
                 f"Unsupported input_range={input_range!r}; expected one of {sorted(_VALID_INPUT_RANGES)}."
             )
+        if not _is_positive_int(strip_batch_size):
+            raise ValueError(
+                f"strip_batch_size must be a positive integer, got {strip_batch_size!r}."
+            )
+        if max_lines_per_image is not None and not _is_positive_int(max_lines_per_image):
+            raise ValueError(
+                f"max_lines_per_image must be a positive integer or None, got {max_lines_per_image!r}."
+            )
+        if not _is_positive_int(max_strip_width) or max_strip_width < 8 or max_strip_width % 8 != 0:
+            raise ValueError(
+                f"max_strip_width must be a positive multiple of 8 (>= 8), got {max_strip_width!r}."
+            )
+        if width_bucket_step is not None and (
+            not _is_positive_int(width_bucket_step) or width_bucket_step % 8 != 0
+        ):
+            raise ValueError(
+                f"width_bucket_step must be a positive multiple of 8 or None, got {width_bucket_step!r}."
+            )
+        if not isinstance(use_checkpoint, bool):
+            raise ValueError(
+                f"use_checkpoint must be a bool, got {type(use_checkpoint).__name__}: {use_checkpoint!r}."
+            )
+        if not isinstance(sync_ddp_counts, bool):
+            raise ValueError(
+                f"sync_ddp_counts must be a bool, got {type(sync_ddp_counts).__name__}: {sync_ddp_counts!r}."
+            )
+
+        norm_amp = _normalize_amp_dtype(amp_dtype)
 
         self.checkpoint = str(checkpoint)
-        self.strip_height = int(strip_height)
-        self.strip_stride = int(strip_stride)
         self.temperature = temp_f
         self.input_range = input_range
+        self.strip_batch_size = int(strip_batch_size)
+        self.max_lines_per_image = int(max_lines_per_image) if max_lines_per_image is not None else None
+        self.max_strip_width = int(max_strip_width)
+        self.width_bucket_step = int(width_bucket_step) if width_bucket_step is not None else None
+        self.amp_dtype = norm_amp
+        self.use_checkpoint = use_checkpoint
+        self.sync_ddp_counts = sync_ddp_counts
+        self._warned_amp_fallback: set[tuple[str, str]] = set()
+        self._warned_missing_text_lines: bool = False
+        self.last_counts: tuple[int, int] = (0, 0)  # (local_lines, local_frames)
 
         rec_model = load_ppocr_recognizer(checkpoint)
         resolved_height = int(getattr(rec_model, "input_height", PPOCRv5ServerRec.input_height))
@@ -377,20 +445,250 @@ class OCRKLLoss(nn.Module):
             return x * 2.0 - 1.0
         return x
 
-    def logits(self, images: torch.Tensor) -> torch.Tensor:
-        """Compute temperature-scaled per-frame CTC logits on horizontal strips of ``images``."""
-        x = self._to_recognizer_range(images)
-        strips = extract_text_strips(x, self.strip_height, self.strip_stride)
-        width = max(8, round(strips.shape[-1] * self.input_height / strips.shape[-2] / 8) * 8)
-        strips = F.interpolate(
-            strips,
-            size=(self.input_height, width),
-            mode="bilinear",
-            align_corners=False,
-        )
-        return self.recognizer(strips).float() / self.temperature
+    def _amp_context(self, device: torch.device) -> contextlib.AbstractContextManager[Any]:
+        if self.amp_dtype == "inherit":
+            return contextlib.nullcontext()
+        device_type = device.type
+        if self.amp_dtype == "fp32":
+            return torch.amp.autocast(device_type=device_type, enabled=False)
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        is_avail = torch.amp.is_autocast_available(device_type)
+        if self.amp_dtype == "bf16":
+            if (device_type == "cuda" and not torch.cuda.is_bf16_supported()) or not is_avail:
+                key = ("bf16", device_type)
+                if key not in self._warned_amp_fallback:
+                    self._warned_amp_fallback.add(key)
+                    logging.getLogger("srtrainer").warning(
+                        "OCRKLLoss: amp_dtype='bf16' is unavailable on device_type=%r; "
+                        "falling back to FP32.",
+                        device_type,
+                    )
+                return torch.amp.autocast(device_type=device_type, enabled=False)
+            return torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=True)
+
+        if self.amp_dtype == "fp16":
+            if device_type == "cpu" or not is_avail:
+                key = ("fp16", device_type)
+                if key not in self._warned_amp_fallback:
+                    self._warned_amp_fallback.add(key)
+                    logging.getLogger("srtrainer").warning(
+                        "OCRKLLoss: amp_dtype='fp16' is unsupported on device_type=%r; "
+                        "falling back to FP32.",
+                        device_type,
+                    )
+                return torch.amp.autocast(device_type=device_type, enabled=False)
+            return torch.amp.autocast(device_type=device_type, dtype=torch.float16, enabled=True)
+
+        return contextlib.nullcontext()
+
+    def _extract_line_quad(
+        self,
+        line: Mapping[str, Any],
+        context: str,
+    ) -> np.ndarray | None:
+        if line.get("valid", True) is False or line.get("alignment_valid", True) is False:
+            return None
+        if line.get("ignore", False) is True or line.get("difficult", False) is True:
+            return None
+        transcript = line.get("transcript", line.get("transcription", line.get("text", "")))
+        if isinstance(transcript, str) and transcript.strip() in _IGNORED_TRANSCRIPTIONS:
+            return None
+
+        for geom_key in _GEOMETRY_KEYS:
+            if geom_key in line and line[geom_key] is not None:
+                return canonical_quad(line[geom_key], name=f"{context}.{geom_key}")
+
+        glyphs = line.get("glyphs")
+        if isinstance(glyphs, Sequence) and not isinstance(glyphs, (str, bytes)) and len(glyphs) > 0:
+            all_pts: list[np.ndarray] = []
+            for g_idx, glyph in enumerate(glyphs):
+                if not isinstance(glyph, Mapping):
+                    continue
+                geom = glyph.get("quad", glyph.get("bbox"))
+                if geom is None:
+                    continue
+                all_pts.append(canonical_quad(geom, name=f"{context}.glyphs[{g_idx}]"))
+            if all_pts:
+                stacked = np.concatenate(all_pts, axis=0)
+                x0, y0 = float(stacked[:, 0].min()), float(stacked[:, 1].min())
+                x1, y1 = float(stacked[:, 0].max()), float(stacked[:, 1].max())
+                if x1 > x0 and y1 > y0:
+                    return canonical_quad([x0, y0, x1, y1], name=f"{context}.glyphs_hull")
+
+        return None
+
+    def _collect_line_entries(
+        self,
+        text_lines: Sequence[Sequence[Mapping[str, Any]] | None],
+    ) -> list[tuple[int, np.ndarray, int]]:
+        entries: list[tuple[int, np.ndarray, int]] = []
+        for img_idx, per_image in enumerate(text_lines):
+            if per_image is None:
+                continue
+            if not isinstance(per_image, Sequence) or isinstance(per_image, (str, bytes)):
+                raise ValueError(
+                    f"Expected sequence of line mappings (or None) in text_lines[{img_idx}], "
+                    f"got {type(per_image).__name__}."
+                )
+            img_entries: list[tuple[int, np.ndarray, int]] = []
+            for line_idx, item in enumerate(per_image):
+                if not isinstance(item, Mapping):
+                    raise ValueError(
+                        f"Expected mapping in text_lines[{img_idx}][{line_idx}], "
+                        f"got {type(item).__name__}."
+                    )
+                quad = self._extract_line_quad(item, f"text_lines[{img_idx}][{line_idx}]")
+                if quad is None:
+                    continue
+
+                top, right, bottom, left = np.linalg.norm(
+                    np.roll(quad, -1, axis=0) - quad, axis=1
+                )
+                nat_h = max(1.0, float(max(left, right)))
+                nat_w = max(1.0, float(max(top, bottom)))
+                # Rotate vertical text lines 90 deg CCW to match horizontal PP-OCRv5 input.
+                if nat_h / nat_w >= 1.5:
+                    quad = quad[[1, 2, 3, 0]]
+                    nat_h, nat_w = nat_w, nat_h
+
+                raw_w = round(nat_w * self.input_height / nat_h / 8.0) * 8
+                target_w = max(8, min(self.max_strip_width, int(raw_w)))
+                img_entries.append((img_idx, quad, target_w))
+
+            if self.max_lines_per_image is not None and len(img_entries) > self.max_lines_per_image:
+                keep_indices = torch.randperm(len(img_entries))[: self.max_lines_per_image].tolist()
+                img_entries = [img_entries[idx] for idx in keep_indices]
+
+            entries.extend(img_entries)
+
+        # Sort by target width so each strip_batch_size chunk shares similar width with minimal pad.
+        entries.sort(key=lambda item: item[2])
+        return entries
+
+    def _resolve_pad_width(self, widths: Sequence[int]) -> int:
+        max_w = max(widths)
+        if self.width_bucket_step is None:
+            pad_w = max_w
+        else:
+            step = self.width_bucket_step
+            bucketed = math.ceil(max_w / step) * step
+            pad_w = min(self.max_strip_width, bucketed)
+            if pad_w < max_w:
+                pad_w = max_w
+        return max(8, math.ceil(pad_w / 8) * 8)
+
+    def _chunk_kl_sum(
+        self,
+        pred_chunk: torch.Tensor,
+        target_chunk: torch.Tensor,
+        valid_widths: tuple[int, ...],
+        pad_w: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        with self._amp_context(pred_chunk.device):
+            with torch.no_grad():
+                target_logits = self.recognizer(target_chunk)
+            pred_logits = self.recognizer(pred_chunk)
+
+        with torch.amp.autocast(device_type=pred_chunk.device.type, enabled=False):
+            target_f32 = target_logits.float() / self.temperature
+            pred_f32 = pred_logits.float() / self.temperature
+            if pred_f32.shape != target_f32.shape or pred_f32.ndim != 3:
+                raise ValueError(
+                    f"OCR recognizer must return matching (N, T, C) logits, "
+                    f"got pred={tuple(pred_f32.shape)}, target={tuple(target_f32.shape)}."
+                )
+
+            batch_n, total_t, _ = pred_f32.shape
+            if all(w == pad_w for w in valid_widths):
+                target_log = F.log_softmax(target_f32, dim=-1)
+                pred_log = F.log_softmax(pred_f32, dim=-1)
+                kl_sum = F.kl_div(pred_log, target_log, reduction="sum", log_target=True)
+                valid_frames = batch_n * total_t
+            else:
+                valid_lens = [
+                    max(1, min(total_t, round(w * total_t / pad_w))) for w in valid_widths
+                ]
+                frame_idx = torch.arange(total_t, device=pred_f32.device).unsqueeze(0)
+                len_t = torch.tensor(valid_lens, device=pred_f32.device).unsqueeze(1)
+                valid_mask = frame_idx < len_t
+                target_log = F.log_softmax(target_f32[valid_mask], dim=-1)
+                pred_log = F.log_softmax(pred_f32[valid_mask], dim=-1)
+                kl_sum = F.kl_div(pred_log, target_log, reduction="sum", log_target=True)
+                valid_frames = int(sum(valid_lens))
+
+        return kl_sum, torch.tensor(valid_frames, device=pred_chunk.device, dtype=torch.long)
+
+    def _run_chunk_kl(
+        self,
+        pred_chunk: torch.Tensor,
+        target_chunk: torch.Tensor,
+        valid_widths: tuple[int, ...],
+        pad_w: int,
+    ) -> tuple[torch.Tensor, int]:
+        if self.use_checkpoint and pred_chunk.requires_grad and torch.is_grad_enabled():
+
+            def _ckpt_fn(p_in: torch.Tensor, t_in: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                return self._chunk_kl_sum(p_in, t_in, valid_widths, pad_w)
+
+            kl_sum, frames_t = checkpoint(
+                _ckpt_fn,
+                pred_chunk,
+                target_chunk,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+        else:
+            kl_sum, frames_t = self._chunk_kl_sum(pred_chunk, target_chunk, valid_widths, pad_w)
+        return kl_sum, int(frames_t.item())
+
+    def _forward_text_lines_chunked(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        entries: list[tuple[int, np.ndarray, int]],
+    ) -> tuple[torch.Tensor, int, int]:
+        with torch.no_grad():
+            target_norm = self._to_recognizer_range(target)
+        pred_norm = self._to_recognizer_range(pred)
+
+        total_kl: torch.Tensor | None = None
+        total_frames = 0
+        for start in range(0, len(entries), self.strip_batch_size):
+            chunk = entries[start : start + self.strip_batch_size]
+            widths = tuple(item[2] for item in chunk)
+            pad_w = self._resolve_pad_width(widths)
+
+            p_crops: list[torch.Tensor] = []
+            t_crops: list[torch.Tensor] = []
+            for img_idx, quad, target_w in chunk:
+                out_hw = (self.input_height, target_w)
+                p_roi = rectify_text_roi(pred_norm[img_idx : img_idx + 1], quad, out_hw)
+                with torch.no_grad():
+                    t_roi = rectify_text_roi(target_norm[img_idx : img_idx + 1], quad, out_hw)
+                if target_w < pad_w:
+                    pad_right = pad_w - target_w
+                    p_roi = F.pad(p_roi, (0, pad_right, 0, 0), mode="constant", value=0.0)
+                    t_roi = F.pad(t_roi, (0, pad_right, 0, 0), mode="constant", value=0.0)
+                p_crops.append(p_roi)
+                t_crops.append(t_roi)
+
+            p_chunk = torch.cat(p_crops, dim=0)
+            t_chunk = torch.cat(t_crops, dim=0)
+            chunk_kl, chunk_frames = self._run_chunk_kl(p_chunk, t_chunk, widths, pad_w)
+            total_kl = chunk_kl if total_kl is None else total_kl + chunk_kl
+            total_frames += chunk_frames
+
+        assert total_kl is not None
+        return total_kl, len(entries), total_frames
+
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        text_lines: Sequence[Sequence[Mapping[str, Any]] | None] | None = None,
+        batch: Mapping[str, Any] | None = None,
+    ) -> torch.Tensor:
         if pred.ndim != 4 or target.ndim != 4:
             raise ValueError(
                 f"OCRKLLoss expects 4D inputs (B, 3, H, W), "
@@ -406,18 +704,55 @@ class OCRKLLoss(nn.Module):
                 f"OCRKLLoss expects 3-channel RGB inputs, got {pred.shape[1]} channels."
             )
 
-        with torch.amp.autocast(device_type=pred.device.type, enabled=False):
-            with torch.no_grad():
-                target_log = F.log_softmax(self.logits(target), dim=-1)
-            pred_log = F.log_softmax(self.logits(pred), dim=-1)
-            if pred_log.shape != target_log.shape or pred_log.ndim != 3:
-                raise ValueError(
-                    f"OCR recognizer must return matching (N, T, C) logits, "
-                    f"got pred={tuple(pred_log.shape)}, target={tuple(target_log.shape)}."
+        resolved_lines = text_lines
+        if resolved_lines is None and batch is not None:
+            resolved_lines = batch.get("text_lines")
+
+        if resolved_lines is None:
+            if not self._warned_missing_text_lines:
+                self._warned_missing_text_lines = True
+                logging.getLogger("srtrainer").warning(
+                    "OCRKLLoss received batch without `text_lines` annotations; skipping OCR-KL "
+                    "on unannotated samples (returning 0). Run `tools/detect_text_lines.py` to "
+                    "generate `text_lines` annotations for training manifests."
                 )
-            frames = pred_log.shape[0] * pred_log.shape[1]
-            kl = F.kl_div(pred_log, target_log, reduction="sum", log_target=True) / frames
-        return kl * (self.temperature**2)
+            entries: list[tuple[int, np.ndarray, int]] = []
+        else:
+            if isinstance(resolved_lines, (str, bytes)) or not isinstance(resolved_lines, Sequence):
+                raise ValueError(
+                    f"text_lines must be a per-image sequence, got {type(resolved_lines).__name__}."
+                )
+            if len(resolved_lines) != pred.shape[0]:
+                raise ValueError(
+                    f"Length of text_lines ({len(resolved_lines)}) must match batch size ({pred.shape[0]})."
+                )
+            entries = self._collect_line_entries(resolved_lines)
+
+        if not entries:
+            self.last_counts = (0, 0)
+            total_frames = 0
+            # Connected zero keeps autograd / DDP backward graphs valid on unannotated/text-free batches.
+            loss = pred.flatten()[:0].float().sum()
+        else:
+            total_kl, num_lines, total_frames = self._forward_text_lines_chunked(
+                pred, target, entries
+            )
+            self.last_counts = (num_lines, total_frames)
+            loss = (total_kl / max(1, total_frames)) * (self.temperature**2)
+
+        if (
+            self.sync_ddp_counts
+            and dist.is_available()
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+        ):
+            world = dist.get_world_size()
+            counts = torch.tensor([total_frames], device=pred.device, dtype=torch.long)
+            dist.all_reduce(counts)
+            global_frames = counts[0].clamp_min(1)
+            loss = loss * (total_frames * world / global_frames.to(dtype=loss.dtype))
+
+        return loss
 
 
 KLOCRLoss = OCRKLLoss

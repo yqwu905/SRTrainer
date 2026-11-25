@@ -1,38 +1,6 @@
-_target_: models.VOSRModel
+defaults:
+  - base_vosr
+  - _self_
+
+# All defaults live in VOSRModelConfig (src/config/schema.py); only bind global ${scale}.
 scale: ${scale}
-
-# Per-arch trainability switches (at least one active arch must be true)
-trainable:
-  vae: false
-  dit: true
-  dino: false
-
-# One-step sampling & decoding options
-noise_input: gaussian           # gaussian | zero
-posterior_mode: true
-clamp_decode_in_train: true
-eval_seed: 42
-
-# FP32 EMA applied to every trainable arch component
-ema:
-  enabled: true
-  decay: 0.999
-  warmup_steps: 0
-
-# Export frozen arch weights alongside trainable ones so weights/ is self-contained
-save_frozen_weights: true
-
-# Optional per-arch pretrain weight overrides (applied before EMA / compile / DDP)
-pretrain:
-  vae:
-    path: null
-    strict: true
-    key: null                   # null | "params_ema" | "params"
-  dit:
-    path: null
-    strict: true
-    key: null
-  dino:
-    path: null
-    strict: true
-    key: null

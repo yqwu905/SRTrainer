@@ -1,40 +1,9 @@
-total_iters: 300000
-val_interval: 5000
-save_interval: 5000
-log_interval: 100
-max_keep_states: 3
+defaults:
+  - base_trainer
+  - _self_
 
-# Accelerate core settings
-mixed_precision: bf16          # "no" | "fp16" | "bf16" (always quote "no" in YAML; unquoted no parses as bool False)
-gradient_accumulation_steps: 1
-grad_clip_norm: 1.0            # null disables gradient clipping
-compile: false                 # Optional torch.compile on raw net_g
-
-# Accelerate tracker management: null | str | list[str] (tensorboard, wandb, mlflow, swanlab, all)
-log_with:
-  - tensorboard
+# All trainer defaults live in TrainerConfig / TileConfig (src/config/schema.py).
 tracker_init_kwargs:
   wandb:
     name: ${exp_name}
     entity: null
-
-# Resume & experiment directory naming
-resume: null                   # null | auto | /path/to/state_iter_xxxxxx
-append_timestamp: false        # If true (and not resuming), Rank 0 appends _YYYYMMDD_HHMMSS & broadcasts work_dir
-
-# Training visuals logged to active Accelerate trackers (0 or null disables)
-train_log_image_interval: 500
-train_max_log_images: 4
-train_log_image_mode: comparison  # comparison ([LQ_bicubic | Pred | GT]) | separate (lq / pred / gt)
-
-# Validation visuals, EMA selection & shared TiledInferencer settings
-val_save_visuals: true
-val_max_save_images: 8
-val_use_ema: true
-val_tile:
-  enabled: true
-  size: auto                   # auto -> data.gt_size // scale | int | [H, W]
-  overlap: 16                  # LQ overlap pixels (0 <= overlap < min(tile_h, tile_w) // 2; 0 = hard stitch)
-  batch_size: 4
-  blend_mode: cosine           # cosine | linear | mean
-  pad_multiple: 8

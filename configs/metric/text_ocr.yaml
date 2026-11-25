@@ -1,3 +1,7 @@
+defaults:
+  - base_metric
+  - _self_
+
 primary_dataset: text_ocr
 primary_metric: ocr_a
 

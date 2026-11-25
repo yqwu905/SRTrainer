@@ -1,13 +1,10 @@
 defaults:
+  - base_data
   - degradation: realesrgan_2nd
   - _self_
 
-gt_size: 512                   # Square side or [height, width]. Both dimensions must be divisible by scale.
+# All data defaults live in DataConfig / AugmentConfig (src/config/schema.py).
 scale: ${scale}
-batch_size_per_gpu: 1
-num_workers: 8
-pin_memory: true
-persistent_workers: true
 
 # Training sources ONLY (validation datasets belong exclusively in configs/metric/).
 # Do NOT specify `mode` — gt_only vs paired is auto-detected per sample from JSON.
@@ -16,8 +13,3 @@ sources:
     root_dir: /home/dataset/train/magazine_small_text
     json_path: /home/dataset/train/magazine_small_text/magazine_small_text_filter.json
     ratio: 1.0
-
-augment:
-  hflip: true
-  vflip: true
-  rot90: true

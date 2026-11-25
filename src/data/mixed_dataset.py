@@ -17,6 +17,8 @@ from omegaconf import OmegaConf
 from omegaconf.errors import OmegaConfBaseException
 from torch.utils.data import Dataset, default_collate
 
+from config.schema import AugmentConfig, DataSourceConfig, KernelConfig
+from config.validation import load_augment_config, load_kernel_config
 from data.degradation.kernels import KernelGenerator
 from data.manifest import SourceStats, TrainSample, validate_sources_config
 from data.transforms import (
@@ -26,6 +28,7 @@ from data.transforms import (
 )
 from utils.image import load_image
 from utils.misc import normalize_gt_size
+from utils.text_geometry import canonical_quad
 
 __all__ = ["MixedSRDataset", "train_collate_fn"]
 
@@ -75,6 +78,71 @@ def _pick_text_focus_center(
     return random.choice(centers)
 
 
+def _polygon_area_2d(pts: np.ndarray) -> float:
+    return (
+        abs(
+            float(
+                np.sum(
+                    pts[:, 0] * np.roll(pts[:, 1], -1) - pts[:, 1] * np.roll(pts[:, 0], -1)
+                )
+            )
+        )
+        * 0.5
+    )
+
+
+def _crop_line_quad(
+    quad: Any,
+    offset: np.ndarray,
+    extent: np.ndarray,
+    *,
+    min_side: float = 4.0,
+    min_axis_retention: float = 0.7,
+    min_area_retention: float = 0.25,
+    min_rectangularity: float = 0.85,
+) -> list[list[float]] | None:
+    """Translate a line quad into crop coordinates, clipping near-axis-aligned boundary boxes."""
+    pts = np.asarray(quad, dtype=np.float64) - offset
+    if pts.shape != (4, 2) or not np.isfinite(pts).all():
+        return None
+    if (pts >= 0.0).all() and (pts <= extent).all():
+        return pts.tolist()
+
+    x0, y0 = float(pts[:, 0].min()), float(pts[:, 1].min())
+    x1, y1 = float(pts[:, 0].max()), float(pts[:, 1].max())
+    aabb_w = x1 - x0
+    aabb_h = y1 - y0
+    if aabb_w <= 0.0 or aabb_h <= 0.0:
+        return None
+
+    # Only clip boxes that are close to axis-aligned; rotated boxes clipped as AABBs pull in
+    # excessive background corners, so keep rotated boxes only when fully inside the crop.
+    poly_area = _polygon_area_2d(pts)
+    aabb_area = aabb_w * aabb_h
+    if poly_area / aabb_area < min_rectangularity:
+        return None
+
+    ix0 = max(0.0, x0)
+    iy0 = max(0.0, y0)
+    ix1 = min(float(extent[0]), x1)
+    iy1 = min(float(extent[1]), y1)
+    iw = ix1 - ix0
+    ih = iy1 - iy0
+    if iw < min_side or ih < min_side:
+        return None
+
+    # Keep horizontal lines truncated left/right (preserving line height) or vertical lines
+    # truncated top/bottom (preserving line width), provided enough of the box remains visible.
+    major_axis_ok = (ih / aabb_h >= min_axis_retention) if aabb_w >= aabb_h else (
+        iw / aabb_w >= min_axis_retention
+    )
+    if not major_axis_ok or (iw * ih) / aabb_area < min_area_retention:
+        return None
+
+    clipped = canonical_quad([ix0, iy0, ix1, iy1], name="cropped line quad")
+    return clipped.tolist()
+
+
 def _crop_text_lines(
     text_lines: tuple[dict[str, Any], ...] | None,
     *,
@@ -84,7 +152,7 @@ def _crop_text_lines(
     orig_h: int,
     orig_w: int,
 ) -> list[dict[str, Any]]:
-    """Translate HR glyph quads to crop-relative coordinates, keeping only fully visible glyphs."""
+    """Translate HR line quads and glyph quads to crop-relative coordinates."""
     if not text_lines:
         return []
     max_x = float(min(crop_size[1], orig_w - crop_left))
@@ -98,13 +166,22 @@ def _crop_text_lines(
     for line in text_lines:
         if not line.get("valid", True) or not line.get("alignment_valid", True):
             continue
+        kept_line: dict[str, Any] = {}
+        if "quad" in line and line["quad"] is not None:
+            kept_quad = _crop_line_quad(line["quad"], offset, extent)
+            if kept_quad is not None:
+                kept_line["quad"] = kept_quad
+
         kept_glyphs: list[dict[str, Any]] = []
         for glyph in line.get("glyphs", ()):
             pts = np.asarray(glyph["quad"], dtype=np.float64) - offset
             if (pts >= 0.0).all() and (pts <= extent).all():
                 kept_glyphs.append({"char": glyph["char"], "quad": pts.tolist()})
         if kept_glyphs:
-            visible_lines.append({"glyphs": kept_glyphs})
+            kept_line["glyphs"] = kept_glyphs
+
+        if kept_line:
+            visible_lines.append(kept_line)
     return visible_lines
 
 
@@ -136,12 +213,12 @@ class MixedSRDataset(Dataset[dict[str, Any]]):
 
     def __init__(
         self,
-        sources: Sequence[Mapping[str, Any]],
+        sources: Sequence[DataSourceConfig | Mapping[str, Any]],
         gt_size: int | Sequence[int],
         scale: int = 1,
-        augment: Mapping[str, Any] | None = None,
+        augment: AugmentConfig | Mapping[str, Any] | None = None,
         has_degradation: bool = True,
-        kernel_cfg: Mapping[str, Any] | None = None,
+        kernel_cfg: KernelConfig | Mapping[str, Any] | None = None,
         is_main_process: bool = True,
         logger: Any = None,
         text_crop_prob: float = 0.0,
@@ -159,26 +236,30 @@ class MixedSRDataset(Dataset[dict[str, Any]]):
         self.has_degradation: bool = has_degradation
 
         if augment is None:
-            self._hflip = False
-            self._vflip = False
-            self._rot90 = False
+            aug_cfg = AugmentConfig(hflip=False, vflip=False, rot90=False)
+        elif isinstance(augment, AugmentConfig):
+            aug_cfg = augment
         else:
             norm_aug = _normalize_omegaconf(augment, "augment")
             if not isinstance(norm_aug, Mapping):
                 raise TypeError(
-                    f"augment must be a mapping or None, got {type(norm_aug).__name__}."
+                    f"augment must be an AugmentConfig, mapping, or None, got {type(norm_aug).__name__}."
                 )
-            flags: dict[str, bool] = {}
             for key in ("hflip", "vflip", "rot90"):
-                val = norm_aug.get(key, False)
-                if not isinstance(val, bool):
+                if key in norm_aug and not isinstance(norm_aug[key], bool):
                     raise TypeError(
-                        f"augment[{key!r}] must be a bool, got {type(val).__name__}."
+                        f"augment[{key!r}] must be a bool, got {type(norm_aug[key]).__name__}."
                     )
-                flags[key] = val
-            self._hflip = flags["hflip"]
-            self._vflip = flags["vflip"]
-            self._rot90 = flags["rot90"]
+            aug_cfg = load_augment_config(
+                {
+                    "hflip": norm_aug.get("hflip", False),
+                    "vflip": norm_aug.get("vflip", False),
+                    "rot90": norm_aug.get("rot90", False),
+                }
+            )
+        self._hflip = aug_cfg.hflip
+        self._vflip = aug_cfg.vflip
+        self._rot90 = aug_cfg.rot90
 
         # Intentionally do NOT store `logger` on `self` to keep dataset picklable for num_workers>0.
         samples_per_source, source_stats = validate_sources_config(
@@ -212,16 +293,16 @@ class MixedSRDataset(Dataset[dict[str, Any]]):
             )
 
         if self.has_degradation:
-            if kernel_cfg is None:
-                plain_kernel_cfg: dict[str, Any] = {}
-            else:
-                norm_kcfg = _normalize_omegaconf(kernel_cfg, "kernel_cfg")
-                if not isinstance(norm_kcfg, Mapping):
-                    raise TypeError(
-                        f"kernel_cfg must be a mapping or None, got {type(norm_kcfg).__name__}."
-                    )
-                plain_kernel_cfg = dict(norm_kcfg)
-            self.kernel_generator: KernelGenerator | None = KernelGenerator(plain_kernel_cfg)
+            if kernel_cfg is not None and not isinstance(kernel_cfg, (KernelConfig, Mapping)):
+                raise TypeError(
+                    f"kernel_cfg must be a KernelConfig, mapping, or None, got {type(kernel_cfg).__name__}."
+                )
+            resolved_kcfg = (
+                kernel_cfg
+                if isinstance(kernel_cfg, KernelConfig)
+                else (load_kernel_config(kernel_cfg) if kernel_cfg is not None else KernelConfig())
+            )
+            self.kernel_generator: KernelGenerator | None = KernelGenerator(resolved_kcfg)
             self.kernel_size: int | None = self.kernel_generator.kernel_size
         else:
             self.kernel_generator = None

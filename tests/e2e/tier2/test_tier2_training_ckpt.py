@@ -25,8 +25,6 @@ def test_t2_e01_vosr_model_empty_or_nonpositive_loss_fails_fast(
     """F43: VOSRModel fails fast with ValueError when cfg.loss is empty or has no positive weights."""
     from accelerate import Accelerator
 
-    from models import VOSRModel
-
     src = paired_train_source_factory(name="loss_fail_src", n_samples=2, lq_h=16, lq_w=16, scale=2)
     invalid_loss_cfgs: list[dict[str, Any]] = [
         {},
@@ -54,9 +52,12 @@ def test_t2_e01_vosr_model_empty_or_nonpositive_loss_fails_fast(
             use_ema=False,
             loss_cfg=loss_cfg,
         )
+        from config import load_train_config
+        from models.base_model import build_model
+
         acc = Accelerator(cpu=True, mixed_precision="no")
         with pytest.raises(ValueError, match="."):
-            model = VOSRModel(cfg)
+            model = build_model(load_train_config(cfg))
             model.setup(acc)
 
 
@@ -71,7 +72,6 @@ def test_t2_e02_vosr_model_pretrain_edge_cases(
     from accelerate import Accelerator
     from tests.dummy_arch import DummyDiT
 
-    from models import VOSRModel
     from utils.misc import save_safetensors
 
     torch.manual_seed(42)
@@ -93,6 +93,9 @@ def test_t2_e02_vosr_model_pretrain_edge_cases(
 
     src = paired_train_source_factory(name="pt_edge_src", n_samples=2, lq_h=16, lq_w=16, scale=2)
 
+    from config import load_train_config
+    from models.base_model import build_model
+
     # (a) Missing pretrain file -> FileNotFoundError
     accelerate_state_resetter()
     cfg_a = minimal_train_cfg_factory(
@@ -102,7 +105,7 @@ def test_t2_e02_vosr_model_pretrain_edge_cases(
     cfg_a.model.pretrain.dit.strict = True
     cfg_a.model.pretrain.dit.key = None
     with pytest.raises(FileNotFoundError):
-        VOSRModel(cfg_a).setup(Accelerator(cpu=True, mixed_precision="no"))
+        build_model(load_train_config(cfg_a)).setup(Accelerator(cpu=True, mixed_precision="no"))
 
     # (b) Missing pretrain key in .pth -> KeyError / ValueError
     accelerate_state_resetter()
@@ -113,7 +116,7 @@ def test_t2_e02_vosr_model_pretrain_edge_cases(
     cfg_b.model.pretrain.dit.strict = True
     cfg_b.model.pretrain.dit.key = "params_ema"
     with pytest.raises((KeyError, ValueError)):
-        VOSRModel(cfg_b).setup(Accelerator(cpu=True, mixed_precision="no"))
+        build_model(load_train_config(cfg_b)).setup(Accelerator(cpu=True, mixed_precision="no"))
 
     # (c) Key mismatch with strict=True -> RuntimeError
     accelerate_state_resetter()
@@ -128,7 +131,7 @@ def test_t2_e02_vosr_model_pretrain_edge_cases(
     cfg_c.model.pretrain.dit.strict = True
     cfg_c.model.pretrain.dit.key = None
     with pytest.raises(RuntimeError):
-        VOSRModel(cfg_c).setup(Accelerator(cpu=True, mixed_precision="no"))
+        build_model(load_train_config(cfg_c)).setup(Accelerator(cpu=True, mixed_precision="no"))
 
     # (d) Partial mismatch with strict=False succeeds & clones into DiT EMA
     accelerate_state_resetter()
@@ -142,7 +145,7 @@ def test_t2_e02_vosr_model_pretrain_edge_cases(
     cfg_d.model.pretrain.dit.path = str(st_mismatch)
     cfg_d.model.pretrain.dit.strict = False
     cfg_d.model.pretrain.dit.key = None
-    model_d = VOSRModel(cfg_d)
+    model_d = build_model(load_train_config(cfg_d))
     model_d.setup(Accelerator(cpu=True, mixed_precision="no"))
 
     main_sd = model_d.get_infer_network(use_ema=False).dit.state_dict()
@@ -160,8 +163,6 @@ def test_t2_e03_vosr_model_optimizer_step_was_skipped_gating(
     """F42, F43: optimizer_step_was_skipped=True freezes lr_scheduler and EMA; False advances both."""
     import torch
     from accelerate import Accelerator
-
-    from models import VOSRModel
 
     class _OverflowSimAccelerator(Accelerator):
         """Genuine Accelerator subclass simulating FP16 GradScaler overflow on CPU."""
@@ -194,8 +195,11 @@ def test_t2_e03_vosr_model_optimizer_step_was_skipped_gating(
     cfg.model.ema.decay = 0.5
     cfg.model.ema.warmup_steps = 0
 
+    from config import load_train_config
+    from models.base_model import build_model
+
     acc = _OverflowSimAccelerator(cpu=True, mixed_precision="no", gradient_accumulation_steps=1)
-    model = VOSRModel(cfg)
+    model = build_model(load_train_config(cfg))
     model.setup(acc)
 
     lr_init = next(iter(model.get_lr_dict().values()))

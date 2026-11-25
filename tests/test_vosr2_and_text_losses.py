@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import hydra
 import numpy as np
@@ -24,7 +25,6 @@ from losses import GlyphLoss, OCRKLLoss
 from losses.glyph_loss import canonical_quad, rectify_text_roi
 from losses.ocr_kl_loss import (
     PPOCRv5ServerRec,
-    extract_text_strips,
     load_ppocr_recognizer,
 )
 from models import ModelEMA, VOSRModel, VOSRPipeline
@@ -455,8 +455,11 @@ def test_vosr_model_per_arch_trainability_combinations_ema_and_separate_export(
         }
     )
 
+    from config import load_train_config
+    from models.base_model import build_model
+
     acc = Accelerator(cpu=True, mixed_precision="no")
-    model = VOSRModel(cfg)
+    model = build_model(load_train_config(cfg, require_data=False, require_trainer_full=False))
     model.setup(acc)
 
     # Non-zero final_layer so step 1 propagates gradients through frozen DiT into VAE encoder / DINO too!
@@ -538,25 +541,23 @@ def test_vosr_model_invalid_trainability_and_missing_dino_fail_fast(
         },
     }
 
+    from config import load_train_config
+
     # All components frozen -> fail fast
-    acc = Accelerator(cpu=True, mixed_precision="no")
     with pytest.raises(ValueError, match="At least one active VOSR arch"):
-        VOSRModel(base_cfg).setup(acc)
-    acc.end_training()
+        load_train_config(base_cfg, require_data=False, require_trainer_full=False)
 
     # trainable.dino=True when arch.dino is None -> fail fast
     cfg_bad_dino = OmegaConf.create(base_cfg)
     cfg_bad_dino.model.trainable.dino = True
-    acc2 = Accelerator(cpu=True, mixed_precision="no")
     with pytest.raises(ValueError, match="trainable.dino"):
-        VOSRModel(cfg_bad_dino).setup(acc2)
-    acc2.end_training()
+        load_train_config(cfg_bad_dino, require_data=False, require_trainer_full=False)
 
-    # Unknown component in trainable -> fail fast
+    # Unknown component in trainable -> fail fast (Structured Config rejects unknown keys)
     cfg_unknown = OmegaConf.create(base_cfg)
     cfg_unknown.model.trainable.unknown_arch = True
-    with pytest.raises(ValueError, match="Unknown component"):
-        VOSRModel(cfg_unknown)
+    with pytest.raises(ValueError, match="unknown_arch"):
+        load_train_config(cfg_unknown, require_data=False, require_trainer_full=False)
 
 
 # ---------------------------------------------------------------------------
@@ -564,12 +565,7 @@ def test_vosr_model_invalid_trainability_and_missing_dino_fail_fast(
 # ---------------------------------------------------------------------------
 
 
-def test_ppocr_layout_strict_load_and_text_strips(tmp_path: Path) -> None:
-    rows = torch.arange(100.0).view(1, 1, 100, 1).expand(2, 3, 100, 5)
-    strips = extract_text_strips(rows, 64, 32)
-    assert strips.shape == (6, 3, 64, 5)
-    assert strips[:, 0, :, 0].unique().tolist() == list(range(100))
-
+def test_ppocr_layout_strict_load(tmp_path: Path) -> None:
     model = PPOCRv5ServerRec(num_classes=11).eval()
     keys = [k for k in model.state_dict() if not k.endswith("num_batches_tracked")]
     assert len(keys) == 458
@@ -585,14 +581,26 @@ def test_ppocr_layout_strict_load_and_text_strips(tmp_path: Path) -> None:
         assert torch.equal(loaded(probe), model(probe))
 
 
-def test_ocr_kl_loss_rescaling_frozen_eval_and_gradients(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ocr_kl_loss_rescaling_frozen_eval_and_skips_unannotated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     torch.manual_seed(0)
-    patch_ppocr_loader(monkeypatch, recognizer=TinyRecognizer())
+    calls = 0
+
+    class _CountingRecognizer(TinyRecognizer):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            nonlocal calls
+            calls += 1
+            return super().forward(x)
+
+    patch_ppocr_loader(monkeypatch, recognizer=_CountingRecognizer())
     criterion = OCRKLLoss(
-        strip_height=16,
-        strip_stride=8,
         temperature=2.0,
         input_range="0_1",
+        strip_batch_size=2,
+        amp_dtype="bf16",
+        use_checkpoint=True,
+        sync_ddp_counts=False,
     )
 
     criterion.train(True)
@@ -600,17 +608,242 @@ def test_ocr_kl_loss_rescaling_frozen_eval_and_gradients(monkeypatch: pytest.Mon
     assert criterion.recognizer.training is False
     assert all(not p.requires_grad for p in criterion.parameters())
 
-    target = torch.rand(2, 3, 40, 48)
-    assert criterion(target, target).item() == pytest.approx(0.0, abs=1e-6)
+    # Legacy strip-mode kwargs are removed and must raise TypeError
+    for removed_kwarg in (
+        {"strip_height": 64},
+        {"strip_stride": 32},
+        {"use_text_lines": False},
+        {"fallback_to_strips": True},
+    ):
+        with pytest.raises(TypeError):
+            OCRKLLoss(**removed_kwarg)  # type: ignore[arg-type]
 
+    target = torch.rand(2, 3, 40, 48)
     pred = (target + 0.25 * torch.randn_like(target)).clamp(0.0, 1.0).requires_grad_(True)
+
+    # Unannotated batch (batch=None or no 'text_lines' key) -> gracefully skipped (0 loss, 0 grad)
+    val_no_batch = criterion(pred, target)
+    assert val_no_batch.item() == 0.0
+    assert criterion.last_counts == (0, 0)
+    assert calls == 0
+    val_no_batch.backward()
+    assert pred.grad is not None and torch.count_nonzero(pred.grad) == 0
+
+    pred.grad = None
+    val_missing_key = criterion(pred, target, batch={"gt": target})
+    assert val_missing_key.item() == 0.0
+    assert criterion.last_counts == (0, 0)
+    assert calls == 0
+    val_missing_key.backward()
+    assert pred.grad is not None and torch.count_nonzero(pred.grad) == 0
+
+    # Annotated batch -> exact zero on identical inputs, positive finite loss + grads on mismatch
+    pred.grad = None
+    lines = [
+        [{"bbox": [2, 4, 44, 20]}],
+        [{"bbox": [4, 18, 42, 34]}],
+    ]
+    assert criterion(target, target, text_lines=lines).item() == pytest.approx(0.0, abs=1e-6)
     with torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16):
-        val = criterion(pred, target)
+        val = criterion(pred, target, batch={"text_lines": lines})
     assert val.ndim == 0 and val.item() > 1e-4
     val.backward()
     assert pred.grad is not None and torch.isfinite(pred.grad).all()
     assert pred.grad.abs().sum().item() > 0.0
     assert all(p.grad is None for p in criterion.parameters())
+
+
+def test_ocr_kl_loss_chunk_and_checkpoint_invariance(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch.manual_seed(7)
+    rec = TinyRecognizer(num_classes=11)
+    patch_ppocr_loader(monkeypatch, recognizer=rec)
+
+    target = torch.rand(2, 3, 64, 96)
+    pred_base = (target + 0.3 * torch.randn_like(target)).clamp(0.0, 1.0)
+    # Same-width boxes across both images so chunk size does not change padding width
+    lines = [
+        [
+            {"bbox": [4, 4, 52, 20]},
+            {"bbox": [4, 24, 52, 40]},
+            {"bbox": [4, 44, 52, 60]},
+        ],
+        [
+            {"bbox": [10, 8, 58, 24]},
+            {"bbox": [10, 32, 58, 48]},
+        ],
+    ]
+
+    loss_ref = OCRKLLoss(
+        temperature=1.5,
+        strip_batch_size=16,
+        width_bucket_step=16,
+        amp_dtype="fp32",
+        use_checkpoint=False,
+        sync_ddp_counts=False,
+    )
+    loss_chunked = OCRKLLoss(
+        temperature=1.5,
+        strip_batch_size=2,
+        width_bucket_step=16,
+        amp_dtype="fp32",
+        use_checkpoint=True,
+        sync_ddp_counts=False,
+    )
+
+    p1 = pred_base.clone().requires_grad_(True)
+    p2 = pred_base.clone().requires_grad_(True)
+    v1 = loss_ref(p1, target, batch={"text_lines": lines})
+    v2 = loss_chunked(p2, target, batch={"text_lines": lines})
+    torch.testing.assert_close(v1, v2)
+    v1.backward()
+    v2.backward()
+    assert p1.grad is not None and p2.grad is not None
+    torch.testing.assert_close(p1.grad, p2.grad)
+
+
+def test_ocr_kl_loss_text_lines_chunked_bf16_vertical_mixed_and_max_lines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(11)
+    observed_batch_sizes: list[int] = []
+    observed_autocast: list[tuple[bool, torch.dtype]] = []
+
+    class _SpyRecognizer(TinyRecognizer):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            observed_batch_sizes.append(int(x.shape[0]))
+            observed_autocast.append(
+                (torch.is_autocast_enabled(x.device.type), torch.get_autocast_dtype(x.device.type))
+            )
+            return super().forward(x)
+
+    patch_ppocr_loader(monkeypatch, recognizer=_SpyRecognizer(num_classes=9))
+    criterion = OCRKLLoss(
+        temperature=1.0,
+        input_range="0_1",
+        strip_batch_size=2,
+        max_lines_per_image=3,
+        max_strip_width=128,
+        width_bucket_step=16,
+        amp_dtype="bf16",
+        use_checkpoint=True,
+        sync_ddp_counts=False,
+    )
+    assert criterion.needs_batch is True
+
+    target = torch.rand(3, 3, 64, 96)
+    pred = (target + 0.25 * torch.randn_like(target)).clamp(0.0, 1.0).requires_grad_(True)
+
+    # Mixed batch:
+    # - Image 0 has 4 valid lines (capped to 3 by max_lines_per_image), incl. one vertical line
+    # - Image 1 has 1 line in the top-left corner only
+    # - Image 2 has NO text_lines (unannotated sample in a mixed batch) -> must get 0 grad
+    batch_lines: list[list[dict[str, Any]] | None] = [
+        [
+            {"transcript": "line0", "bbox": [2, 2, 50, 18]},
+            {"transcript": "line1", "bbox": [2, 20, 74, 36]},
+            {"transcript": "vert", "bbox": [76, 4, 90, 58]},  # height/width > 1.5 -> auto-rotated
+            {"transcript": "line3", "bbox": [2, 40, 42, 56]},
+            {"transcript": "###", "bbox": [2, 2, 20, 18]},  # ignored sentinel
+            {"transcript": "bad", "bbox": [2, 2, 20, 18], "valid": False},
+        ],
+        [
+            {"transcript": "img1_line", "bbox": [0, 0, 32, 16]},
+        ],
+        None,
+    ]
+
+    val = criterion(pred, target, batch={"text_lines": batch_lines})
+    assert criterion.last_counts[0] == 4  # 3 (capped from 4) + 1 + 0
+    assert criterion.last_counts[1] > 0
+    assert val.ndim == 0 and val.item() > 0.0
+    assert observed_batch_sizes and max(observed_batch_sizes) <= 2
+    assert all(enabled and dtype == torch.bfloat16 for enabled, dtype in observed_autocast)
+
+    val.backward()
+    assert pred.grad is not None and torch.isfinite(pred.grad).all()
+    assert pred.grad[0].abs().sum().item() > 0.0
+    assert pred.grad[1, :, :18, :34].abs().sum().item() > 0.0
+    # Region far outside image 1's single text box must receive zero gradient.
+    assert torch.count_nonzero(pred.grad[1, :, 32:, 48:]) == 0
+    # Unannotated image 2 must receive strictly zero gradient.
+    assert torch.count_nonzero(pred.grad[2]) == 0
+
+    # Empty text_lines batch -> connected zero loss and zero grad without calling recognizer
+    pred.grad = None
+    observed_batch_sizes.clear()
+    empty_val = criterion(pred, target, batch={"text_lines": [[], [], []]})
+    assert criterion.last_counts == (0, 0)
+    assert empty_val.item() == 0.0
+    assert observed_batch_sizes == []
+    empty_val.backward()
+    assert pred.grad is not None and torch.count_nonzero(pred.grad) == 0
+
+    # Identical pred & target produces exact zero KL
+    assert criterion(target, target, batch={"text_lines": batch_lines}).item() == pytest.approx(
+        0.0, abs=1e-6
+    )
+
+
+def test_mixed_dataset_preserves_line_quads_without_glyphs_and_clips_boundary_lines(
+    tmp_path: Path,
+) -> None:
+    hr_dir = tmp_path / "hr"
+    lr_dir = tmp_path / "lr"
+    _write_dummy_rgb_image(hr_dir / "page.png", (64, 64), seed=5)
+    _write_dummy_rgb_image(lr_dir / "page.png", (16, 16), seed=6)
+
+    manifest = tmp_path / "train.json"
+    manifest.write_text(
+        json.dumps(
+            [
+                {
+                    "gt": "hr/page.png",
+                    "lq": "lr/page.png",
+                    "text_lines": [
+                        {"transcript": "hello", "bbox": [4, 8, 56, 24]},
+                        {"transcript": "world", "quad": [[6, 30], [50, 30], [50, 48], [6, 48]]},
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    ds = MixedSRDataset(
+        sources=[
+            {"name": "lines_only", "root_dir": str(tmp_path), "json_path": str(manifest), "ratio": 1.0}
+        ],
+        gt_size=64,
+        scale=4,
+        augment={"hflip": False, "vflip": False, "rot90": False},
+        has_degradation=False,
+    )
+    assert ds.has_text_annotations is True
+    item = ds[0]
+    assert len(item["text_lines"]) == 2
+    assert "quad" in item["text_lines"][0] and "quad" in item["text_lines"][1]
+    assert "glyphs" not in item["text_lines"][0]
+
+    # Verify boundary clipping keeps horizontally truncated line and drops out-of-bounds line
+    from data.mixed_dataset import _crop_text_lines
+
+    cropped = _crop_text_lines(
+        (
+            {"valid": True, "alignment_valid": True, "quad": [[0.0, 10.0], [100.0, 10.0], [100.0, 30.0], [0.0, 30.0]], "glyphs": []},
+            {"valid": True, "alignment_valid": True, "quad": [[70.0, 70.0], [95.0, 70.0], [95.0, 90.0], [70.0, 90.0]], "glyphs": []},
+        ),
+        crop_left=0,
+        crop_top=0,
+        crop_size=(48, 64),
+        orig_h=128,
+        orig_w=128,
+    )
+    assert len(cropped) == 1
+    pts = np.asarray(cropped[0]["quad"], dtype=np.float64)
+    assert pts[:, 0].min() == pytest.approx(0.0)
+    assert pts[:, 0].max() == pytest.approx(64.0)
+    assert pts[:, 1].min() == pytest.approx(10.0)
+    assert pts[:, 1].max() == pytest.approx(30.0)
 
 
 # ---------------------------------------------------------------------------
@@ -915,9 +1148,9 @@ def test_end_to_end_trainer_vosr2_with_ocr_kl_and_glyph_losses_and_per_arch_savi
                     "weight": 0.1,
                     "criterion": {
                         "_target_": "losses.OCRKLLoss",
-                        "strip_height": 16,
-                        "strip_stride": 16,
                         "temperature": 1.0,
+                        "strip_batch_size": 2,
+                        "amp_dtype": "bf16",
                     },
                 },
                 "glyph": {
@@ -938,7 +1171,6 @@ def test_end_to_end_trainer_vosr2_with_ocr_kl_and_glyph_losses_and_per_arch_savi
                 "eval_seed": 42,
                 "ema": {"enabled": True, "decay": 0.99, "warmup_steps": 0},
                 "save_frozen_weights": True,
-                "pretrain": None,
             },
             "data": {
                 "gt_size": 32,
@@ -997,7 +1229,7 @@ def test_end_to_end_trainer_vosr2_with_ocr_kl_and_glyph_losses_and_per_arch_savi
                 "gradient_accumulation_steps": 1,
                 "grad_clip_norm": 1.0,
                 "compile": False,
-                "log_with": None,
+                "log_with": [],
                 "resume": None,
                 "append_timestamp": False,
                 "val_save_visuals": False,

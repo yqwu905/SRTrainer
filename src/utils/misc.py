@@ -21,19 +21,21 @@ def _is_positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
 
-def normalize_gt_size(size: int | Sequence[int], scale: int = 1) -> tuple[int, int]:
+def normalize_gt_size(
+    size: int | Sequence[int], scale: int = 1, *, field_name: str = "gt_size"
+) -> tuple[int, int]:
     """Return the GT crop (height, width), validating both axes against the SR scale."""
     if isinstance(size, Sequence) and not isinstance(size, (str, bytes, bytearray)):
         if len(size) != 2:
-            raise ValueError(f"gt_size must contain [height, width], got {size!r}.")
+            raise ValueError(f"{field_name} must contain [height, width], got {size!r}.")
         height, width = size
     else:
         height = width = size
     for dim in (height, width):
         if isinstance(dim, bool) or not isinstance(dim, numbers.Integral) or dim <= 0:
-            raise ValueError(f"gt_size dimensions must be positive integers, got {size!r}.")
+            raise ValueError(f"{field_name} dimensions must be positive integers, got {size!r}.")
         if dim % scale:
-            raise ValueError(f"gt_size {size!r} must be evenly divisible by scale ({scale}).")
+            raise ValueError(f"{field_name} {size!r} must be evenly divisible by scale ({scale}).")
     return int(height), int(width)
 
 

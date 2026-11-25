@@ -3,34 +3,33 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
+import hydra
 import torch
-from omegaconf import DictConfig, OmegaConf
 from torch import nn
+
+from config.schema import TrainConfig
 
 if TYPE_CHECKING:
     from accelerate import Accelerator
 
-__all__ = ["BaseModel"]
+__all__ = ["BaseModel", "build_model"]
 
 
 class BaseModel(ABC):
-    """Abstract base class for all training paradigms managed by ``Trainer``."""
+    """Abstract base class for all training paradigms managed by ``Trainer``.
 
-    def __init__(self, cfg: DictConfig | Mapping[str, Any]) -> None:
-        if isinstance(cfg, DictConfig):
-            self.cfg: DictConfig = cfg
-        elif isinstance(cfg, Mapping):
-            created = OmegaConf.create(dict(cfg))
-            if not isinstance(created, DictConfig):
-                raise TypeError(f"Expected mapping config, got {type(cfg).__name__}.")
-            self.cfg = created
-        else:
+    Receives an already-validated, strongly-typed ``TrainConfig`` instance from the training
+    entrypoint; subclasses consume typed config fields directly without re-parsing dicts.
+    """
+
+    def __init__(self, cfg: TrainConfig) -> None:
+        if not isinstance(cfg, TrainConfig):
             raise TypeError(
-                f"Expected DictConfig or Mapping for cfg, got {type(cfg).__name__}."
+                f"BaseModel requires a validated TrainConfig instance, got {type(cfg).__name__}."
             )
+        self.cfg: TrainConfig = cfg
         self.accelerator: Accelerator | None = None
 
     @abstractmethod
@@ -87,3 +86,17 @@ class BaseModel(ABC):
     def pop_train_visuals(self) -> dict[str, torch.Tensor] | None:
         """Return and clear the latest captured training visual tensors (e.g. ``lq``, ``gt``, ``pred``)."""
         return None
+
+
+def build_model(cfg: TrainConfig) -> BaseModel:
+    """Instantiate the ``BaseModel`` class named by ``cfg.model._target_`` with typed ``TrainConfig``."""
+    if not isinstance(cfg, TrainConfig):
+        raise TypeError(f"build_model requires a validated TrainConfig, got {type(cfg).__name__}.")
+    model_cls = hydra.utils.get_class(cfg.model._target_)
+    model_obj = model_cls(cfg)
+    if not isinstance(model_obj, BaseModel):
+        raise TypeError(
+            f"Instantiated cfg.model ({cfg.model._target_!r}) must be a BaseModel, "
+            f"got {type(model_obj).__name__}."
+        )
+    return model_obj

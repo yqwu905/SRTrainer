@@ -37,8 +37,7 @@ trackers = [
 ]
 ocr = [
     "opencv-python-headless>=4.8.0",
-    "paddleocr>=3.0.0",
-    "paddlepaddle>=3.0.0",
+    "rapidocr>=3.10.0,<4",
 ]
 npu = [
     "torch-npu==2.9.0; sys_platform == 'linux'",
@@ -57,7 +56,7 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["archs*", "data*", "engine*", "losses*", "metrics*", "models*", "utils*"]
+include = ["archs*", "config*", "data*", "engine*", "hydra_plugins*", "losses*", "metrics*", "models*", "utils*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

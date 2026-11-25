@@ -264,10 +264,10 @@ def test_t2_a07_hydra_cli_edge_overrides_and_partial_loss_override(
     """F05, F10, F12, F16: Edge CLI overrides for trackers, mixed_precision, and partial loss weight."""
     from utils.config import normalize_mixed_precision
 
-    cfg_null_log = hydra_compose(
-        "train", overrides=["experiment=vosr2_onestep_text", "trainer.log_with=null"]
+    cfg_empty_log = hydra_compose(
+        "train", overrides=["experiment=vosr2_onestep_text", "trainer.log_with=[]"]
     )
-    assert cfg_null_log.trainer.log_with is None
+    assert list(cfg_empty_log.trainer.log_with) == []
 
     cfg_multi_log = hydra_compose(
         "train",
@@ -290,15 +290,19 @@ def test_t2_a07_hydra_cli_edge_overrides_and_partial_loss_override(
     assert cfg_zero_lpips.loss.lpips.criterion._target_ == "losses.LPIPSLoss"
 
 
-def test_t2_a08_realesrgan_2nd_standalone_schema_and_bounds(configs_dir: Path) -> None:
-    """F07: realesrgan_2nd.yaml standalone schema, normalized probabilities, and numeric bounds."""
-    import yaml
+def test_t2_a08_realesrgan_2nd_standalone_schema_and_bounds(
+    hydra_compose: Callable[..., Any],
+) -> None:
+    """F07: realesrgan_2nd composed schema (from Structured Config), probabilities, and numeric bounds."""
+    from omegaconf import OmegaConf
 
-    deg_path = configs_dir / "data" / "degradation" / "realesrgan_2nd.yaml"
-    raw = yaml.safe_load(deg_path.read_text(encoding="utf-8"))
+    from data.degradation.kernels import KernelGenerator
+
+    cfg = hydra_compose("train", overrides=["experiment=vosr2_onestep_text"])
+    raw = OmegaConf.to_container(cfg.data.degradation, resolve=True)
     assert isinstance(raw, dict)
     assert raw["_target_"] == "data.degradation.RealESRGANDegrader"
-    assert raw["scale"] == "${scale}"
+    assert raw["scale"] == cfg.scale
     assert isinstance(raw["use_usm"], bool)
     assert isinstance(raw["queue_size"], int) and raw["queue_size"] >= 0
 
@@ -308,6 +312,8 @@ def test_t2_a08_realesrgan_2nd_standalone_schema_and_bounds(configs_dir: Path) -
     assert isinstance(ksize, int) and ksize >= 3 and ksize % 2 == 1
 
     krange = kcfg["kernel_range"]
+    if krange is None:
+        krange = list(KernelGenerator(kcfg).kernel_range)
     assert isinstance(krange, list) and len(krange) >= 1
     assert all(isinstance(k, int) and 1 <= k <= ksize and k % 2 == 1 for k in krange)
 

@@ -23,7 +23,6 @@ def test_t3_hydra_experiment_inheritance_into_vosr_model_lpips_and_cosine_t_max(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Seam A x B x E (F03-F06, F08, F12-F15, F43): experiment -> VOSRModel + LPIPS + Cosine LR."""
-    import hydra.utils
     import torch
     from accelerate import Accelerator
     from tests.dummy_arch import get_dummy_vosr_arch_dict
@@ -63,7 +62,10 @@ def test_t3_hydra_experiment_inheritance_into_vosr_model_lpips_and_cosine_t_max(
     assert cfg.loss.l1.weight == pytest.approx(1.0)
     assert cfg.loss.lpips.weight == pytest.approx(0.05)
 
-    model = hydra.utils.instantiate(cfg.model, cfg=cfg, _recursive_=False)
+    from config import load_train_config
+    from models.base_model import build_model
+
+    model = build_model(load_train_config(cfg, require_data=False, require_trainer_full=False))
     assert isinstance(model, VOSRModel)
     accelerator = Accelerator(cpu=True, mixed_precision="no")
     model.setup(accelerator)
@@ -123,7 +125,6 @@ def test_t3_mixed_dataset_weighted_sampler_usm_pool_degrader_and_vosr_model(
     from torch.utils.data._utils.collate import default_collate
 
     from data.degradation import RealESRGANDegrader
-    from models import VOSRModel
 
     # gt_size=64 ensures USMSharp default radius=50 satisfies reflect pad (50 < 64).
     gt_src = gt_only_train_source_factory(name="c_gt", n_samples=4, gt_h=64, gt_w=64, ratio=0.4)
@@ -161,7 +162,10 @@ def test_t3_mixed_dataset_weighted_sampler_usm_pool_degrader_and_vosr_model(
     cfg.data.degradation.kernel_cfg.kernel_range = [7]
     cfg.optim.optimizer.lr = 1.0e-3
 
-    model = VOSRModel(cfg)
+    from config import load_train_config
+    from models.base_model import build_model
+
+    model = build_model(load_train_config(cfg))
     model.setup(Accelerator(cpu=True, mixed_precision="no"))
     init_sd = {
         k: v.detach().cpu().clone()
@@ -226,7 +230,7 @@ def test_t3_pure_paired_degradation_null_vosr_scale4_and_multistep_lr(
     from tests.dummy_arch import get_dummy_vosr_arch_dict
     from torch.utils.data import DataLoader
 
-    from models import VOSRModel, VOSRPipeline
+    from models import VOSRPipeline
 
     pair_src = paired_train_source_factory(
         name="pure_x4", n_samples=4, lq_h=16, lq_w=16, scale=4, ratio=1.0
@@ -265,7 +269,10 @@ def test_t3_pure_paired_degradation_null_vosr_scale4_and_multistep_lr(
     ds = mixed_dataset_factory([pair_src], gt_size=64, scale=4, has_degradation=False)
     loader = DataLoader(ds, batch_size=2, shuffle=False, num_workers=0)
 
-    model = VOSRModel(cfg)
+    from config import load_train_config
+    from models.base_model import build_model
+
+    model = build_model(load_train_config(cfg, require_trainer_full=False))
     model.setup(Accelerator(cpu=True, mixed_precision="no"))
     assert isinstance(model.get_infer_network(use_ema=False), VOSRPipeline)
     assert next(iter(model.get_lr_dict().values())) == pytest.approx(2.0e-4, rel=1e-6)
@@ -327,8 +334,6 @@ def test_t3_pretrain_basicsr_pth_with_ema_warmup_grad_clip_and_accum(
     from accelerate import Accelerator
     from tests.dummy_arch import DummyDiT
 
-    from models import VOSRModel
-
     torch.manual_seed(34)
     ref_dit = DummyDiT(in_channels=8, out_channels=4, patch_size=2, hidden_ch=8, z_dims=8)
     sd_ema = {
@@ -362,8 +367,11 @@ def test_t3_pretrain_basicsr_pth_with_ema_warmup_grad_clip_and_accum(
     cfg.trainer.grad_clip_norm = 0.5
     cfg.optim.optimizer.lr = 1.0e-2
 
+    from config import load_train_config
+    from models.base_model import build_model
+
     accelerator = Accelerator(cpu=True, mixed_precision="no", gradient_accumulation_steps=2)
-    model = VOSRModel(cfg)
+    model = build_model(load_train_config(cfg))
     model.setup(accelerator)
 
     def _snapshot(use_ema: bool) -> dict[str, Any]:
@@ -449,7 +457,6 @@ def test_t3_sampler_o1_resume_coupled_with_checkpointer_and_train_state(
     from torch.utils.data._utils.collate import default_collate
 
     from engine import Checkpointer, TrainState
-    from models import VOSRModel
 
     s0 = paired_train_source_factory(name="res_s0", n_samples=4, lq_h=16, lq_w=16, scale=2, ratio=0.6)
     s1 = paired_train_source_factory(name="res_s1", n_samples=4, lq_h=16, lq_w=16, scale=2, ratio=0.4)
@@ -483,7 +490,10 @@ def test_t3_sampler_o1_resume_coupled_with_checkpointer_and_train_state(
             gradient_accumulation_steps=2,
             project_config=proj_cfg,
         )
-        model = VOSRModel(cfg)
+        from config import load_train_config
+        from models.base_model import build_model
+
+        model = build_model(load_train_config(cfg))
         model.setup(acc)
         train_state = TrainState()
         acc.register_for_checkpointing(train_state)
@@ -575,7 +585,7 @@ def test_t3_vosr_scales_export_weights_safetensors_reload_parity(
     from tests.dummy_arch import DummyDino, DummyDiT, DummyVAE
 
     from engine import Checkpointer
-    from models import VOSRModel, VOSRPipeline
+    from models import VOSRPipeline
     from utils.misc import load_weights
 
     for scale in (2, 4):
@@ -598,8 +608,11 @@ def test_t3_vosr_scales_export_weights_safetensors_reload_parity(
         cfg.optim.optimizer.lr = 5.0e-3
         cfg.model.ema.decay = 0.9
 
+        from config import load_train_config
+        from models.base_model import build_model
+
         accelerator = Accelerator(cpu=True, mixed_precision="no")
-        model = VOSRModel(cfg)
+        model = build_model(load_train_config(cfg))
         model.setup(accelerator)
 
         for step in range(2):

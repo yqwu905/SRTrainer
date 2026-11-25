@@ -45,11 +45,11 @@ Trainer 对每个样本每项指标构造 `[1, 2]` 统计量张量，再调用 `
 - RGB `[1,3,H,W]` 浮点预测先 detach，限制到 [0,1]，乘 255 后 `round()`，转换为 CPU uint8 BGR，与工程 `save_image` 量化一致；不修改输入 tensor 或 meta，不保留训练计算图。
 - 对四边形调整逆时针顺序为顺时针并保留起点；超过四点使用 OpenCV 最小面积矩形；采用与参考一致的 `INTER_CUBIC`、`BORDER_REPLICATE` 透视裁剪。高宽比至少 1.5 时逆时针旋转 90 度。
 - 重用已有几何验证能力，但不能直接用现有 PyTorch 双线性 ROI 替代参考 OpenCV 三次插值而声称像素一致。退化/交叉/非有限框明确拒绝。
-- 后端使用 PaddleOCR 3.x `TextRecognition`，默认模型 `PP-OCRv5_server_rec`，默认 batch_size=1；可选 `TextLineOrientationClassification` 做 0/180 度判断。检查输出条数等于输入框数，禁止 zip 静默截断。
-- 支持明确 `ocr_device` 和本地模型目录；默认 CPU，作为与参考自动选设备不同的可移植默认值记录。`.to(torch_device)` 不得将 MPS/NPU/CUDA 字符串盲传给 Paddle，也不应移动已指定的 OCR 设备。
-- Paddle/OpenCV 作为可选 OCR 依赖，延迟导入和初始化；普通指标 import/训练不能要求安装 Paddle。缺包时提示可执行的安装方式，禁止以伪识别或空识别代替依赖错误。
+- 后端使用 RapidOCR 的批量识别接口和 PyTorch 引擎（`EngineType.TORCH`），默认模型 `PP-OCRv5_server_rec`，默认 batch_size=1。可选 `ch_ppocr_mobile_v2.0_cls` 做 0/180 度判断。识别直接接收标注裁剪，并检查输出条数与输入框数一致。
+- `ocr_device` 默认 CPU，独立于训练设备，支持 `cpu`、`gpu[:ID]`/`cuda[:ID]`、`npu[:ID]`（需 `torch_npu`）和 `mps`。`.to(torch_device)` 保留 OCR 设备设置。`ocr_model_dir` 和 `ocr_cls_model_dir` 支持本地 RapidOCR PyTorch `.pth` 文件或目录（识别模型同目录可提供 `dict.txt` / `ppocrv5_dict.txt`）。
+- RapidOCR 和 OpenCV 作为可选 OCR 依赖，延迟导入和初始化。缺包时提示 `uv sync --extra ocr`。
 - 同进程、同配置的三项指标共享模型，并复用同一样本的一次识别结果；缓存只能有界保留最后一个样本，必须检查图像/标注/配置变化，不允许下一次验证错误复用上次预测。不依赖 inference-mode tensor 不具备的 `_version`；不能保留 GPU tensor/计算图。测试用 monkeypatch 或替代测试后端，生产接口不添加 fake/pretrained=false 模式。
-- 多进程使用前建议单进程预下载权重并为各 rank 配置同一只读本地模型目录；本次真实模型验收的预热不等同于冷启动并发下载验收，README 必须明确该运行建议。
+- 首次验证时自动下载模型权重与字典。同一缓存目录中的进程通过文件锁串行预下载，离线运行可配置本地 PyTorch `.pth` 权重。
 
 ## 交付范围与所有权
 
@@ -66,10 +66,10 @@ Trainer 对每个样本每项指标构造 `[1, 2]` 统计量张量，再调用 `
 4. 缓存：三指标一次识别；预测变化/原地更新、标注变化、重复 validate 不串缓存；不会持有无界 GPU 图像或梯度图。
 5. Trainer：混用现有 PSNR/SSIM/自定义标量指标和 OCR；跨图片不同文本数/长度的加权数学；CER 驱动 best checkpoint 方向正确；全空不保存 best。
 6. 分布式：真实 2-process CPU、奇数样本数量，包含零框样本；与串行全局手算一致，证明 padding 未计入。仅 mock gather 不足以通过该项。
-7. 兼容：现有 metrics/config/trainer smoke 回归，普通环境没有 Paddle 仍可 import；改动文件 Ruff，所有失败区分基线缺陷与新增回归。
-8. 后端：尽量运行真实 PaddleOCR + 真实权重的最小 CPU 冒烟。若平台/下载阻断，必须提供确切命令和错误，不能把 mock 通过写成真实模型验收；由验证者明确列为未验收项并请求协调者处理，不能静默 PASS。
+7. 兼容：运行现有 metrics/config/trainer smoke 回归和改动文件的 Ruff 检查，确认普通训练环境可在未安装 OCR 可选依赖时导入指标。
+8. 后端：使用真实 `PP-OCRv5_server_rec` 权重运行 CPU 冒烟，覆盖整图和文本框。
 
-## 最终验收记录
+## 初版 PaddleOCR 实现验收记录
 
 **2026-11-23 独立验收结论：PASS，限本次 OCR 指标交付及下述实测范围。**
 

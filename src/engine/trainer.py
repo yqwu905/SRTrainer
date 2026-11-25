@@ -7,7 +7,7 @@ import math
 import time
 from collections import Counter
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -16,24 +16,26 @@ import torch
 from accelerate import Accelerator
 from accelerate.state import AcceleratorState, GradientState, PartialState
 from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 
+from config.schema import KernelConfig, TrainConfig
+from config.validation import load_kernel_config, load_train_config, to_resolved_dict_config
 from data import (
     DistributedWeightedInfiniteSampler,
     MixedSRDataset,
     ValImageDataset,
     val_collate_fn,
 )
+from data.mixed_dataset import train_collate_fn
 from engine.checkpointer import Checkpointer
 from engine.inferencer import TiledInferencer
 from engine.state import TrainState
 from metrics.base import BaseMetric
-from models.base_model import BaseModel
+from models.base_model import BaseModel, build_model
 from models.ema import unwrap_model_for_ema
 from utils.config import (
     flatten_config_for_tracker,
-    normalize_mixed_precision,
     resolve_work_dir,
     save_resolved_config,
     setup_experiment_dirs,
@@ -45,7 +47,6 @@ from utils.logging import (
     log_images_to_trackers,
     setup_logger,
 )
-from utils.misc import normalize_gt_size
 
 __all__ = ["Trainer"]
 
@@ -60,153 +61,31 @@ class _ValSuite:
     vis_stems: list[str]
 
 
-def _as_dict_config(cfg: DictConfig | Mapping[str, Any]) -> DictConfig:
-    if isinstance(cfg, DictConfig):
-        return cfg
-    if isinstance(cfg, Mapping):
-        created = OmegaConf.create(dict(cfg))
-        if isinstance(created, DictConfig):
-            return created
-    raise TypeError(f"Expected DictConfig or Mapping, got {type(cfg).__name__}.")
-
-
-def _require_positive_int(value: Any, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError(f"{name} must be a positive integer, got {value!r}.")
-    return int(value)
-
-
-def _require_non_negative_int(value: Any, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{name} must be a non-negative integer, got {value!r}.")
-    return int(value)
-
-
-def _require_interval(value: Any, name: str) -> int:
-    if value is None:
-        return 0
-    return _require_non_negative_int(value, name)
-
-
-def _require_bool(value: Any, name: str) -> bool:
-    if not isinstance(value, bool):
-        raise ValueError(f"{name} must be a bool, got {type(value).__name__}: {value!r}.")
-    return value
-
-
-def _optional_stripped_str(value: Any, name: str) -> str | None:
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise ValueError(f"{name} must be a string or None, got {type(value).__name__}: {value!r}.")
-    stripped = value.strip()
-    return stripped if stripped else None
-
-
-_VALID_TRAIN_LOG_IMAGE_MODES: frozenset[str] = frozenset({"comparison", "separate"})
-
-
-def _require_train_log_image_mode(value: Any, name: str) -> str:
-    if not isinstance(value, str):
-        raise ValueError(
-            f"{name} must be one of {sorted(_VALID_TRAIN_LOG_IMAGE_MODES)}, "
-            f"got {type(value).__name__}: {value!r}."
-        )
-    normalized = value.strip().lower()
-    if normalized not in _VALID_TRAIN_LOG_IMAGE_MODES:
-        raise ValueError(
-            f"{name} must be one of {sorted(_VALID_TRAIN_LOG_IMAGE_MODES)}, got {value!r}."
-        )
-    return normalized
-
-
-def _normalize_log_with(raw: Any) -> list[str] | None:
-    if raw is None:
-        return None
-    if OmegaConf.is_config(raw):
-        raw = OmegaConf.to_container(raw, resolve=True)
-    if raw is None:
-        return None
-    if isinstance(raw, str):
-        stripped = raw.strip()
-        if stripped.lower() in {"", "none", "null"}:
-            return None
-        return [stripped]
-    if isinstance(raw, (list, tuple)):
-        cleaned: list[str] = []
-        for idx, elem in enumerate(raw):
-            if elem is None:
-                continue
-            if not isinstance(elem, str):
-                raise ValueError(
-                    f"trainer.log_with[{idx}] must be a string, got {type(elem).__name__}: {elem!r}."
-                )
-            stripped = elem.strip()
-            if not stripped or stripped.lower() in {"none", "null"}:
-                continue
-            cleaned.append(stripped)
-        return cleaned if cleaned else None
-    raise ValueError(
-        f"trainer.log_with must be null, str, or list[str], got {type(raw).__name__}: {raw!r}."
-    )
-
-
-def _sanitize_tracker_init_kwargs(
-    raw: Any,
-    active_log_with: list[str] | None,
+def _filter_tracker_init_kwargs(
+    raw: dict[str, dict[str, Any]],
+    active_log_with: list[str],
 ) -> dict[str, dict[str, Any]]:
-    if raw is None or active_log_with is None:
+    if not raw or not active_log_with:
         return {}
-    if OmegaConf.is_config(raw):
-        raw = OmegaConf.to_container(raw, resolve=True)
-    if raw is None:
-        return {}
-    if not isinstance(raw, Mapping):
-        raise ValueError(
-            f"trainer.tracker_init_kwargs must be a mapping or None, got {type(raw).__name__}."
-        )
-
     keep_all = any(item.lower() == "all" for item in active_log_with)
     active_set = {item.lower() for item in active_log_with}
-
-    cleaned: dict[str, dict[str, Any]] = {}
-    for tracker_key, kwargs_node in raw.items():
-        if kwargs_node is None:
-            continue
-        if not isinstance(kwargs_node, Mapping):
-            raise ValueError(
-                f"trainer.tracker_init_kwargs[{tracker_key!r}] must be a mapping or None, "
-                f"got {type(kwargs_node).__name__}."
-            )
-        key_str = str(tracker_key)
-        if not keep_all and key_str.lower() not in active_set:
-            continue
-        cleaned[key_str] = dict(kwargs_node)
-    return cleaned
+    return {
+        key: dict(kwargs)
+        for key, kwargs in raw.items()
+        if keep_all or key.lower() in active_set
+    }
 
 
-def _validate_resume_early(raw_resume: Any) -> None:
-    if raw_resume is None or raw_resume is False:
-        return
-    if isinstance(raw_resume, bool):
-        raise ValueError(
-            "Ambiguous trainer.resume=True; specify 'auto', a checkpoint directory path, or null."
-        )
-    if not isinstance(raw_resume, (str, Path)):
-        raise ValueError(
-            f"trainer.resume must be str, Path, or None, got {type(raw_resume).__name__}: {raw_resume!r}."
-        )
-    text = str(raw_resume).strip()
-    if text.lower() in {"", "none", "null", "false", "auto"}:
-        return
-    explicit = Path(text)
-    if not explicit.exists():
-        raise FileNotFoundError(f"Resume checkpoint directory not found: {explicit}")
-    if not explicit.is_dir():
-        raise ValueError(
-            f"Resume path must be a checkpoint state directory, got file: {explicit} "
-            "(use model.pretrain.<arch>.path for weight files)."
-        )
+def _extract_kernel_cfg(degradation: Any) -> KernelConfig | None:
+    if degradation is None:
+        return None
+    if is_dataclass(degradation) and not isinstance(degradation, type):
+        kcfg = getattr(degradation, "kernel_cfg", None)
+    elif isinstance(degradation, Mapping):
+        kcfg = degradation.get("kernel_cfg", None)
+    else:
+        return None
+    return load_kernel_config(kcfg)
 
 
 def _reenable_srtrainer_loggers() -> None:
@@ -233,9 +112,7 @@ def _build_vis_stems(dataset: ValImageDataset) -> list[str]:
 class Trainer:
     """Iteration-driven Accelerate training engine with distributed exact validation."""
 
-    def __init__(self, cfg: DictConfig | Mapping[str, Any]) -> None:
-        cfg_oc = _as_dict_config(cfg)
-
+    def __init__(self, cfg: TrainConfig | DictConfig | Mapping[str, Any]) -> None:
         # Capture existing singleton/distributed state BEFORE anything touches PartialState.
         self._had_existing_state: bool = bool(PartialState._shared_state)
         self._had_existing_dist: bool = (
@@ -244,209 +121,50 @@ class Trainer:
         self._training_ended: bool = False
         self.accelerator: Accelerator | None = None
 
-        # Step 1: Pure fail-fast config validation (no directories or Accelerate state created yet).
-        trainer_cfg = OmegaConf.select(cfg_oc, "trainer", default=None)
-        if not isinstance(trainer_cfg, (DictConfig, Mapping)):
-            raise ValueError("Configuration must contain a `trainer` mapping.")
+        # Step 1: Centralized Structured Config loading & fail-fast business validation
+        # (no directories or Accelerate state created yet).
+        config: TrainConfig = load_train_config(cfg)
+        self.config: TrainConfig = config
 
-        self.total_iters: int = _require_positive_int(
-            OmegaConf.select(cfg_oc, "trainer.total_iters", default=None),
-            "trainer.total_iters",
-        )
-        self.log_interval: int = _require_interval(
-            OmegaConf.select(cfg_oc, "trainer.log_interval", default=100),
-            "trainer.log_interval",
-        )
-        self.val_interval: int = _require_interval(
-            OmegaConf.select(cfg_oc, "trainer.val_interval", default=5000),
-            "trainer.val_interval",
-        )
-        self.save_interval: int = _require_interval(
-            OmegaConf.select(cfg_oc, "trainer.save_interval", default=5000),
-            "trainer.save_interval",
-        )
+        t_cfg = config.trainer
+        d_cfg = config.data
+        m_cfg = config.metric
 
-        raw_max_keep = OmegaConf.select(cfg_oc, "trainer.max_keep_states", default=3)
-        if raw_max_keep is not None and (
-            isinstance(raw_max_keep, bool) or not isinstance(raw_max_keep, int)
-        ):
-            raise ValueError(
-                f"trainer.max_keep_states must be an integer or None, got {raw_max_keep!r}."
-            )
+        self.total_iters: int = t_cfg.total_iters
+        self.log_interval: int = t_cfg.log_interval
+        self.val_interval: int = t_cfg.val_interval
+        self.save_interval: int = t_cfg.save_interval
         self.max_keep_states: int | None = (
-            None if (raw_max_keep is None or raw_max_keep <= 0) else int(raw_max_keep)
+            None if (t_cfg.max_keep_states is None or t_cfg.max_keep_states <= 0) else t_cfg.max_keep_states
         )
+        self.grad_accum_steps: int = t_cfg.gradient_accumulation_steps
+        self.mixed_precision: str = t_cfg.mixed_precision.value
+        self.train_log_image_interval: int = t_cfg.train_log_image_interval
+        self.train_max_log_images: int = t_cfg.train_max_log_images
+        self.train_log_image_mode: str = t_cfg.train_log_image_mode.value
+        self.val_save_visuals: bool = t_cfg.val_save_visuals
+        self.val_max_save_images: int = t_cfg.val_max_save_images
+        self.val_use_ema: bool = t_cfg.val_use_ema
 
-        self.grad_accum_steps: int = _require_positive_int(
-            OmegaConf.select(cfg_oc, "trainer.gradient_accumulation_steps", default=1),
-            "trainer.gradient_accumulation_steps",
-        )
-        self.mixed_precision: str = normalize_mixed_precision(
-            OmegaConf.select(cfg_oc, "trainer.mixed_precision", default="no")
-        )
-        self.train_log_image_interval: int = _require_interval(
-            OmegaConf.select(cfg_oc, "trainer.train_log_image_interval", default=0),
-            "trainer.train_log_image_interval",
-        )
-        self.train_max_log_images: int = _require_non_negative_int(
-            OmegaConf.select(cfg_oc, "trainer.train_max_log_images", default=4),
-            "trainer.train_max_log_images",
-        )
-        self.train_log_image_mode: str = _require_train_log_image_mode(
-            OmegaConf.select(cfg_oc, "trainer.train_log_image_mode", default="comparison"),
-            "trainer.train_log_image_mode",
-        )
-        self.val_save_visuals: bool = _require_bool(
-            OmegaConf.select(cfg_oc, "trainer.val_save_visuals", default=True),
-            "trainer.val_save_visuals",
-        )
-        self.val_max_save_images: int = _require_non_negative_int(
-            OmegaConf.select(cfg_oc, "trainer.val_max_save_images", default=8),
-            "trainer.val_max_save_images",
-        )
-        self.val_use_ema: bool = _require_bool(
-            OmegaConf.select(cfg_oc, "trainer.val_use_ema", default=True),
-            "trainer.val_use_ema",
-        )
+        self.seed: int = config.seed
+        self.scale: int = config.scale
+        self.gt_size = d_cfg.gt_size
+        self.primary_dataset: str | None = m_cfg.primary_dataset
+        self.primary_metric: str | None = m_cfg.primary_metric
 
-        self.seed: int = _require_non_negative_int(
-            OmegaConf.select(cfg_oc, "seed", default=42),
-            "seed",
+        active_log_with: list[str] | None = list(t_cfg.log_with) if t_cfg.log_with else None
+        sanitized_tracker_init_kwargs = _filter_tracker_init_kwargs(
+            t_cfg.tracker_init_kwargs,
+            t_cfg.log_with,
         )
-        self.scale: int = _require_positive_int(
-            OmegaConf.select(cfg_oc, "scale", default=None),
-            "scale",
-        )
-
-        data_cfg = OmegaConf.select(cfg_oc, "data", default=None)
-        if not isinstance(data_cfg, (DictConfig, Mapping)):
-            raise ValueError("Configuration must contain a `data` mapping.")
-        data_scale_raw = OmegaConf.select(cfg_oc, "data.scale", default=None)
-        if data_scale_raw is not None:
-            data_scale = _require_positive_int(data_scale_raw, "data.scale")
-            if data_scale != self.scale:
-                raise ValueError(
-                    f"data.scale ({data_scale}) must match cfg.scale ({self.scale})."
-                )
-        self.gt_size = normalize_gt_size(OmegaConf.select(cfg_oc, "data.gt_size"), self.scale)
-        batch_size_per_gpu = _require_positive_int(
-            OmegaConf.select(cfg_oc, "data.batch_size_per_gpu", default=None),
-            "data.batch_size_per_gpu",
-        )
-        num_workers = _require_non_negative_int(
-            OmegaConf.select(cfg_oc, "data.num_workers", default=0),
-            "data.num_workers",
-        )
-
-        raw_resume = OmegaConf.select(cfg_oc, "trainer.resume", default=None)
-        _validate_resume_early(raw_resume)
-
-        normalized_log_with = _normalize_log_with(
-            OmegaConf.select(cfg_oc, "trainer.log_with", default=None)
-        )
-        sanitized_tracker_init_kwargs = _sanitize_tracker_init_kwargs(
-            OmegaConf.select(cfg_oc, "trainer.tracker_init_kwargs", default=None),
-            normalized_log_with,
-        )
-
-        # Validate metric.val_suites and primary_dataset / primary_metric fail-fast.
-        raw_suites = OmegaConf.select(cfg_oc, "metric.val_suites", default=None)
-        raw_primary_dataset = _optional_stripped_str(
-            OmegaConf.select(cfg_oc, "metric.primary_dataset", default=None),
-            "metric.primary_dataset",
-        )
-        raw_primary_metric = _optional_stripped_str(
-            OmegaConf.select(cfg_oc, "metric.primary_metric", default=None),
-            "metric.primary_metric",
-        )
-
-        validated_suite_cfgs: dict[str, dict[str, Any]] = {}
-        if raw_suites is not None and not isinstance(raw_suites, (DictConfig, Mapping)):
-            raise ValueError(
-                f"metric.val_suites must be a mapping or null, got {type(raw_suites).__name__}."
-            )
-        if raw_suites is not None:
-            for suite_name, suite_cfg in raw_suites.items():
-                s_name = str(suite_name).strip()
-                if not s_name:
-                    raise ValueError("Validation suite names in metric.val_suites must be non-empty.")
-                if not isinstance(suite_cfg, (DictConfig, Mapping)):
-                    raise ValueError(
-                        f"metric.val_suites[{s_name!r}] must be a mapping, got {type(suite_cfg).__name__}."
-                    )
-                ds_cfg = suite_cfg.get("dataset", None)
-                if not isinstance(ds_cfg, (DictConfig, Mapping)):
-                    raise ValueError(
-                        f"metric.val_suites[{s_name!r}].dataset must be a mapping with 'json_path'."
-                    )
-                json_path = ds_cfg.get("json_path", None)
-                if not isinstance(json_path, (str, Path)) or not str(json_path).strip():
-                    raise ValueError(
-                        f"metric.val_suites[{s_name!r}].dataset.json_path must be a non-empty path."
-                    )
-
-                metrics_cfg = suite_cfg.get("metrics", None)
-                if metrics_cfg is None:
-                    metrics_map: dict[str, Any] = {}
-                elif isinstance(metrics_cfg, (DictConfig, Mapping)):
-                    metrics_map = {str(k): v for k, v in metrics_cfg.items() if v is not None}
-                else:
-                    raise ValueError(
-                        f"metric.val_suites[{s_name!r}].metrics must be a mapping or null."
-                    )
-
-                raw_suite_max_vis = suite_cfg.get("max_save_images", None)
-                suite_max_vis = (
-                    self.val_max_save_images
-                    if raw_suite_max_vis is None
-                    else _require_non_negative_int(
-                        raw_suite_max_vis,
-                        f"metric.val_suites[{s_name!r}].max_save_images",
-                    )
-                )
-                validated_suite_cfgs[s_name] = {
-                    "dataset": ds_cfg,
-                    "metrics": metrics_map,
-                    "max_save_images": suite_max_vis,
-                }
-
-        if (raw_primary_dataset is None) != (raw_primary_metric is None):
-            raise ValueError(
-                "Both metric.primary_dataset and metric.primary_metric must be set together "
-                "or both null."
-            )
-        if raw_primary_dataset is not None and raw_primary_metric is not None:
-            if raw_primary_dataset not in validated_suite_cfgs:
-                raise ValueError(
-                    f"metric.primary_dataset={raw_primary_dataset!r} not found in "
-                    f"metric.val_suites {list(validated_suite_cfgs.keys())}."
-                )
-            primary_suite_metrics = validated_suite_cfgs[raw_primary_dataset]["metrics"]
-            if raw_primary_metric not in primary_suite_metrics:
-                raise ValueError(
-                    f"metric.primary_metric={raw_primary_metric!r} not found in "
-                    f"metric.val_suites[{raw_primary_dataset!r}].metrics "
-                    f"{list(primary_suite_metrics.keys())}."
-                )
-        self.primary_dataset: str | None = raw_primary_dataset
-        self.primary_metric: str | None = raw_primary_metric
 
         # Steps 2-10: Clean up Accelerate/distributed singletons if construction fails mid-way.
         try:
             # Step 2: Multi-rank safe work_dir resolution BEFORE Accelerator(...).
-            raw_base_work_dir = OmegaConf.select(cfg_oc, "work_dir", default=None)
-            base_work_dir: Path | None = (
-                Path(str(raw_base_work_dir))
-                if raw_base_work_dir is not None and str(raw_base_work_dir).strip()
-                else None
-            )
-            self.work_dir: Path = resolve_work_dir(cfg_oc)
-            resolved_container = OmegaConf.to_container(cfg_oc, resolve=True)
-            cfg_resolved = OmegaConf.create(resolved_container)
-            if not isinstance(cfg_resolved, DictConfig):
-                raise TypeError("Resolved configuration must be a DictConfig.")
-            cfg_resolved.work_dir = str(self.work_dir)
-            self.cfg: DictConfig = cfg_resolved
+            base_work_dir = Path(config.work_dir)
+            self.work_dir: Path = resolve_work_dir(config)
+            self.config.work_dir = str(self.work_dir)
+            self.cfg: DictConfig = to_resolved_dict_config(self.config)
 
             # Step 3: Initialize Accelerator + ProjectConfiguration.
             project_config = ProjectConfiguration(
@@ -455,19 +173,12 @@ class Trainer:
                 automatic_checkpoint_naming=False,
             )
             ddp_kwargs = DistributedDataParallelKwargs(
-                # 默认 True 最稳（保守，兼容任意自定义 arch）。
-                # 若所用 arch 已通过 ``freeze_unused_parameters()`` 冻结前向旁路参数
-                # （如 VOSR2PBDiT 的 ``context_embedder``），可设为 False 去掉每步图遍历开销。
-                find_unused_parameters=bool(
-                    OmegaConf.select(
-                        cfg_oc, "trainer.ddp_find_unused_parameters", default=True
-                    )
-                ),
+                find_unused_parameters=t_cfg.ddp_find_unused_parameters,
             )
             self.accelerator = Accelerator(
                 mixed_precision=self.mixed_precision,
                 gradient_accumulation_steps=self.grad_accum_steps,
-                log_with=normalized_log_with,
+                log_with=active_log_with,
                 project_config=project_config,
                 kwargs_handlers=[ddp_kwargs],
             )
@@ -476,7 +187,6 @@ class Trainer:
             self.accelerator.wait_for_everyone()
             if (
                 self.accelerator.is_main_process
-                and base_work_dir is not None
                 and base_work_dir.resolve() != self.work_dir.resolve()
                 and base_work_dir.is_dir()
             ):
@@ -504,9 +214,8 @@ class Trainer:
 
             if self.accelerator.log_with:
                 flat_cfg = flatten_config_for_tracker(self.cfg)
-                project_name = str(OmegaConf.select(self.cfg, "exp_name", default="srtrainer"))
                 self.accelerator.init_trackers(
-                    project_name=project_name,
+                    project_name=self.config.exp_name,
                     config=flat_cfg,
                     init_kwargs=sanitized_tracker_init_kwargs,
                 )
@@ -514,15 +223,8 @@ class Trainer:
             # Step 6: Phase-A identical cross-rank seeding before model & metric initialization.
             set_seed(self.seed, device_specific=False)
 
-            # Step 7: Instantiate & setup model, TrainState, Checkpointer, and deterministic registration.
-            # NOTE: Never wrap model.setup() in main_process_first() because setup() invokes
-            # collective accelerator.prepare() (DDP sync). Pretrained loss/arch downloads are guarded
-            # inside VOSRModel.setup() Step 1 before prepare().
-            model_obj = hydra.utils.instantiate(self.cfg.model, cfg=self.cfg, _recursive_=False)
-            if not isinstance(model_obj, BaseModel):
-                raise TypeError(
-                    f"Instantiated cfg.model must be a BaseModel, got {type(model_obj).__name__}."
-                )
+            # Step 7: Instantiate & setup model with typed TrainConfig, TrainState, Checkpointer.
+            model_obj = build_model(self.config)
             model_obj.setup(self.accelerator)
             self.model: BaseModel = model_obj
 
@@ -534,49 +236,38 @@ class Trainer:
             )
 
             # Step 8: Training data pipeline (unprepared train_loader + dedicated Generator).
-            has_degradation = OmegaConf.select(self.cfg, "data.degradation", default=None) is not None
-            kernel_cfg = (
-                OmegaConf.select(self.cfg, "data.degradation.kernel_cfg", default=None)
-                if has_degradation
-                else None
-            )
+            has_degradation = d_cfg.degradation is not None
+            kernel_cfg = _extract_kernel_cfg(d_cfg.degradation) if has_degradation else None
             self.train_dataset = MixedSRDataset(
-                sources=self.cfg.data.sources,
+                sources=d_cfg.sources,
                 gt_size=self.gt_size,
                 scale=self.scale,
-                augment=OmegaConf.select(self.cfg, "data.augment", default=None),
+                augment=d_cfg.augment,
                 has_degradation=has_degradation,
                 kernel_cfg=kernel_cfg,
                 is_main_process=self.accelerator.is_main_process,
                 logger=self.logger,
-                text_crop_prob=float(OmegaConf.select(self.cfg, "data.text_crop_prob", default=0.0)),
+                text_crop_prob=d_cfg.text_crop_prob,
             )
             self.train_sampler = DistributedWeightedInfiniteSampler(
                 source_sizes=self.train_dataset.source_sizes,
                 ratios=self.train_dataset.source_ratios,
-                batch_size_per_gpu=batch_size_per_gpu,
+                batch_size_per_gpu=d_cfg.batch_size_per_gpu,
                 rank=self.accelerator.process_index,
                 world_size=self.accelerator.num_processes,
                 base_seed=self.seed,
                 start_micro_step=0,
             )
-            pin_memory = (
-                bool(OmegaConf.select(self.cfg, "data.pin_memory", default=True))
-                and self.accelerator.device.type == "cuda"
-            )
-            persistent_workers = (
-                bool(OmegaConf.select(self.cfg, "data.persistent_workers", default=False))
-                and num_workers > 0
-            )
+            pin_memory = d_cfg.pin_memory and self.accelerator.device.type == "cuda"
+            persistent_workers = d_cfg.persistent_workers and d_cfg.num_workers > 0
             train_dl_gen = torch.Generator()
             train_dl_gen.manual_seed(self.seed + self.accelerator.process_index)
-            from data.mixed_dataset import train_collate_fn
 
             self.train_loader = DataLoader(
                 self.train_dataset,
-                batch_size=batch_size_per_gpu,
+                batch_size=d_cfg.batch_size_per_gpu,
                 sampler=self.train_sampler,
-                num_workers=num_workers,
+                num_workers=d_cfg.num_workers,
                 pin_memory=pin_memory,
                 persistent_workers=persistent_workers,
                 collate_fn=train_collate_fn if self.train_dataset.has_text_annotations else None,
@@ -585,57 +276,57 @@ class Trainer:
 
             # Step 9: Validation suites (val_loader prepared ONCE in __init__, metrics cached on device).
             self.val_suites: dict[str, _ValSuite] = {}
-            if validated_suite_cfgs:
-                for s_name, s_info in validated_suite_cfgs.items():
-                    ds_cfg = s_info["dataset"]
-                    val_ds = ValImageDataset(
-                        root_dir=ds_cfg.get("root_dir", None),
-                        json_path=ds_cfg["json_path"],
-                    )
-                    vis_stems = _build_vis_stems(val_ds)
-                    val_dl_gen = torch.Generator()
-                    val_dl_gen.manual_seed(self.seed)
-                    raw_val_loader = DataLoader(
-                        val_ds,
-                        batch_size=1,
-                        shuffle=False,
-                        num_workers=0,
-                        collate_fn=val_collate_fn,
-                        pin_memory=pin_memory,
-                        generator=val_dl_gen,
-                    )
-                    prepared_val_loader = self.accelerator.prepare(raw_val_loader)
+            for s_name, suite_cfg in m_cfg.val_suites.items():
+                val_ds = ValImageDataset(
+                    root_dir=suite_cfg.dataset.root_dir,
+                    json_path=suite_cfg.dataset.json_path,
+                )
+                vis_stems = _build_vis_stems(val_ds)
+                val_dl_gen = torch.Generator()
+                val_dl_gen.manual_seed(self.seed)
+                raw_val_loader = DataLoader(
+                    val_ds,
+                    batch_size=1,
+                    shuffle=False,
+                    num_workers=0,
+                    collate_fn=val_collate_fn,
+                    pin_memory=pin_memory,
+                    generator=val_dl_gen,
+                )
+                prepared_val_loader = self.accelerator.prepare(raw_val_loader)
 
-                    instantiated_metrics: dict[str, BaseMetric] = {}
-                    with self.accelerator.main_process_first():
-                        for m_name, m_cfg in s_info["metrics"].items():
-                            metric = hydra.utils.instantiate(m_cfg)
-                            if not isinstance(metric, BaseMetric):
-                                raise TypeError(
-                                    f"Instantiated metric {s_name}.{m_name} must be a BaseMetric, "
-                                    f"got {type(metric).__name__}."
-                                )
-                            metric.to(self.accelerator.device)
-                            instantiated_metrics[m_name] = metric
+                instantiated_metrics: dict[str, BaseMetric] = {}
+                with self.accelerator.main_process_first():
+                    for m_name, metric_target_cfg in suite_cfg.metrics.items():
+                        metric = hydra.utils.instantiate(metric_target_cfg)
+                        if not isinstance(metric, BaseMetric):
+                            raise TypeError(
+                                f"Instantiated metric {s_name}.{m_name} must be a BaseMetric, "
+                                f"got {type(metric).__name__}."
+                            )
+                        metric.to(self.accelerator.device)
+                        instantiated_metrics[m_name] = metric
 
-                    self.val_suites[s_name] = _ValSuite(
-                        name=s_name,
-                        dataset=val_ds,
-                        loader=prepared_val_loader,
-                        metrics=instantiated_metrics,
-                        max_save_images=s_info["max_save_images"],
-                        vis_stems=vis_stems,
-                    )
+                suite_max_vis = (
+                    self.val_max_save_images
+                    if suite_cfg.max_save_images is None
+                    else suite_cfg.max_save_images
+                )
+                self.val_suites[s_name] = _ValSuite(
+                    name=s_name,
+                    dataset=val_ds,
+                    loader=prepared_val_loader,
+                    metrics=instantiated_metrics,
+                    max_save_images=suite_max_vis,
+                    vis_stems=vis_stems,
+                )
 
             # Step 10: Phase-B per-rank seeding & optional resume restoration.
             set_seed(self.seed, device_specific=True)
-            resolved_resume_cfg = OmegaConf.select(self.cfg, "trainer.resume", default=None)
-            resume_path = self.checkpointer.resolve_resume_path(resolved_resume_cfg)
+            resume_cfg = t_cfg.resume
+            resume_path = self.checkpointer.resolve_resume_path(resume_cfg)
             if resume_path is None:
-                if (
-                    isinstance(resolved_resume_cfg, str)
-                    and resolved_resume_cfg.strip().lower() == "auto"
-                ):
+                if resume_cfg is not None and resume_cfg.strip().lower() == "auto":
                     self.logger.warning(
                         "[Resume] trainer.resume='auto' requested, but no checkpoint state was "
                         "found under %s; starting fresh from step 0.",
@@ -786,7 +477,7 @@ class Trainer:
         inferencer = TiledInferencer.from_config(
             model=infer_net,
             scale=self.scale,
-            tile_cfg=OmegaConf.select(self.cfg, "trainer.val_tile", default=None),
+            tile_cfg=self.config.trainer.val_tile,
             gt_size=self.gt_size,
             mixed_precision=self.mixed_precision,
             device=self.accelerator.device,

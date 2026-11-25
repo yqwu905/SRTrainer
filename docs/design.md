@@ -646,7 +646,7 @@ class BaseMetric(ABC):
   - `OCRAccuracyMetric`（**OCR-A**，`higher_is_better = True`）、`CERMetric`（**CER**，`higher_is_better = False`，不截断允许 `> 1`）、`OneMinusNEDMetric`（**1-NED**，`higher_is_better = True`）；
   - 与 `yqwu905/VOSR` `evaluate.py` 对齐 NFKC/空白规范化、Unicode 单位代价 Levenshtein 编辑距离与 OpenCV `INTER_CUBIC` / `BORDER_REPLICATE` 透视裁剪（高宽比 `>= 1.5` 逆时针旋转 90°）；
   - 支持单行整图 `label` 与多框 `text_lines`（`points`/`quad`/`bbox`/`box` + 可选 `annotation_size` 显式缩放），不依赖 `target`（支持 GT-less）；
-  - 延迟导入可选依赖（`uv sync --extra ocr`），默认 `ocr_device="cpu"`（`.to(torch_device)` 安全空操作），同进程同配置三指标共享模型并有界缓存最后一个样本的一次识别结果；多进程运行前建议单进程预下载权重并统一配置只读本地 `ocr_model_dir`。
+  - RapidOCR（PyTorch 后端）与 OpenCV 作为可选依赖延迟导入（`uv sync --extra ocr`）。`ocr_device` 默认 CPU，支持 `cpu` / `gpu[:ID]` / `cuda[:ID]` / `npu[:ID]` / `mps`，独立于训练设备。同进程同配置的三项指标共享模型和最后一个样本的识别结果。模型与字典首次使用时下载，离线运行可通过 `ocr_model_dir` 指定本地 RapidOCR PyTorch `.pth` 权重及同目录字典文件。
 
 #### 验证套件与指标 Hydra 配置：`configs/metric/sr_default.yaml`
 ```yaml
@@ -820,7 +820,7 @@ mixed_precision: bf16          # no | fp16 | bf16
 # Tile 推理策略
 tile:
   enabled: true
-  size: auto                   # auto -> 自动推导为 train_cfg.data.gt_size // scale；也可填具体整数如 64 或 [64, 64]
+  size: null                   # null 表示按训练尺寸逐轴推导，也可填 [高, 宽]
   overlap: 16                  # LQ 空间重叠像素（必须 < tile_size // 2），0 表示硬拼接
   batch_size: 4                # 单次并行前向的 tile 数量，提升 GPU 利用率
   blend_mode: cosine           # cosine | linear | mean（重叠区羽化融合权重策略）
@@ -830,7 +830,7 @@ tile:
 #### 自动 Tile 切块与羽化融合算法细节
 
 1. **`tile_size` 自动推导**：
-   - 当 `tile.size == "auto"` 时，自动计算 `(tile_h, tile_w) = (gt_h // scale, gt_w // scale)`（例如训练 `gt_size=256, scale=4` → 自动 `tile_size = 64`，与训练网络见过的 LQ patch 尺寸完全一致！）；
+   - 当 `tile.size` 为 `null` 时，自动计算 `(tile_h, tile_w) = (gt_h // scale, gt_w // scale)`（例如训练 `gt_size=256, scale=4` → 自动 `tile_size = (64, 64)`，与训练网络见过的 LQ patch 尺寸完全一致！）；
    - 若独立模式无 `data.gt_size`，则提示用户显式指定 `tile.size` 或退回整图模式（并自动执行 `pad_multiple`）。
 2. **小图 / 边界保护**：
    - 若输入图 `H < tile_h` 或 `W < tile_w`，先用 `reflect` 模式（超边时降级 `replicate`）向右下方 padding 至至少 `(tile_h, tile_w)`，推理完毕后按 `(orig_H * scale, orig_W * scale)` 精确裁回。
@@ -862,7 +862,7 @@ accelerate launch --num_processes 4 tools/infer.py \
   infer.input=/data/manifests/large_test.json \
   infer.input_root=/data/large_test \
   infer.output_dir=outputs/exp01_large_test \
-  infer.tile.size=auto \
+  infer.tile.size=null \
   infer.tile.overlap=16 \
   infer.tile.batch_size=8
 ```

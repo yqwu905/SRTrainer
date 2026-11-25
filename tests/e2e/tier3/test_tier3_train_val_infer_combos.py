@@ -85,7 +85,7 @@ def test_t3_trainer_validation_and_tools_infer_tiled_output_parity(
         log_with=None,
     )
     cfg.trainer.val_tile.enabled = True
-    cfg.trainer.val_tile.size = "auto"
+    cfg.trainer.val_tile.size = None
     cfg.trainer.val_tile.overlap = 4
     cfg.trainer.val_tile.blend_mode = "cosine"
     Trainer(cfg).fit()
@@ -116,7 +116,7 @@ def test_t3_trainer_validation_and_tools_infer_tiled_output_parity(
             f"infer.output_dir={fmt(str(out_dir))}",
             "infer.mixed_precision='no'",
             "infer.tile.enabled=true",
-            "infer.tile.size=auto",
+            "infer.tile.size=null",
             "infer.tile.overlap=4",
             "infer.tile.blend_mode=cosine",
         ],
@@ -137,7 +137,7 @@ def test_t3_trainer_validation_and_tools_infer_tiled_output_parity(
         model=net,
         scale=2,
         tile_enabled=True,
-        tile_size="auto",
+        tile_size=None,
         tile_overlap=4,
         tile_batch_size=4,
         blend_mode="cosine",
@@ -343,7 +343,7 @@ def test_t3_2proc_distributed_validation_odd_suite_exact_gather_parity(
         model=oracle_net,
         scale=2,
         tile_enabled=True,
-        tile_size="auto",
+        tile_size=None,
         tile_overlap=4,
         tile_batch_size=4,
         blend_mode="cosine",
@@ -412,7 +412,7 @@ def test_t3_2proc_distributed_validation_odd_suite_exact_gather_parity(
         cfg.optim.optimizer.weight_decay = 0.0
         cfg.optim.scheduler.eta_min = 0.0
         cfg.trainer.val_tile.enabled = True
-        cfg.trainer.val_tile.size = "auto"
+        cfg.trainer.val_tile.size = None
         cfg.trainer.val_tile.overlap = 4
         cfg.trainer.val_tile.blend_mode = "cosine"
         cfg_path = e2e_workdir["root"] / f"{name}_cfg.yaml"
@@ -646,7 +646,7 @@ def test_t3_toymodel_exp_dir_auto_restore_on_non_square_odd_tiled_image(
             f"infer.output_dir={fmt(str(out_dir))}",
             "infer.mixed_precision='no'",
             "infer.tile.enabled=true",
-            "infer.tile.size=auto",
+            "infer.tile.size=null",
             "infer.tile.overlap=4",
             "infer.tile.blend_mode=linear",
         ],

@@ -238,26 +238,26 @@ def _make_exp_dir(
 def test_tiled_inferencer_tile_size_modes_and_validation(caplog: pytest.LogCaptureFixture) -> None:
     model = NearestUpsampler(scale=4)
 
-    # tile_size="auto" with gt_size -> gt_size // scale
-    inf_auto = TiledInferencer(model=model, scale=4, tile_size="auto", tile_overlap=4, gt_size=64)
+    # tile_size=None (auto) with gt_size -> gt_size // scale
+    inf_auto = TiledInferencer(model=model, scale=4, tile_size=None, tile_overlap=4, gt_size=64)
     assert inf_auto.tile_enabled is True
     assert inf_auto.tile_size == (16, 16)
     assert inf_auto.weight_window is not None
     assert tuple(inf_auto.weight_window.shape) == (1, 1, 64, 64)
 
     rectangular = TiledInferencer(
-        model=model, scale=4, tile_size="auto", tile_overlap=4, gt_size=[48, 80]
+        model=model, scale=4, tile_size=None, tile_overlap=4, gt_size=[48, 80]
     )
     assert rectangular.tile_size == (12, 20)
     image = torch.rand(1, 3, 29, 43)
     torch.testing.assert_close(rectangular.infer_tensor(image), model(image))
 
-    # tile_size="auto" without gt_size -> warning + untiled fallback
+    # tile_size=None (auto) without gt_size -> warning + untiled fallback
     with caplog.at_level(logging.WARNING, logger="srtrainer"):
         inf_fallback = TiledInferencer(
             model=model,
             scale=4,
-            tile_size="auto",
+            tile_size=None,
             tile_overlap=16,
             gt_size=None,
             pad_multiple=8,
@@ -265,7 +265,7 @@ def test_tiled_inferencer_tile_size_modes_and_validation(caplog: pytest.LogCaptu
     assert inf_fallback.tile_enabled is False
     assert inf_fallback.tile_size is None
     assert inf_fallback.weight_window is None
-    assert any("auto" in rec.getMessage() and "gt_size" in rec.getMessage() for rec in caplog.records)
+    assert any("gt_size" in rec.getMessage() for rec in caplog.records)
 
     # tile_enabled=False ignores default overlap/auto without warning
     caplog.clear()
@@ -274,7 +274,7 @@ def test_tiled_inferencer_tile_size_modes_and_validation(caplog: pytest.LogCaptu
             model=model,
             scale=4,
             tile_enabled=False,
-            tile_size="auto",
+            tile_size=None,
             tile_overlap=16,
             gt_size=None,
         )
@@ -285,7 +285,7 @@ def test_tiled_inferencer_tile_size_modes_and_validation(caplog: pytest.LogCaptu
 
     # gt_size not divisible by scale
     with pytest.raises(ValueError, match="divisible"):
-        TiledInferencer(model=model, scale=4, tile_size="auto", tile_overlap=4, gt_size=65)
+        TiledInferencer(model=model, scale=4, tile_size=None, tile_overlap=4, gt_size=65)
 
     # int, list, and OmegaConf ListConfig
     inf_int = TiledInferencer(model=model, scale=4, tile_size=32, tile_overlap=8)
@@ -303,7 +303,7 @@ def test_tiled_inferencer_tile_size_modes_and_validation(caplog: pytest.LogCaptu
     with pytest.raises(TypeError):
         TiledInferencer(model=model, scale=4, tile_enabled=False, device=123)  # type: ignore[arg-type]
 
-    for bad_size in (0, -8, True, False, 16.5, [16], [16, 0], [True, 16], "bad", b"16", None):
+    for bad_size in (0, -8, True, False, 16.5, [16], [16, 0], [True, 16], "auto", "bad", b"16"):
         with pytest.raises(ValueError):
             TiledInferencer(model=model, scale=4, tile_size=bad_size, tile_overlap=0)  # type: ignore[arg-type]
 
@@ -343,8 +343,13 @@ def test_tiled_inferencer_tile_size_modes_and_validation(caplog: pytest.LogCaptu
         train_cfg = hydra.compose(
             config_name="train",
             overrides=[
-                "~experiment", "arch/vae=qwen_vae2d", "arch/dit=vosr2_dit", "loss=l1",
-                "scale=4", "data.gt_size=[256,512]", "trainer.val_tile.overlap=16",
+                "~experiment",
+                "arch/vae=qwen_vae2d",
+                "arch/dit=vosr2_dit",
+                "loss=l1",
+                "scale=4",
+                "data.gt_size=[256,512]",
+                "trainer.val_tile.overlap=16",
             ],
         )
     inf_from_train = TiledInferencer.from_config(
@@ -876,7 +881,7 @@ def test_infer_mode2_standalone_safetensors_pth_and_errors(tmp_path: Path) -> No
             f"infer.input={in_img}",
             f"infer.output_dir={out_st}",
             "infer.mixed_precision=no",
-            "infer.tile.size=auto",
+            "infer.tile.size=null",
         ]
     )
     summary_st = infer_mod.run_infer(cfg_st)
@@ -926,7 +931,7 @@ def test_infer_mode2_standalone_safetensors_pth_and_errors(tmp_path: Path) -> No
             )
         )
 
-    with pytest.raises(ValueError, match="weights_path"):
+    with pytest.raises(ValueError, match="component_weights"):
         infer_mod.run_infer(
             _compose_infer(
                 [
@@ -944,7 +949,7 @@ def test_infer_mode2_standalone_safetensors_pth_and_errors(tmp_path: Path) -> No
                 [
                     "arch/vae=qwen_vae2d",
                     "arch/dit=vosr2_dit",
-                    f"++infer.weights_path={{dit:{tmp_path / 'missing.safetensors'}}}",
+                    f"infer.component_weights.dit={tmp_path / 'missing.safetensors'}",
                     f"infer.input={in_img}",
                     f"infer.output_dir={tmp_path / 'e_missing_w'}",
                 ]
@@ -1036,7 +1041,7 @@ def test_infer_vosr_multi_arch_exp_dir_and_standalone(tmp_path: Path) -> None:
     save_safetensors(sd_ema["dit"], weights_dir / "latest_dit_ema.safetensors")
     # Also ensure latest_vae and latest_dino match pipe_ema when testing latest_ema fallback
     ref_inf_best = TiledInferencer(
-        model=pipe_best, scale=2, tile_size="auto", tile_overlap=4, gt_size=32, mixed_precision="no"
+        model=pipe_best, scale=2, tile_size=None, tile_overlap=4, gt_size=32, mixed_precision="no"
     )
     expected_best = ref_inf_best.infer_tensor(lq_tensor)
 
@@ -1075,7 +1080,7 @@ def test_infer_vosr_multi_arch_exp_dir_and_standalone(tmp_path: Path) -> None:
     )
     assert sum_no_ema.weights_path.name == "latest_dit.safetensors"
     ref_inf_latest = TiledInferencer(
-        model=pipe_latest, scale=2, tile_size="auto", tile_overlap=4, gt_size=32, mixed_precision="no"
+        model=pipe_latest, scale=2, tile_size=None, tile_overlap=4, gt_size=32, mixed_precision="no"
     )
     assert (load_image(out_no_ema / "vosr_in.png") - ref_inf_latest.infer_tensor(lq_tensor)).abs().max().item() <= (1.0 / 255.0) + 1e-5
 
@@ -1108,7 +1113,7 @@ def test_infer_vosr_multi_arch_exp_dir_and_standalone(tmp_path: Path) -> None:
     assert pipe_mixed.dino is not None
     pipe_mixed.dino.load_state_dict(sd_latest["dino"])
     ref_inf_mixed = TiledInferencer(
-        model=pipe_mixed, scale=2, tile_size="auto", tile_overlap=4, gt_size=32, mixed_precision="no"
+        model=pipe_mixed, scale=2, tile_size=None, tile_overlap=4, gt_size=32, mixed_precision="no"
     )
     assert (load_image(out_ema / "vosr_in.png") - ref_inf_mixed.infer_tensor(lq_tensor)).abs().max().item() <= (1.0 / 255.0) + 1e-5
 
@@ -1176,7 +1181,8 @@ def test_infer_vosr_multi_arch_exp_dir_and_standalone(tmp_path: Path) -> None:
             "++arch={vae:{_target_:tests.dummy_arch.DummyVAE,z_dim:4,spatial_compression_ratio:2},"
             "dit:{_target_:tests.dummy_arch.DummyDiT,in_channels:8,out_channels:4,patch_size:2,hidden_ch:8,z_dims:null},"
             "dino:null}",
-            f"++infer.weights_path={{vae:{vae_nd_path},dit:{dit_nd_path}}}",
+            f"infer.component_weights.vae={vae_nd_path}",
+            f"infer.component_weights.dit={dit_nd_path}",
             f"infer.input={in_img}",
             f"infer.output_dir={out_standalone}",
             "infer.mixed_precision=no",
@@ -1474,7 +1480,7 @@ def test_infer_cli_distributed_2proc_cpu_5_images_from_tmp(tmp_path: Path) -> No
         f"infer.input={in_dir}",
         f"infer.output_dir={out_dir}",
         "infer.mixed_precision=no",
-        "infer.tile.size=auto",
+        "infer.tile.size=null",
         "infer.tile.overlap=4",
         "infer.tile.batch_size=2",
     ]
@@ -1488,7 +1494,7 @@ def test_infer_cli_distributed_2proc_cpu_5_images_from_tmp(tmp_path: Path) -> No
     ref_inf = TiledInferencer(
         model=model,
         scale=2,
-        tile_size="auto",
+        tile_size=None,
         tile_overlap=4,
         tile_batch_size=2,
         gt_size=32,
