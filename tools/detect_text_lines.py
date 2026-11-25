@@ -3,11 +3,12 @@
 Reads a unified list-of-dicts training/validation JSON manifest containing ``gt`` image paths,
 runs RapidOCR detection (and recognition unless ``--det-only`` is set) on each ``gt`` image in
 parallel across multiple CUDA GPUs, Ascend NPUs, or CPU workers, overwrites existing
-``text_lines`` (or inserts ``text_lines`` when absent), and atomically writes the result to a new
-JSON file while preserving all other fields and sample order.
+``text_lines`` (or inserts ``text_lines`` when absent), persists progress incrementally to a
+sidecar JSONL checkpoint for automatic resume after interruption, and atomically writes the
+final ordered result to ``--output-json``.
 
 Examples:
-    # Auto-detect all available GPUs / NPUs and run PP-OCRv5 det + rec
+    # Auto-detect all available GPUs / NPUs and run PP-OCRv5 det + rec (auto-resumes if interrupted)
     uv run python tools/detect_text_lines.py \\
         --input-json /data/train.json \\
         --output-json /data/train_with_lines.json \\
@@ -20,19 +21,19 @@ Examples:
         --root-dir /data \\
         --devices npu:0,npu:1,npu:2,npu:3,npu:4,npu:5,npu:6,npu:7
 
-    # Explicit 4-GPU detection only (faster when transcripts are not needed)
+    # Force fresh run ignoring any previous sidecar checkpoint
     uv run python tools/detect_text_lines.py \\
         --input-json /data/train.json \\
-        --output-json /data/train_det_only.json \\
+        --output-json /data/train_with_lines.json \\
         --root-dir /data \\
-        --devices cuda:0,cuda:1,cuda:2,cuda:3 \\
-        --det-only
+        --no-resume
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -43,7 +44,7 @@ import sys
 import tempfile
 import time
 import traceback
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -55,6 +56,20 @@ _SRC_DIR = str(Path(__file__).resolve().parents[1] / "src")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
+from utils.rapidocr import (  # noqa: E402
+    CLS_MODELS,
+    DEFAULT_CLS_MODEL,
+    DEFAULT_DET_MODEL,
+    DEFAULT_REC_MODEL,
+    DET_MODELS,
+    REC_MODELS,
+    create_rapidocr_engine,
+    ensure_rapidocr_models_ready,
+    get_rapidocr_model_root,
+    import_rapidocr,
+    onnx_device_params,
+    resolve_onnx_model,
+)
 from utils.text_geometry import canonical_quad  # noqa: E402
 
 __all__ = [
@@ -63,6 +78,7 @@ __all__ = [
     "DEFAULT_CLS_MODEL",
     "DetectConfig",
     "DetectSummary",
+    "default_checkpoint_path",
     "parse_devices",
     "resolve_gt_path",
     "build_rapidocr_params",
@@ -71,27 +87,7 @@ __all__ = [
     "main",
 ]
 
-DEFAULT_DET_MODEL: str = "PP-OCRv5_server_det"
-DEFAULT_REC_MODEL: str = "PP-OCRv5_server_rec"
-DEFAULT_CLS_MODEL: str = "PP-LCNet_x1_0_textline_ori"
-
-_DET_MODELS: dict[str, tuple[str, str]] = {
-    "PP-OCRv5_server_det": ("PP-OCRv5", "server"),
-    "PP-OCRv5_mobile_det": ("PP-OCRv5", "mobile"),
-    "PP-OCRv4_server_det": ("PP-OCRv4", "server"),
-    "PP-OCRv4_mobile_det": ("PP-OCRv4", "mobile"),
-}
-_REC_MODELS: dict[str, tuple[str, str]] = {
-    "PP-OCRv5_server_rec": ("PP-OCRv5", "server"),
-    "PP-OCRv5_mobile_rec": ("PP-OCRv5", "mobile"),
-    "PP-OCRv4_server_rec": ("PP-OCRv4", "server"),
-    "PP-OCRv4_mobile_rec": ("PP-OCRv4", "mobile"),
-}
-_CLS_MODELS: dict[str, tuple[str, str]] = {
-    "PP-LCNet_x1_0_textline_ori": ("PP-OCRv5", "server"),
-    "PP-LCNet_x0_25_textline_ori": ("PP-OCRv5", "mobile"),
-}
-
+_CHECKPOINT_VERSION = 1
 _LOGGER = logging.getLogger("srtrainer.detect_text_lines")
 
 
@@ -125,6 +121,8 @@ class DetectSummary:
     total_samples: int
     overwritten_samples: int
     added_samples: int
+    resumed_samples: int
+    processed_samples: int
     total_lines: int
     empty_samples: int
     skipped_errors: int
@@ -132,80 +130,44 @@ class DetectSummary:
     devices: tuple[str, ...]
     elapsed_sec: float
     output_json: Path
+    checkpoint_path: Path | None = None
 
 
-def _import_rapidocr() -> tuple[Any, Any]:
-    try:
-        import onnxruntime
-        import rapidocr
-    except ImportError as exc:
-        raise ImportError(
-            "Offline text-line detection requires RapidOCR and ONNX Runtime. "
-            "Install optional OCR dependencies with `uv sync --extra ocr`."
-        ) from exc
-    return rapidocr, onnxruntime
+def default_checkpoint_path(output_json: str | Path) -> Path:
+    """Return the default sidecar JSONL checkpoint path paired with ``output_json``."""
+    out = Path(output_json)
+    return out.parent / f"{out.name}.ckpt.jsonl"
 
 
-def _resolve_onnx_model(
-    model_name: str,
-    model_dir: str | Path | None,
-    role_label: str,
-    known_models: Mapping[str, tuple[str, str]],
-) -> tuple[str, str, Path | None]:
-    if model_dir is None:
-        if model_name not in known_models:
-            raise ValueError(
-                f"Unknown OCR {role_label} model {model_name!r}. Available for automatic "
-                f"download: {', '.join(known_models)}. To use other weights, supply an ONNX model."
-            )
-        version, model_type = known_models[model_name]
-        return version, model_type, None
-
-    path = Path(model_dir).expanduser()
-    if path.is_dir():
-        named_model = path / f"{model_name}.onnx"
-        candidates = sorted(p for p in path.glob("*.onnx") if p.is_file())
-        if named_model in candidates:
-            path = named_model
-        elif len(candidates) == 1:
-            path = candidates[0]
-        elif candidates:
-            raise ValueError(
-                f"Multiple ONNX models found in {path}. Specify the exact {role_label} .onnx file."
-            )
-    if path.suffix.lower() != ".onnx" or not path.is_file():
-        raise FileNotFoundError(
-            f"OCR {role_label} ONNX model not found at {path}. Supply an .onnx file or "
-            "a directory containing the ONNX export of your model."
-        )
-    version, model_type = known_models.get(model_name, ("PP-OCRv5", "server"))
-    return version, model_type, path
-
-
-def _onnx_device_params(device: str, onnxruntime: Any) -> dict[str, Any]:
-    name, separator, device_id = device.strip().lower().partition(":")
-    if name == "cpu" and not separator:
-        return {}
-    providers = {
-        "gpu": ("cuda", "CUDAExecutionProvider"),
-        "cuda": ("cuda", "CUDAExecutionProvider"),
-        "npu": ("cann", "CANNExecutionProvider"),
+def _compute_run_fingerprint(
+    gt_entries: Sequence[str],
+    cfg: DetectConfig,
+) -> str:
+    """Compute a stable SHA-256 fingerprint binding checkpoint records to input order & OCR mode."""
+    hasher = hashlib.sha256()
+    meta = {
+        "version": _CHECKPOINT_VERSION,
+        "count": len(gt_entries),
+        "det_model": cfg.det_model,
+        "det_model_dir": cfg.det_model_dir,
+        "rec_model": None if cfg.det_only else cfg.rec_model,
+        "rec_model_dir": None if cfg.det_only else cfg.rec_model_dir,
+        "cls_model": cfg.cls_model if cfg.use_cls else None,
+        "cls_model_dir": cfg.cls_model_dir if cfg.use_cls else None,
+        "det_only": cfg.det_only,
+        "use_cls": cfg.use_cls,
+        "limit_side_len": cfg.limit_side_len,
+        "limit_type": cfg.limit_type,
+        "box_thresh": cfg.box_thresh,
+        "unclip_ratio": cfg.unclip_ratio,
+        "text_score": cfg.text_score,
+        "min_box_size": cfg.min_box_size,
     }
-    if name not in providers or (separator and not device_id.isdecimal()):
-        raise ValueError(
-            f"Unsupported OCR device {device!r}. Use cpu, gpu[:ID], cuda[:ID], or npu[:ID]."
-        )
-    flag, provider = providers[name]
-    available = onnxruntime.get_available_providers()
-    if provider not in available:
-        raise ValueError(
-            f"OCR device {device!r} requires {provider}, but available ONNX Runtime providers "
-            f"are {available}. Install the matching ONNX Runtime build or pass `--devices cpu`."
-        )
-    return {
-        f"EngineConfig.onnxruntime.use_{flag}": True,
-        f"EngineConfig.onnxruntime.{flag}_ep_cfg.device_id": int(device_id or 0),
-    }
+    hasher.update(json.dumps(meta, sort_keys=True, ensure_ascii=False).encode("utf-8"))
+    for raw_gt in gt_entries:
+        hasher.update(b"\0")
+        hasher.update(raw_gt.encode("utf-8"))
+    return hasher.hexdigest()
 
 
 def _detect_accelerator_devices(device_type: str = "auto") -> list[str]:
@@ -218,7 +180,7 @@ def _detect_accelerator_devices(device_type: str = "auto") -> list[str]:
     if norm_type == "cpu":
         return ["cpu"]
 
-    _, onnxruntime = _import_rapidocr()
+    _, onnxruntime = import_rapidocr(context="Offline text-line detection")
     providers = set(onnxruntime.get_available_providers())
 
     def _cuda_count() -> int:
@@ -354,14 +316,12 @@ def build_rapidocr_params(
     device: str,
     rapidocr: Any,
     onnxruntime: Any,
-) -> tuple[dict[str, Any], bool, Path]:
-    """Build RapidOCR 3.x ``params`` dictionary matching ``src/metrics/ocr_metrics.py``."""
-    det_version, det_type, det_path = _resolve_onnx_model(
-        cfg.det_model, cfg.det_model_dir, "detection", _DET_MODELS
+) -> tuple[dict[str, Any], tuple[str, ...], Path]:
+    """Build RapidOCR 3.x ``params`` dict, auto-download model keys, and cache root."""
+    det_version, det_type, det_path = resolve_onnx_model(
+        cfg.det_model, cfg.det_model_dir, "detection", DET_MODELS
     )
-    cache_root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
-    model_root = cache_root / "srtrainer" / "rapidocr"
-
+    model_root = get_rapidocr_model_root()
     det_lang: Any = rapidocr.LangDet("ch") if hasattr(rapidocr, "LangDet") else "ch"
     params: dict[str, Any] = {
         "Global.use_det": True,
@@ -378,17 +338,21 @@ def build_rapidocr_params(
         "Det.limit_type": str(cfg.limit_type),
         "Det.box_thresh": float(cfg.box_thresh),
         "Det.unclip_ratio": float(cfg.unclip_ratio),
-        **_onnx_device_params(device, onnxruntime),
+        **onnx_device_params(device, onnxruntime, cpu_fallback_hint="`--devices cpu`"),
     }
     if cfg.intra_threads is not None:
         params["EngineConfig.onnxruntime.intra_op_num_threads"] = int(cfg.intra_threads)
 
-    needs_download = det_path is None
+    download_keys: list[str] = []
+    if det_path is None:
+        download_keys.append(f"det:{det_version}:{det_type}:ch")
+
     if not cfg.det_only:
-        rec_version, rec_type, rec_path = _resolve_onnx_model(
-            cfg.rec_model, cfg.rec_model_dir, "recognition", _REC_MODELS
+        rec_version, rec_type, rec_path = resolve_onnx_model(
+            cfg.rec_model, cfg.rec_model_dir, "recognition", REC_MODELS
         )
-        needs_download |= rec_path is None
+        if rec_path is None:
+            download_keys.append(f"rec:{rec_version}:{rec_type}:ch")
         params.update(
             {
                 "Rec.engine_type": rapidocr.EngineType.ONNXRUNTIME,
@@ -405,10 +369,11 @@ def build_rapidocr_params(
                 params["Rec.rec_keys_path"] = str(dict_path)
 
     if cfg.use_cls:
-        cls_version, cls_type, cls_path = _resolve_onnx_model(
-            cfg.cls_model, cfg.cls_model_dir, "orientation", _CLS_MODELS
+        cls_version, cls_type, cls_path = resolve_onnx_model(
+            cfg.cls_model, cfg.cls_model_dir, "orientation", CLS_MODELS
         )
-        needs_download |= cls_path is None
+        if cls_path is None:
+            download_keys.append(f"cls:{cls_version}:{cls_type}")
         params.update(
             {
                 "Cls.engine_type": rapidocr.EngineType.ONNXRUNTIME,
@@ -419,20 +384,31 @@ def build_rapidocr_params(
             }
         )
 
-    return params, needs_download, model_root
+    return params, tuple(download_keys), model_root
 
 
-def _create_rapidocr_engine(cfg: DetectConfig, device: str) -> Any:
-    rapidocr, onnxruntime = _import_rapidocr()
-    params, needs_download, model_root = build_rapidocr_params(cfg, device, rapidocr, onnxruntime)
-    if needs_download:
-        from huggingface_hub.utils import WeakFileLock
+def _prefetch_models_before_spawn(cfg: DetectConfig) -> None:
+    """Pre-download any uncached ONNX models once on CPU before spawning GPU/NPU workers."""
+    rapidocr, onnxruntime = import_rapidocr(context="Offline text-line detection")
+    params, download_keys, model_root = build_rapidocr_params(cfg, "cpu", rapidocr, onnxruntime)
+    if download_keys:
+        ensure_rapidocr_models_ready(
+            params,
+            rapidocr=rapidocr,
+            model_root=model_root,
+            download_keys=download_keys,
+        )
 
-        lock_path = model_root / ".download.lock"
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with WeakFileLock(lock_path):
-            return rapidocr.RapidOCR(params=params)
-    return rapidocr.RapidOCR(params=params)
+
+def _create_rapidocr_engine(cfg: DetectConfig, device: str, *, skip_download_lock: bool = False) -> Any:
+    rapidocr, onnxruntime = import_rapidocr(context="Offline text-line detection")
+    params, download_keys, model_root = build_rapidocr_params(cfg, device, rapidocr, onnxruntime)
+    return create_rapidocr_engine(
+        params,
+        rapidocr=rapidocr,
+        model_root=model_root,
+        download_keys=() if skip_download_lock else download_keys,
+    )
 
 
 def _load_bgr_image(image_path: Path) -> np.ndarray:
@@ -543,7 +519,7 @@ def _worker_loop(
     result_queue: Any,
 ) -> None:
     try:
-        engine = _create_rapidocr_engine(cfg, device)
+        engine = _create_rapidocr_engine(cfg, device, skip_download_lock=True)
     except BaseException:
         result_queue.put(("error", worker_id, device, traceback.format_exc()))
         return
@@ -552,9 +528,11 @@ def _worker_loop(
         try:
             task = task_queue.get()
         except (EOFError, OSError):
-            break
+            result_queue.put(("error", worker_id, device, "Task queue closed unexpectedly."))
+            return
         if task is None:
-            break
+            result_queue.put(("done", worker_id, device, None))
+            return
         chunk_out: list[tuple[int, list[dict[str, Any]], int, bool]] = []
         try:
             for sample_idx, gt_path_str in task:
@@ -564,6 +542,156 @@ def _worker_loop(
             result_queue.put(("error", worker_id, device, traceback.format_exc()))
             return
         result_queue.put(("ok", worker_id, device, chunk_out))
+
+
+def _load_checkpoint(
+    ckpt_path: Path,
+    *,
+    expected_fingerprint: str,
+    gt_entries: Sequence[str],
+) -> tuple[dict[int, tuple[list[dict[str, Any]], int, bool]], int, int]:
+    """Load completed per-sample results from a sidecar JSONL checkpoint.
+
+    Validates the run fingerprint and per-sample ``gt`` path, and safely ignores a torn
+    final line caused by a crash mid-write.
+    """
+    raw_lines = ckpt_path.read_text(encoding="utf-8").splitlines()
+    if not raw_lines:
+        return {}, 0, 0
+
+    try:
+        header = json.loads(raw_lines[0])
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Corrupted checkpoint header in {ckpt_path}; pass --no-resume to restart fresh."
+        ) from exc
+
+    if not isinstance(header, dict) or header.get("type") != "header":
+        raise ValueError(
+            f"Invalid checkpoint header in {ckpt_path}; pass --no-resume to restart fresh."
+        )
+    if header.get("version") != _CHECKPOINT_VERSION:
+        raise ValueError(
+            f"Unsupported checkpoint version {header.get('version')!r} in {ckpt_path}; "
+            "pass --no-resume to restart fresh."
+        )
+    if header.get("fingerprint") != expected_fingerprint:
+        raise ValueError(
+            f"Checkpoint {ckpt_path} does not match current input manifest or OCR parameters "
+            "(fingerprint mismatch). Pass --no-resume to overwrite the checkpoint or choose a "
+            "different --output-json."
+        )
+
+    restored: dict[int, tuple[list[dict[str, Any]], int, bool]] = {}
+    num_samples = len(gt_entries)
+    total_lines = len(raw_lines)
+    for line_no in range(1, total_lines):
+        raw_line = raw_lines[line_no].strip()
+        if not raw_line:
+            continue
+        try:
+            record = json.loads(raw_line)
+        except json.JSONDecodeError:
+            if line_no == total_lines - 1:
+                _LOGGER.warning(
+                    "[Detect] Ignoring torn trailing line %d in checkpoint %s; that sample will be re-run.",
+                    line_no + 1,
+                    ckpt_path,
+                )
+                break
+            raise ValueError(
+                f"Corrupted JSON on line {line_no + 1} of checkpoint {ckpt_path}; "
+                "pass --no-resume to restart fresh."
+            ) from None
+
+        if not isinstance(record, dict) or record.get("type") != "result":
+            continue
+        idx = record.get("idx")
+        gt_val = record.get("gt")
+        text_lines = record.get("text_lines")
+        if (
+            isinstance(idx, bool)
+            or not isinstance(idx, int)
+            or not (0 <= idx < num_samples)
+            or gt_val != gt_entries[idx]
+            or not isinstance(text_lines, list)
+        ):
+            raise ValueError(
+                f"Inconsistent checkpoint record on line {line_no + 1} of {ckpt_path} "
+                f"(idx={idx!r}, gt={gt_val!r}); pass --no-resume to restart fresh."
+            )
+        dropped = int(record.get("dropped_boxes", 0))
+        had_err = bool(record.get("had_error", False))
+        restored[idx] = (text_lines, dropped, had_err)
+
+    dropped_boxes = sum(entry[1] for entry in restored.values())
+    skipped_errors = sum(int(entry[2]) for entry in restored.values())
+    return restored, dropped_boxes, skipped_errors
+
+
+def _init_checkpoint_file(
+    ckpt_path: Path,
+    *,
+    fingerprint: str,
+    total_samples: int,
+    restored_results: dict[int, tuple[list[dict[str, Any]], int, bool]] | None = None,
+    gt_entries: Sequence[str] = (),
+) -> Any:
+    """Create or reopen the JSONL checkpoint file in append mode with a clean header."""
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    header = {
+        "type": "header",
+        "version": _CHECKPOINT_VERSION,
+        "fingerprint": fingerprint,
+        "total_samples": total_samples,
+    }
+    # Rewriting compacted valid records atomically on resume also truncates any torn trailing line.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=ckpt_path.parent,
+        prefix=f".{ckpt_path.name}.",
+        suffix=".tmp",
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(header, ensure_ascii=False) + "\n")
+            if restored_results:
+                for idx in sorted(restored_results):
+                    lines, dropped, had_err = restored_results[idx]
+                    rec = {
+                        "type": "result",
+                        "idx": idx,
+                        "gt": gt_entries[idx],
+                        "text_lines": lines,
+                        "dropped_boxes": dropped,
+                        "had_error": had_err,
+                    }
+                    handle.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        os.replace(tmp_path, ckpt_path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+    return ckpt_path.open("a", encoding="utf-8")
+
+
+def _append_checkpoint_records(
+    ckpt_handle: Any,
+    records: Sequence[tuple[int, str, list[dict[str, Any]], int, bool]],
+) -> None:
+    if ckpt_handle is None or not records:
+        return
+    for sample_idx, raw_gt, lines, dropped, had_err in records:
+        payload = {
+            "type": "result",
+            "idx": sample_idx,
+            "gt": raw_gt,
+            "text_lines": lines,
+            "dropped_boxes": dropped,
+            "had_error": had_err,
+        }
+        ckpt_handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    ckpt_handle.flush()
 
 
 def _atomic_write_json(path: Path, payload: Any, *, indent: int | None) -> None:
@@ -585,6 +713,113 @@ def _atomic_write_json(path: Path, payload: Any, *, indent: int | None) -> None:
         raise
 
 
+def _drain_multiprocess_workers(
+    procs: Sequence[Any],
+    active_devices: Sequence[str],
+    result_q: Any,
+    *,
+    total_chunks: int,
+    on_chunk: Any,
+) -> None:
+    """Consume worker results while failing fast on crashes OR premature exitcode==0 exits."""
+    completed_chunks = 0
+    finished_workers: set[int] = set()
+    num_workers = len(procs)
+
+    def _handle_msg(msg: tuple[Any, ...]) -> None:
+        nonlocal completed_chunks
+        status = msg[0]
+        if status == "error":
+            _, wid, dev, tb_text = msg
+            raise RuntimeError(f"RapidOCR worker {wid} on {dev!r} failed:\n{tb_text}")
+        if status == "done":
+            _, wid, _, _ = msg
+            finished_workers.add(int(wid))
+            return
+        if status == "ok":
+            _, _, _, chunk_out = msg
+            on_chunk(chunk_out)
+            completed_chunks += 1
+            return
+        raise RuntimeError(f"Unexpected worker message: {msg!r}.")
+
+    try:
+        while completed_chunks < total_chunks:
+            try:
+                msg = result_q.get(timeout=0.5)
+            except queue.Empty:
+                # Re-check queue non-blockingly before declaring a worker prematurely dead to
+                # avoid racing between a worker enqueuing its last message and exiting.
+                try:
+                    msg = result_q.get_nowait()
+                except queue.Empty:
+                    failed_nonzero = [
+                        (wid, active_devices[wid], proc.exitcode)
+                        for wid, proc in enumerate(procs)
+                        if not proc.is_alive() and proc.exitcode not in (0, None)
+                    ]
+                    if failed_nonzero:
+                        raise RuntimeError(
+                            f"RapidOCR worker(s) crashed unexpectedly: {failed_nonzero}."
+                        ) from None
+
+                    premature_zero = [
+                        (wid, active_devices[wid], proc.exitcode)
+                        for wid, proc in enumerate(procs)
+                        if wid not in finished_workers
+                        and not proc.is_alive()
+                        and proc.exitcode == 0
+                    ]
+                    if premature_zero:
+                        raise RuntimeError(
+                            f"RapidOCR worker(s) exited prematurely with exitcode=0 before "
+                            f"signaling completion ({completed_chunks}/{total_chunks} chunks done): "
+                            f"{premature_zero}."
+                        ) from None
+
+                    if len(finished_workers) >= num_workers or all(
+                        not proc.is_alive() for proc in procs
+                    ):
+                        raise RuntimeError(
+                            f"All RapidOCR workers exited with incomplete progress "
+                            f"({completed_chunks}/{total_chunks} chunks done)."
+                        ) from None
+                    continue
+
+            _handle_msg(msg)
+
+        # Drain remaining "done" messages so workers finish cleanly without blocking on queue pipe.
+        deadline = time.monotonic() + 30.0
+        while len(finished_workers) < num_workers and time.monotonic() < deadline:
+            try:
+                msg = result_q.get(timeout=0.2)
+            except queue.Empty:
+                if all(not proc.is_alive() for proc in procs):
+                    break
+                continue
+            _handle_msg(msg)
+    except BaseException:
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate()
+        for proc in procs:
+            proc.join(timeout=5.0)
+        raise
+    else:
+        for wid, proc in enumerate(procs):
+            proc.join(timeout=15.0)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=5.0)
+                raise RuntimeError(
+                    f"RapidOCR worker {wid} (PID={proc.pid}) failed to exit cleanly after work finished."
+                )
+            if proc.exitcode != 0:
+                raise RuntimeError(
+                    f"RapidOCR worker {wid} (PID={proc.pid}) exited with code {proc.exitcode}."
+                )
+
+
 def run_detect_manifest(
     input_json: str | Path,
     output_json: str | Path,
@@ -596,12 +831,16 @@ def run_detect_manifest(
     chunk_size: int = 16,
     config: DetectConfig | None = None,
     indent: int | None = 2,
+    resume: bool = True,
+    checkpoint_file: str | Path | None = None,
+    keep_checkpoint: bool = False,
     engine_factory: Any = None,
 ) -> DetectSummary:
     """Run offline RapidOCR detection/recognition on every ``gt`` in a manifest JSON.
 
     Existing ``text_lines`` fields are overwritten; entries without ``text_lines`` receive a new
-    ``text_lines`` list. All other fields and original sample ordering are preserved.
+    ``text_lines`` list. Progress is flushed incrementally to a sidecar JSONL checkpoint so an
+    interrupted run automatically resumes when re-invoked with ``resume=True`` (default).
     """
     cfg = config if config is not None else DetectConfig()
     if cfg.on_error not in {"raise", "skip"}:
@@ -613,6 +852,11 @@ def run_detect_manifest(
 
     in_path = Path(input_json)
     out_path = Path(output_json)
+    ckpt_path = (
+        Path(checkpoint_file)
+        if checkpoint_file is not None
+        else default_checkpoint_path(out_path)
+    )
     if not in_path.is_file():
         raise FileNotFoundError(f"Input manifest JSON not found: {in_path}")
 
@@ -623,7 +867,8 @@ def run_detect_manifest(
         )
 
     resolved_root = Path(root_dir) if root_dir is not None else None
-    tasks: list[tuple[int, str]] = []
+    all_tasks: list[tuple[int, str]] = []
+    gt_entries: list[str] = []
     overwritten = 0
     added = 0
     for idx, entry in enumerate(raw_data):
@@ -635,7 +880,8 @@ def run_detect_manifest(
         if "gt" not in entry:
             raise ValueError(f"Input manifest {in_path}[{idx}] is missing required key 'gt'.")
         gt_path = resolve_gt_path(entry["gt"], resolved_root, in_path.parent)
-        tasks.append((idx, str(gt_path)))
+        gt_entries.append(str(entry["gt"]))
+        all_tasks.append((idx, str(gt_path)))
         if "text_lines" in entry:
             overwritten += 1
         else:
@@ -650,27 +896,19 @@ def run_detect_manifest(
         # Custom factory is intended for in-process testing.
         worker_devices = [worker_devices[0]]
 
-    num_samples = len(tasks)
+    num_samples = len(all_tasks)
     start_time = time.perf_counter()
-    results_by_idx: list[list[dict[str, Any]] | None] = [None] * num_samples
-    dropped_boxes = 0
-    skipped_errors = 0
-
-    _LOGGER.info(
-        "[Detect] Starting offline RapidOCR (%s) on %d samples | workers=%d (%s) | input=%s",
-        "det-only" if cfg.det_only else "det+rec",
-        num_samples,
-        len(worker_devices),
-        ", ".join(worker_devices),
-        in_path,
-    )
 
     if num_samples == 0:
         _atomic_write_json(out_path, [], indent=indent)
+        if not keep_checkpoint:
+            ckpt_path.unlink(missing_ok=True)
         return DetectSummary(
             total_samples=0,
             overwritten_samples=0,
             added_samples=0,
+            resumed_samples=0,
+            processed_samples=0,
             total_lines=0,
             empty_samples=0,
             skipped_errors=0,
@@ -678,33 +916,98 @@ def run_detect_manifest(
             devices=tuple(worker_devices),
             elapsed_sec=max(time.perf_counter() - start_time, 1e-9),
             output_json=out_path,
+            checkpoint_path=ckpt_path if keep_checkpoint else None,
         )
+
+    fingerprint = _compute_run_fingerprint(gt_entries, cfg)
+    results_by_idx: list[list[dict[str, Any]] | None] = [None] * num_samples
+    restored_map: dict[int, tuple[list[dict[str, Any]], int, bool]] = {}
+    dropped_boxes = 0
+    skipped_errors = 0
+
+    if resume and ckpt_path.is_file():
+        restored_map, dropped_boxes, skipped_errors = _load_checkpoint(
+            ckpt_path,
+            expected_fingerprint=fingerprint,
+            gt_entries=gt_entries,
+        )
+        for idx, (lines, _, _) in restored_map.items():
+            results_by_idx[idx] = lines
+        _LOGGER.info(
+            "[Detect] Auto-resumed %d/%d completed samples from checkpoint %s.",
+            len(restored_map),
+            num_samples,
+            ckpt_path,
+        )
+    elif not resume and ckpt_path.is_file():
+        ckpt_path.unlink(missing_ok=True)
+
+    pending_tasks = [task for task in all_tasks if results_by_idx[task[0]] is None]
+    resumed_samples = len(restored_map)
+    processed_samples = len(pending_tasks)
+
+    _LOGGER.info(
+        "[Detect] Starting offline RapidOCR (%s) | total=%d | resumed=%d | pending=%d | "
+        "workers=%d (%s) | input=%s",
+        "det-only" if cfg.det_only else "det+rec",
+        num_samples,
+        resumed_samples,
+        processed_samples,
+        len(worker_devices),
+        ", ".join(worker_devices),
+        in_path,
+    )
 
     progress_bar: Any = None
     try:
         from tqdm import tqdm
 
-        progress_bar = tqdm(total=num_samples, desc="Detecting text_lines", unit="img")
+        progress_bar = tqdm(
+            total=num_samples,
+            initial=resumed_samples,
+            desc="Detecting text_lines",
+            unit="img",
+        )
     except Exception:
         progress_bar = None
 
+    ckpt_handle = _init_checkpoint_file(
+        ckpt_path,
+        fingerprint=fingerprint,
+        total_samples=num_samples,
+        restored_results=restored_map,
+        gt_entries=gt_entries,
+    )
     try:
-        if len(worker_devices) == 1 or num_samples == 1:
+        if processed_samples == 0:
+            pass
+        elif len(worker_devices) == 1 or processed_samples == 1:
             dev = worker_devices[0]
             engine = (
                 engine_factory(cfg, dev)
                 if engine_factory is not None
                 else _create_rapidocr_engine(cfg, dev)
             )
-            for sample_idx, gt_path_str in tasks:
+            for sample_idx, gt_path_str in pending_tasks:
                 lines, dropped, had_err = _process_one_image(engine, Path(gt_path_str), cfg)
                 results_by_idx[sample_idx] = lines
                 dropped_boxes += dropped
                 skipped_errors += int(had_err)
+                _append_checkpoint_records(
+                    ckpt_handle,
+                    [(sample_idx, gt_entries[sample_idx], lines, dropped, had_err)],
+                )
                 if progress_bar is not None:
                     progress_bar.update(1)
         else:
-            chunks = [tasks[i : i + chunk_size] for i in range(0, num_samples, chunk_size)]
+            # Pre-download any missing ONNX weights once on CPU so all GPU/NPU workers initialize
+            # concurrently without contending on WeakFileLock.
+            _prefetch_models_before_spawn(cfg)
+
+            chunks = [
+                pending_tasks[i : i + chunk_size]
+                for i in range(0, processed_samples, chunk_size)
+            ]
             num_workers = min(len(worker_devices), len(chunks))
             active_devices = worker_devices[:num_workers]
             worker_devices = active_devices
@@ -729,52 +1032,29 @@ def run_detect_manifest(
             for proc in procs:
                 proc.start()
 
-            completed_chunks = 0
-            try:
-                while completed_chunks < len(chunks):
-                    try:
-                        msg = result_q.get(timeout=1.0)
-                    except queue.Empty:
-                        dead = [
-                            (wid, proc.exitcode)
-                            for wid, proc in enumerate(procs)
-                            if not proc.is_alive() and proc.exitcode not in (0, None)
-                        ]
-                        if dead:
-                            raise RuntimeError(
-                                f"RapidOCR worker(s) exited unexpectedly: {dead}."
-                            ) from None
-                        continue
+            def _on_chunk(chunk_out: Sequence[tuple[int, list[dict[str, Any]], int, bool]]) -> None:
+                nonlocal dropped_boxes, skipped_errors
+                ckpt_batch: list[tuple[int, str, list[dict[str, Any]], int, bool]] = []
+                for sample_idx, lines, dropped, had_err in chunk_out:
+                    results_by_idx[sample_idx] = lines
+                    dropped_boxes += dropped
+                    skipped_errors += int(had_err)
+                    ckpt_batch.append(
+                        (sample_idx, gt_entries[sample_idx], lines, dropped, had_err)
+                    )
+                _append_checkpoint_records(ckpt_handle, ckpt_batch)
+                if progress_bar is not None:
+                    progress_bar.update(len(chunk_out))
 
-                    status = msg[0]
-                    if status == "error":
-                        _, wid, dev, tb_text = msg
-                        raise RuntimeError(
-                            f"RapidOCR worker {wid} on {dev!r} failed:\n{tb_text}"
-                        )
-                    _, _, _, chunk_out = msg
-                    for sample_idx, lines, dropped, had_err in chunk_out:
-                        results_by_idx[sample_idx] = lines
-                        dropped_boxes += dropped
-                        skipped_errors += int(had_err)
-                    completed_chunks += 1
-                    if progress_bar is not None:
-                        progress_bar.update(len(chunk_out))
-            except BaseException:
-                for proc in procs:
-                    if proc.is_alive():
-                        proc.terminate()
-                for proc in procs:
-                    proc.join(timeout=5.0)
-                raise
-            else:
-                for proc in procs:
-                    proc.join()
-                    if proc.exitcode != 0:
-                        raise RuntimeError(
-                            f"RapidOCR worker PID={proc.pid} exited with code {proc.exitcode}."
-                        )
+            _drain_multiprocess_workers(
+                procs,
+                active_devices,
+                result_q,
+                total_chunks=len(chunks),
+                on_chunk=_on_chunk,
+            )
     finally:
+        ckpt_handle.close()
         if progress_bar is not None:
             progress_bar.close()
 
@@ -793,17 +1073,22 @@ def run_detect_manifest(
             empty_samples += 1
 
     _atomic_write_json(out_path, output_records, indent=indent)
+    if not keep_checkpoint:
+        ckpt_path.unlink(missing_ok=True)
+
     elapsed = max(time.perf_counter() - start_time, 1e-9)
     _LOGGER.info(
-        "[Detect] Done: %d samples (%d lines, %d empty, %d dropped boxes, %d errors) in %.2fs "
-        "(%.2f img/s) | overwritten=%d added=%d | saved=%s",
+        "[Detect] Done: %d samples (resumed=%d, processed=%d, lines=%d, empty=%d, dropped=%d, "
+        "errors=%d) in %.2fs (%.2f img/s) | overwritten=%d added=%d | saved=%s",
         num_samples,
+        resumed_samples,
+        processed_samples,
         total_lines,
         empty_samples,
         dropped_boxes,
         skipped_errors,
         elapsed,
-        num_samples / elapsed,
+        processed_samples / elapsed if processed_samples > 0 else 0.0,
         overwritten,
         added,
         out_path,
@@ -812,6 +1097,8 @@ def run_detect_manifest(
         total_samples=num_samples,
         overwritten_samples=overwritten,
         added_samples=added,
+        resumed_samples=resumed_samples,
+        processed_samples=processed_samples,
         total_lines=total_lines,
         empty_samples=empty_samples,
         skipped_errors=skipped_errors,
@@ -819,6 +1106,7 @@ def run_detect_manifest(
         devices=tuple(worker_devices),
         elapsed_sec=elapsed,
         output_json=out_path,
+        checkpoint_path=ckpt_path if keep_checkpoint else None,
     )
 
 
@@ -826,7 +1114,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Offline multi-device RapidOCR text-line detection & recognition for SRTrainer JSON "
-            "manifests. Overwrites existing `text_lines` or inserts new `text_lines` per sample."
+            "manifests with incremental JSONL checkpointing and automatic resume."
         )
     )
     parser.add_argument(
@@ -874,6 +1162,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=16,
         help="Number of images dispatched per dynamic queue chunk (default: 16).",
+    )
+    parser.add_argument(
+        "--checkpoint-file",
+        type=Path,
+        default=None,
+        help="Optional path for incremental JSONL progress checkpoint (default: <output-json>.ckpt.jsonl).",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Ignore and discard any existing checkpoint file and start from scratch.",
+    )
+    parser.add_argument(
+        "--keep-checkpoint",
+        action="store_true",
+        help="Keep the sidecar JSONL checkpoint file after the final output JSON is written.",
     )
     parser.add_argument(
         "--det-only",
@@ -1022,6 +1326,9 @@ def main(argv: Sequence[str] | None = None) -> DetectSummary:
         chunk_size=args.chunk_size,
         config=cfg,
         indent=indent,
+        resume=not bool(args.no_resume),
+        checkpoint_file=args.checkpoint_file,
+        keep_checkpoint=bool(args.keep_checkpoint),
     )
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import hydra
 import numpy as np
@@ -24,7 +25,6 @@ from losses import GlyphLoss, OCRKLLoss
 from losses.glyph_loss import canonical_quad, rectify_text_roi
 from losses.ocr_kl_loss import (
     PPOCRv5ServerRec,
-    extract_text_strips,
     load_ppocr_recognizer,
 )
 from models import ModelEMA, VOSRModel, VOSRPipeline
@@ -564,12 +564,7 @@ def test_vosr_model_invalid_trainability_and_missing_dino_fail_fast(
 # ---------------------------------------------------------------------------
 
 
-def test_ppocr_layout_strict_load_and_text_strips(tmp_path: Path) -> None:
-    rows = torch.arange(100.0).view(1, 1, 100, 1).expand(2, 3, 100, 5)
-    strips = extract_text_strips(rows, 64, 32)
-    assert strips.shape == (6, 3, 64, 5)
-    assert strips[:, 0, :, 0].unique().tolist() == list(range(100))
-
+def test_ppocr_layout_strict_load(tmp_path: Path) -> None:
     model = PPOCRv5ServerRec(num_classes=11).eval()
     keys = [k for k in model.state_dict() if not k.endswith("num_batches_tracked")]
     assert len(keys) == 458
@@ -585,15 +580,22 @@ def test_ppocr_layout_strict_load_and_text_strips(tmp_path: Path) -> None:
         assert torch.equal(loaded(probe), model(probe))
 
 
-def test_ocr_kl_loss_rescaling_frozen_eval_and_gradients(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ocr_kl_loss_rescaling_frozen_eval_and_skips_unannotated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     torch.manual_seed(0)
-    patch_ppocr_loader(monkeypatch, recognizer=TinyRecognizer())
+    calls = 0
+
+    class _CountingRecognizer(TinyRecognizer):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            nonlocal calls
+            calls += 1
+            return super().forward(x)
+
+    patch_ppocr_loader(monkeypatch, recognizer=_CountingRecognizer())
     criterion = OCRKLLoss(
-        strip_height=16,
-        strip_stride=8,
         temperature=2.0,
         input_range="0_1",
-        use_text_lines=False,
         strip_batch_size=2,
         amp_dtype="bf16",
         use_checkpoint=True,
@@ -605,12 +607,44 @@ def test_ocr_kl_loss_rescaling_frozen_eval_and_gradients(monkeypatch: pytest.Mon
     assert criterion.recognizer.training is False
     assert all(not p.requires_grad for p in criterion.parameters())
 
-    target = torch.rand(2, 3, 40, 48)
-    assert criterion(target, target).item() == pytest.approx(0.0, abs=1e-6)
+    # Legacy strip-mode kwargs are removed and must raise TypeError
+    for removed_kwarg in (
+        {"strip_height": 64},
+        {"strip_stride": 32},
+        {"use_text_lines": False},
+        {"fallback_to_strips": True},
+    ):
+        with pytest.raises(TypeError):
+            OCRKLLoss(**removed_kwarg)  # type: ignore[arg-type]
 
+    target = torch.rand(2, 3, 40, 48)
     pred = (target + 0.25 * torch.randn_like(target)).clamp(0.0, 1.0).requires_grad_(True)
+
+    # Unannotated batch (batch=None or no 'text_lines' key) -> gracefully skipped (0 loss, 0 grad)
+    val_no_batch = criterion(pred, target)
+    assert val_no_batch.item() == 0.0
+    assert criterion.last_counts == (0, 0)
+    assert calls == 0
+    val_no_batch.backward()
+    assert pred.grad is not None and torch.count_nonzero(pred.grad) == 0
+
+    pred.grad = None
+    val_missing_key = criterion(pred, target, batch={"gt": target})
+    assert val_missing_key.item() == 0.0
+    assert criterion.last_counts == (0, 0)
+    assert calls == 0
+    val_missing_key.backward()
+    assert pred.grad is not None and torch.count_nonzero(pred.grad) == 0
+
+    # Annotated batch -> exact zero on identical inputs, positive finite loss + grads on mismatch
+    pred.grad = None
+    lines = [
+        [{"bbox": [2, 4, 44, 20]}],
+        [{"bbox": [4, 18, 42, 34]}],
+    ]
+    assert criterion(target, target, text_lines=lines).item() == pytest.approx(0.0, abs=1e-6)
     with torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16):
-        val = criterion(pred, target)
+        val = criterion(pred, target, batch={"text_lines": lines})
     assert val.ndim == 0 and val.item() > 1e-4
     val.backward()
     assert pred.grad is not None and torch.isfinite(pred.grad).all()
@@ -618,30 +652,38 @@ def test_ocr_kl_loss_rescaling_frozen_eval_and_gradients(monkeypatch: pytest.Mon
     assert all(p.grad is None for p in criterion.parameters())
 
 
-def test_ocr_kl_loss_strip_chunk_and_checkpoint_invariance(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ocr_kl_loss_chunk_and_checkpoint_invariance(monkeypatch: pytest.MonkeyPatch) -> None:
     torch.manual_seed(7)
     rec = TinyRecognizer(num_classes=11)
     patch_ppocr_loader(monkeypatch, recognizer=rec)
 
-    target = torch.rand(2, 3, 40, 48)
+    target = torch.rand(2, 3, 64, 96)
     pred_base = (target + 0.3 * torch.randn_like(target)).clamp(0.0, 1.0)
+    # Same-width boxes across both images so chunk size does not change padding width
+    lines = [
+        [
+            {"bbox": [4, 4, 52, 20]},
+            {"bbox": [4, 24, 52, 40]},
+            {"bbox": [4, 44, 52, 60]},
+        ],
+        [
+            {"bbox": [10, 8, 58, 24]},
+            {"bbox": [10, 32, 58, 48]},
+        ],
+    ]
 
     loss_ref = OCRKLLoss(
-        strip_height=16,
-        strip_stride=8,
         temperature=1.5,
-        use_text_lines=False,
         strip_batch_size=16,
+        width_bucket_step=16,
         amp_dtype="fp32",
         use_checkpoint=False,
         sync_ddp_counts=False,
     )
     loss_chunked = OCRKLLoss(
-        strip_height=16,
-        strip_stride=8,
         temperature=1.5,
-        use_text_lines=False,
         strip_batch_size=2,
+        width_bucket_step=16,
         amp_dtype="fp32",
         use_checkpoint=True,
         sync_ddp_counts=False,
@@ -649,8 +691,8 @@ def test_ocr_kl_loss_strip_chunk_and_checkpoint_invariance(monkeypatch: pytest.M
 
     p1 = pred_base.clone().requires_grad_(True)
     p2 = pred_base.clone().requires_grad_(True)
-    v1 = loss_ref(p1, target)
-    v2 = loss_chunked(p2, target)
+    v1 = loss_ref(p1, target, batch={"text_lines": lines})
+    v2 = loss_chunked(p2, target, batch={"text_lines": lines})
     torch.testing.assert_close(v1, v2)
     v1.backward()
     v2.backward()
@@ -658,7 +700,7 @@ def test_ocr_kl_loss_strip_chunk_and_checkpoint_invariance(monkeypatch: pytest.M
     torch.testing.assert_close(p1.grad, p2.grad)
 
 
-def test_ocr_kl_loss_text_lines_chunked_bf16_vertical_empty_and_max_lines(
+def test_ocr_kl_loss_text_lines_chunked_bf16_vertical_mixed_and_max_lines(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     torch.manual_seed(11)
@@ -677,7 +719,6 @@ def test_ocr_kl_loss_text_lines_chunked_bf16_vertical_empty_and_max_lines(
     criterion = OCRKLLoss(
         temperature=1.0,
         input_range="0_1",
-        use_text_lines=True,
         strip_batch_size=2,
         max_lines_per_image=3,
         max_strip_width=128,
@@ -688,16 +729,14 @@ def test_ocr_kl_loss_text_lines_chunked_bf16_vertical_empty_and_max_lines(
     )
     assert criterion.needs_batch is True
 
-    target = torch.rand(2, 3, 64, 96)
+    target = torch.rand(3, 3, 64, 96)
     pred = (target + 0.25 * torch.randn_like(target)).clamp(0.0, 1.0).requires_grad_(True)
 
-    # Missing text_lines raises fail-fast when fallback_to_strips=False
-    with pytest.raises(ValueError, match="text_lines"):
-        criterion(pred, target)
-
-    # Image 0 has 4 valid lines (capped to 3 by max_lines_per_image), incl. one vertical line and
-    # one ignored line; Image 1 has 1 line in the top-left corner only.
-    batch_lines = [
+    # Mixed batch:
+    # - Image 0 has 4 valid lines (capped to 3 by max_lines_per_image), incl. one vertical line
+    # - Image 1 has 1 line in the top-left corner only
+    # - Image 2 has NO text_lines (unannotated sample in a mixed batch) -> must get 0 grad
+    batch_lines: list[list[dict[str, Any]] | None] = [
         [
             {"transcript": "line0", "bbox": [2, 2, 50, 18]},
             {"transcript": "line1", "bbox": [2, 20, 74, 36]},
@@ -709,10 +748,11 @@ def test_ocr_kl_loss_text_lines_chunked_bf16_vertical_empty_and_max_lines(
         [
             {"transcript": "img1_line", "bbox": [0, 0, 32, 16]},
         ],
+        None,
     ]
 
     val = criterion(pred, target, batch={"text_lines": batch_lines})
-    assert criterion.last_counts[0] == 4  # 3 (capped from 4) + 1
+    assert criterion.last_counts[0] == 4  # 3 (capped from 4) + 1 + 0
     assert criterion.last_counts[1] > 0
     assert val.ndim == 0 and val.item() > 0.0
     assert observed_batch_sizes and max(observed_batch_sizes) <= 2
@@ -724,18 +764,20 @@ def test_ocr_kl_loss_text_lines_chunked_bf16_vertical_empty_and_max_lines(
     assert pred.grad[1, :, :18, :34].abs().sum().item() > 0.0
     # Region far outside image 1's single text box must receive zero gradient.
     assert torch.count_nonzero(pred.grad[1, :, 32:, 48:]) == 0
+    # Unannotated image 2 must receive strictly zero gradient.
+    assert torch.count_nonzero(pred.grad[2]) == 0
 
     # Empty text_lines batch -> connected zero loss and zero grad without calling recognizer
     pred.grad = None
     observed_batch_sizes.clear()
-    empty_val = criterion(pred, target, batch={"text_lines": [[], []]})
+    empty_val = criterion(pred, target, batch={"text_lines": [[], [], []]})
     assert criterion.last_counts == (0, 0)
     assert empty_val.item() == 0.0
     assert observed_batch_sizes == []
     empty_val.backward()
     assert pred.grad is not None and torch.count_nonzero(pred.grad) == 0
 
-    # Identical pred & target produces exact zero KL under text_lines mode
+    # Identical pred & target produces exact zero KL
     assert criterion(target, target, batch={"text_lines": batch_lines}).item() == pytest.approx(
         0.0, abs=1e-6
     )
@@ -1105,9 +1147,9 @@ def test_end_to_end_trainer_vosr2_with_ocr_kl_and_glyph_losses_and_per_arch_savi
                     "weight": 0.1,
                     "criterion": {
                         "_target_": "losses.OCRKLLoss",
-                        "strip_height": 16,
-                        "strip_stride": 16,
                         "temperature": 1.0,
+                        "strip_batch_size": 2,
+                        "amp_dtype": "bf16",
                     },
                 },
                 "glyph": {

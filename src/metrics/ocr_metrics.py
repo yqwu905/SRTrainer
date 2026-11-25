@@ -17,7 +17,6 @@ from __future__ import annotations
 import hashlib
 import math
 import numbers
-import os
 import threading
 import unicodedata
 from collections import OrderedDict
@@ -29,6 +28,22 @@ from typing import Any
 import numpy as np
 import torch
 
+from utils.rapidocr import (
+    CLS_MODELS as _CLS_MODELS,
+)
+from utils.rapidocr import (
+    DEFAULT_REC_MODEL as DEFAULT_OCR_MODEL,
+)
+from utils.rapidocr import (
+    REC_MODELS as _REC_MODELS,
+)
+from utils.rapidocr import (
+    create_rapidocr_engine,
+    get_rapidocr_model_root,
+    import_rapidocr,
+    onnx_device_params,
+    resolve_onnx_model,
+)
 from utils.text_geometry import canonical_quad
 
 from .base import BaseMetric
@@ -48,7 +63,6 @@ __all__ = [
     "OneMinusNEDMetric",
 ]
 
-DEFAULT_OCR_MODEL: str = "PP-OCRv5_server_rec"
 IGNORED_TRANSCRIPTIONS: frozenset[str] = frozenset({"###", "*"})
 
 _TRANSCRIPT_KEYS: tuple[str, ...] = ("transcript", "transcription", "text")
@@ -136,15 +150,7 @@ def _import_cv2() -> Any:
 
 
 def _import_rapidocr() -> tuple[Any, Any]:
-    try:
-        import onnxruntime
-        import rapidocr
-    except ImportError as exc:
-        raise ImportError(
-            "OCR metrics require RapidOCR and ONNX Runtime. Install optional OCR dependencies "
-            "with `uv sync --extra ocr`."
-        ) from exc
-    return rapidocr, onnxruntime
+    return import_rapidocr(context="OCR metrics")
 
 
 def _contains_bool(obj: Any) -> bool:
@@ -564,77 +570,6 @@ def _extract_ocr_instances(
     )
 
 
-_REC_MODELS = {
-    "PP-OCRv4_server_rec": ("PP-OCRv4", "server"),
-    "PP-OCRv4_mobile_rec": ("PP-OCRv4", "mobile"),
-    DEFAULT_OCR_MODEL: ("PP-OCRv5", "server"),
-    "PP-OCRv5_mobile_rec": ("PP-OCRv5", "mobile"),
-}
-_CLS_MODELS = {
-    "PP-LCNet_x1_0_textline_ori": ("PP-OCRv5", "server"),
-    "PP-LCNet_x0_25_textline_ori": ("PP-OCRv5", "mobile"),
-}
-
-
-def _resolve_onnx_model(
-    model_name: str,
-    model_dir: str | Path | None,
-    role_label: str,
-    known_models: Mapping[str, tuple[str, str]],
-) -> tuple[str, str, Path | None]:
-    if model_dir is None:
-        if model_name not in known_models:
-            raise ValueError(
-                f"Unknown OCR {role_label} model {model_name!r}. Available for automatic "
-                f"download: {', '.join(known_models)}. To use other weights, supply an ONNX model."
-            )
-        version, model_type = known_models[model_name]
-        return version, model_type, None
-
-    path = Path(model_dir).expanduser()
-    if path.is_dir():
-        named_model = path / f"{model_name}.onnx"
-        candidates = sorted(candidate for candidate in path.glob("*.onnx") if candidate.is_file())
-        if named_model in candidates:
-            path = named_model
-        elif len(candidates) == 1:
-            path = candidates[0]
-        elif candidates:
-            raise ValueError(f"Multiple ONNX models in {path}. Specify the {role_label} ONNX file.")
-    if path.suffix.lower() != ".onnx" or not path.is_file():
-        raise FileNotFoundError(
-            f"OCR {role_label} ONNX model not found at {path}. Supply an .onnx file or "
-            "a directory containing the ONNX export of your model."
-        )
-    version, model_type = known_models.get(model_name, ("PP-OCRv5", "server"))
-    return version, model_type, path
-
-
-def _onnx_device_params(device: str | None, onnxruntime: Any) -> dict[str, Any]:
-    name, separator, device_id = (device or "cpu").partition(":")
-    if name == "cpu" and not separator:
-        return {}
-    providers = {
-        "gpu": ("cuda", "CUDAExecutionProvider"),
-        "cuda": ("cuda", "CUDAExecutionProvider"),
-        "npu": ("cann", "CANNExecutionProvider"),
-    }
-    if name not in providers or (separator and not device_id.isdecimal()):
-        raise ValueError(
-            f"Unsupported OCR device {device!r}. Use cpu, gpu[:ID], cuda[:ID], or npu[:ID]."
-        )
-    flag, provider = providers[name]
-    if provider not in onnxruntime.get_available_providers():
-        raise ValueError(
-            f"OCR device {device!r} requires {provider}. Install an ONNX Runtime build with "
-            'that provider or set ocr_device="cpu".'
-        )
-    return {
-        f"EngineConfig.onnxruntime.use_{flag}": True,
-        f"EngineConfig.onnxruntime.{flag}_ep_cfg.device_id": int(device_id or 0),
-    }
-
-
 class RapidOCRTextRecognizer:
     """Batched RapidOCR text recognition on BGR crops with optional 0/180-deg orientation."""
 
@@ -654,18 +589,17 @@ class RapidOCRTextRecognizer:
         if cls_model_dir is not None and cls_model_name is None:
             raise ValueError("cls_model_dir requires cls_model_name to be specified.")
 
-        rec_version, rec_type, rec_path = _resolve_onnx_model(
+        rec_version, rec_type, rec_path = resolve_onnx_model(
             clean_model_name, model_dir, "recognition", _REC_MODELS
         )
         cls_model = (
-            _resolve_onnx_model(cls_model_name, cls_model_dir, "orientation", _CLS_MODELS)
+            resolve_onnx_model(cls_model_name, cls_model_dir, "orientation", _CLS_MODELS)
             if cls_model_name is not None
             else None
         )
         self.use_cls = cls_model is not None
         rapidocr, onnxruntime = _import_rapidocr()
-        cache_root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
-        model_root = cache_root / "srtrainer" / "rapidocr"
+        model_root = get_rapidocr_model_root()
         params: dict[str, Any] = {
             "Global.use_det": False,
             "Global.use_cls": self.use_cls,
@@ -676,16 +610,20 @@ class RapidOCRTextRecognizer:
             "Rec.lang_type": "ch",
             "Rec.model_path": str(rec_path) if rec_path is not None else None,
             "Rec.rec_batch_num": self.batch_size,
-            **_onnx_device_params(device, onnxruntime),
+            **onnx_device_params(device, onnxruntime, cpu_fallback_hint='ocr_device="cpu"'),
         }
         if rec_path is not None:
             dict_path = rec_path.with_name("dict.txt")
             if dict_path.is_file():
                 params["Rec.rec_keys_path"] = str(dict_path)
-        needs_download = rec_path is None
+
+        download_keys: list[str] = []
+        if rec_path is None:
+            download_keys.append(f"rec:{rec_version}:{rec_type}:ch")
         if cls_model is not None:
             cls_version, cls_type, cls_path = cls_model
-            needs_download |= cls_path is None
+            if cls_path is None:
+                download_keys.append(f"cls:{cls_version}:{cls_type}")
             params.update(
                 {
                     "Cls.engine_type": rapidocr.EngineType.ONNXRUNTIME,
@@ -697,24 +635,17 @@ class RapidOCRTextRecognizer:
                     "Cls.cls_thresh": -1.0,
                 }
             )
-        self.engine = rapidocr.RapidOCR(params=params)
-        # RapidOCR downloads directly to the final path. Serialize the first call across ranks.
-        self._download_lock = model_root / ".download.lock" if needs_download else None
+        self.engine = create_rapidocr_engine(
+            params,
+            rapidocr=rapidocr,
+            model_root=model_root,
+            download_keys=download_keys,
+        )
 
     def __call__(self, crops: Sequence[np.ndarray]) -> list[tuple[str, float]]:
         crop_list = list(crops)
         if not crop_list:
             return []
-
-        lock_path = self._download_lock
-        if lock_path is not None:
-            from huggingface_hub.utils import WeakFileLock
-
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-            with WeakFileLock(lock_path):
-                outputs = self._recognize(crop_list)
-            self._download_lock = None
-            return outputs
         return self._recognize(crop_list)
 
     def _recognize(self, crops: list[np.ndarray]) -> list[tuple[str, float]]:
