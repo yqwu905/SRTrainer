@@ -22,6 +22,7 @@ from config import (
     InferRootConfig,
     InferSettingsConfig,
     KernelConfig,
+    LoRAConfig,
     MetricConfig,
     MixedPrecision,
     NoiseInput,
@@ -150,6 +151,10 @@ def test_single_source_of_truth_defaults_match_composed_yamls() -> None:
     assert train_cfg.scale == default_train.scale
     assert train_cfg.seed == default_train.seed
     assert train_cfg.model.ema.decay == default_model.ema.decay
+    assert train_cfg.model.lora.enable is False
+    assert train_cfg.model.lora.lora_rank == default_model.lora.lora_rank == 32
+    assert train_cfg.model.lora.lora_alpha == default_model.lora.lora_alpha == 32.0
+    assert train_cfg.model.lora.checkpoint is None
     assert train_cfg.model.noise_input == default_model.noise_input
     assert train_cfg.trainer.total_iters == default_trainer.total_iters
     assert train_cfg.trainer.mixed_precision == default_trainer.mixed_precision
@@ -215,6 +220,11 @@ def test_unified_yaml_rejects_polymorphic_and_unknown_fields(tmp_path: Path) -> 
     with pytest.raises(ConfigValidationError, match="extra_net"):
         load_train_config(raw_unknown_trainable)
 
+    raw_unknown_lora = _minimal_train_dict(tmp_path)
+    raw_unknown_lora["model"]["lora"] = {"enable": True, "unknown_key": 1}
+    with pytest.raises(ConfigValidationError, match="unknown_key"):
+        load_train_config(raw_unknown_lora)
+
     raw_legacy_mode = _minimal_train_dict(tmp_path)
     raw_legacy_mode["data"]["sources"][0]["mode"] = "gt_only"
     with pytest.raises(ConfigValidationError, match="mode"):
@@ -262,6 +272,25 @@ def test_business_range_and_cross_field_validations(tmp_path: Path) -> None:
     raw["model"]["ema"]["decay"] = 1.1
     with pytest.raises(ConfigValidationError, match="ema.decay"):
         load_train_config(raw)
+
+    # lora validation (lora_rank, lora_alpha, checkpoint)
+    raw = _minimal_train_dict(tmp_path)
+    raw["model"]["lora"] = {"enable": True, "lora_rank": 0}
+    with pytest.raises(ConfigValidationError, match="lora_rank"):
+        load_train_config(raw)
+
+    raw = _minimal_train_dict(tmp_path)
+    raw["model"]["lora"] = {"enable": True, "lora_alpha": 0.0}
+    with pytest.raises(ConfigValidationError, match="lora_alpha"):
+        load_train_config(raw)
+
+    raw = _minimal_train_dict(tmp_path)
+    raw["model"]["lora"] = {"enable": True, "checkpoint": "   "}
+    with pytest.raises(ConfigValidationError, match="lora.checkpoint"):
+        load_train_config(raw)
+
+    with pytest.raises(ConfigValidationError, match="lora_rank"):
+        load_infer_config({"model": {"lora": {"enable": True, "lora_rank": -4}}})
 
     # All VOSR components frozen
     raw = _minimal_train_dict(tmp_path)
@@ -326,6 +355,7 @@ def test_centralized_validation_returns_typed_dataclasses_and_roundtrips(tmp_pat
 
     assert isinstance(typed, TrainConfig)
     assert isinstance(typed.model, VOSRModelConfig)
+    assert isinstance(typed.model.lora, LoRAConfig)
     assert isinstance(typed.model.ema, EMAConfig)
     assert isinstance(typed.data, DataConfig)
     assert isinstance(typed.data.sources[0], DataSourceConfig)

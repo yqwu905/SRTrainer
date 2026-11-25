@@ -17,6 +17,7 @@ from torch import nn
 
 from config.schema import (
     VOSR_COMPONENTS,
+    LoRAConfig,
     NoiseInput,
     TrainConfig,
     VOSRModelConfig,
@@ -30,7 +31,7 @@ from utils.misc import load_weights, pad_to_multiple, strip_state_dict_prefix, u
 if TYPE_CHECKING:
     from accelerate import Accelerator
 
-__all__ = ["VOSRModel", "VOSRPipeline"]
+__all__ = ["VOSRModel", "VOSRPipeline", "attach_dit_lora", "should_attach_dit_lora"]
 
 
 def _move_to_device(obj: Any, device: torch.device, non_blocking: bool = True) -> Any:
@@ -87,6 +88,62 @@ def _load_component_weights(
     if callable(loader):
         return loader(path, strict=strict, key=key)
     return load_weights(module, path, strict=strict, key=key)
+
+
+def attach_dit_lora(
+    dit: nn.Module,
+    lora_cfg: LoRAConfig,
+) -> nn.Module:
+    """Attach LoRA adapters to DiT (stub placeholder for custom LoRA injection).
+
+    Args:
+        dit: Instantiated DiT module (with base pretrained weights already loaded).
+        lora_cfg: Typed ``LoRAConfig`` specifying ``lora_rank``, ``lora_alpha``, etc.
+
+    Returns:
+        The DiT module with LoRA layers attached (modified in-place or wrapped).
+    """
+    # TODO: Implement custom DiT LoRA injection logic here.
+    del lora_cfg
+    return dit
+
+
+def should_attach_dit_lora(model_cfg: VOSRModelConfig) -> bool:
+    """Return ``True`` iff DiT is trainable and ``model.lora.enable`` is ``True``."""
+    return bool(model_cfg.trainable.dit and model_cfg.lora.enable)
+
+
+def _apply_dit_lora(dit: nn.Module, lora_cfg: LoRAConfig) -> nn.Module:
+    """Invoke ``attach_dit_lora`` and validate/normalize its return value."""
+    attached = attach_dit_lora(dit, lora_cfg)
+    if attached is None:
+        return dit
+    if not isinstance(attached, nn.Module):
+        raise TypeError(
+            f"attach_dit_lora() must return an nn.Module or None, got {type(attached).__name__}."
+        )
+    return attached
+
+
+def _set_dit_lora_trainable_params(
+    dit: nn.Module,
+    base_param_ids: set[int],
+) -> list[nn.Parameter]:
+    """Freeze all non-LoRA parameters on ``dit`` and unfreeze only LoRA parameters."""
+    named_params = list(dit.named_parameters())
+    has_named_lora = any("lora" in name.lower() for name, _ in named_params)
+
+    trainable_params: list[nn.Parameter] = []
+    for name, param in named_params:
+        is_lora_param = (
+            ("lora" in name.lower())
+            if has_named_lora
+            else (id(param) not in base_param_ids)
+        )
+        param.requires_grad_(is_lora_param)
+        if is_lora_param:
+            trainable_params.append(param)
+    return trainable_params
 
 
 class VOSRPipeline(nn.Module):
@@ -329,6 +386,7 @@ class VOSRModel(BaseModel):
         self.model_cfg: VOSRModelConfig = m
         self.scale: int = m.scale
         self.trainable: dict[str, bool] = m.trainable.as_dict()
+        self.lora: LoRAConfig = m.lora
         self.noise_input: str = m.noise_input.value
         self.posterior_mode: bool = m.posterior_mode
         self.clamp_decode_in_train: bool = m.clamp_decode_in_train
@@ -375,6 +433,10 @@ class VOSRModel(BaseModel):
     @property
     def trainable_components(self) -> tuple[str, ...]:
         return tuple(name for name in self._active_components if self.trainable.get(name, False))
+
+    @property
+    def dit_lora_enabled(self) -> bool:
+        return should_attach_dit_lora(self.model_cfg)
 
     def get_component(self, name: str, *, use_ema: bool = False) -> nn.Module | None:
         """Return an unwrapped component arch (``vae`` / ``dit`` / ``dino``), optionally EMA."""
@@ -541,22 +603,62 @@ class VOSRModel(BaseModel):
                         unexpected_keys,
                     )
 
+        # Step 2.5: Optional DiT LoRA attachment & checkpoint loading (only when dit is trainable).
+        dit_lora_active = should_attach_dit_lora(self.model_cfg)
+        dit_base_param_ids: set[int] = set()
+        if dit_lora_active:
+            dit_mod = raw_components["dit"]
+            dit_base_param_ids = {id(p) for p in dit_mod.parameters()}
+            dit_mod.requires_grad_(False)
+            dit_mod = _apply_dit_lora(dit_mod, self.lora)
+            raw_components["dit"] = dit_mod
+            if self.lora.checkpoint is not None:
+                missing_keys, unexpected_keys = load_weights(
+                    dit_mod,
+                    Path(self.lora.checkpoint),
+                    strict=False,
+                )
+                if accelerator.is_main_process:
+                    logger.info(
+                        "[Model] Loaded DiT LoRA checkpoint from %s (rank=%d, alpha=%g).",
+                        self.lora.checkpoint,
+                        self.lora.lora_rank,
+                        self.lora.lora_alpha,
+                    )
+                    if missing_keys or unexpected_keys:
+                        logger.warning(
+                            "[Model] DiT LoRA checkpoint load summary: missing=%d %s, unexpected=%d %s.",
+                            len(missing_keys),
+                            missing_keys,
+                            len(unexpected_keys),
+                            unexpected_keys,
+                        )
+
         # Step 3: Apply per-arch trainability switches BEFORE EMA / compile / DDP.
         trainable_names: list[str] = []
         trainable_params: list[nn.Parameter] = []
         for comp_name in active_components:
             comp_mod = raw_components[comp_name]
             if self.trainable[comp_name]:
-                comp_mod.requires_grad_(True)
-                freeze_unused = getattr(comp_mod, "freeze_unused_parameters", None)
-                if callable(freeze_unused):
-                    freeze_unused()
-                comp_params = [p for p in comp_mod.parameters() if p.requires_grad]
-                if not comp_params:
-                    raise ValueError(
-                        f"Component {comp_name!r} is marked trainable=True but has no parameters "
-                        "with requires_grad=True."
-                    )
+                if comp_name == "dit" and dit_lora_active:
+                    comp_params = _set_dit_lora_trainable_params(comp_mod, dit_base_param_ids)
+                    if not comp_params:
+                        raise ValueError(
+                            "Component 'dit' has trainable=True and model.lora.enable=True, "
+                            "but no trainable LoRA parameters were found after attach_dit_lora(). "
+                            "Implement attach_dit_lora() to inject LoRA parameters into DiT."
+                        )
+                else:
+                    comp_mod.requires_grad_(True)
+                    freeze_unused = getattr(comp_mod, "freeze_unused_parameters", None)
+                    if callable(freeze_unused):
+                        freeze_unused()
+                    comp_params = [p for p in comp_mod.parameters() if p.requires_grad]
+                    if not comp_params:
+                        raise ValueError(
+                            f"Component {comp_name!r} is marked trainable=True but has no parameters "
+                            "with requires_grad=True."
+                        )
                 trainable_names.append(comp_name)
                 trainable_params.extend(comp_params)
             else:
@@ -623,11 +725,12 @@ class VOSRModel(BaseModel):
         if accelerator.is_main_process:
             frozen_names = [n for n in active_components if n not in trainable_names]
             logger.info(
-                "[Model] VOSRModel ready | active=%s | trainable=%s | frozen=%s | ema=%s",
+                "[Model] VOSRModel ready | active=%s | trainable=%s | frozen=%s | ema=%s | dit_lora=%s",
                 list(active_components),
                 trainable_names,
                 frozen_names,
                 list(emas.keys()),
+                dit_lora_active,
             )
 
         self.accelerator = accelerator

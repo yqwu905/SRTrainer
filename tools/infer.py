@@ -30,11 +30,14 @@ from config import (
     load_structured_config,
     register_configs,
 )
+from config.validation import _validate_lora_config
 from engine.inferencer import TiledInferencer
 from models.vosr_model import (
     VOSRPipeline,
+    _apply_dit_lora,
     _clone_arch_cfg_skip_pretrained,
     _load_component_weights,
+    should_attach_dit_lora,
 )
 from utils.config import load_resolved_config
 from utils.image import IMAGE_EXTENSIONS, load_image, save_image
@@ -204,6 +207,7 @@ def _extract_exp_subconfigs(
         if raw_model is not None
         else VOSRModelConfig()
     )
+    _validate_lora_config(model_cfg.lora)
     raw_metric = train_cfg.get("metric", None)
     metric_cfg = (
         load_structured_config(MetricConfig, raw_metric, context="config_resolved.metric")
@@ -848,6 +852,8 @@ def _build_infer_model(
     accelerator: Accelerator,
 ) -> nn.Module:
     if resolved.component_weights is not None:
+        model_cfg = resolved.model_cfg or VOSRModelConfig(scale=resolved.scale)
+        dit_lora_active = should_attach_dit_lora(model_cfg)
         comp_modules: dict[str, nn.Module] = {}
         comp_keys = resolved.component_weights_keys or {}
         for comp in VOSR_COMPONENTS:
@@ -866,16 +872,31 @@ def _build_infer_model(
                 raise TypeError(
                     f"Instantiated arch.{comp} must be torch.nn.Module, got {type(comp_mod).__name__}."
                 )
+            if comp == "dit" and dit_lora_active:
+                comp_mod = _apply_dit_lora(comp_mod, model_cfg.lora)
             if weight_path is not None:
-                _load_component_weights(
+                if comp == "dit" and dit_lora_active:
+                    load_weights(
+                        comp_mod,
+                        weight_path,
+                        strict=True,
+                        key=comp_keys.get(comp),
+                    )
+                else:
+                    _load_component_weights(
+                        comp_mod,
+                        weight_path,
+                        strict=True,
+                        key=comp_keys.get(comp),
+                    )
+            elif comp == "dit" and dit_lora_active and model_cfg.lora.checkpoint is not None:
+                load_weights(
                     comp_mod,
-                    weight_path,
-                    strict=True,
-                    key=comp_keys.get(comp),
+                    Path(model_cfg.lora.checkpoint),
+                    strict=False,
                 )
             comp_modules[comp] = comp_mod
 
-        model_cfg = resolved.model_cfg or VOSRModelConfig(scale=resolved.scale)
         model: nn.Module = VOSRPipeline.from_model_config(
             vae=comp_modules["vae"],
             dit=comp_modules["dit"],
