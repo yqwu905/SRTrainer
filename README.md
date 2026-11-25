@@ -139,7 +139,9 @@ uv run python tools/infer.py \
   arch/dit=vosr2_dit \
   arch/dino=dinov2_vitl14 \
   scale=1 \
-  '++infer.weights_path={vae:/path/to/vae.safetensors,dit:/path/to/dit.safetensors,dino:/path/to/dino.safetensors}' \
+  infer.weights_path.vae=/path/to/vae.safetensors \
+  infer.weights_path.dit=/path/to/dit.safetensors \
+  infer.weights_path.dino=/path/to/dino.safetensors \
   infer.input=/data/test.png \
   infer.tile.size=512 \
   infer.tile.overlap=64

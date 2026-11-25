@@ -935,9 +935,35 @@ def test_infer_mode2_standalone_safetensors_pth_and_errors(tmp_path: Path) -> No
                 [
                     "arch/vae=qwen_vae2d",
                     "arch/dit=vosr2_dit",
-                    f"++infer.weights_path={{dit:{tmp_path / 'missing.safetensors'}}}",
+                    f"infer.weights_path.dit={tmp_path / 'missing.safetensors'}",
                     f"infer.input={in_img}",
                     f"infer.output_dir={tmp_path / 'e_missing_w'}",
+                ]
+            )
+        )
+
+    with pytest.raises(ValueError, match="infer.weights_path.vae"):
+        infer_mod.run_infer(
+            _compose_infer(
+                [
+                    "arch/vae=qwen_vae2d",
+                    "arch/dit=vosr2_dit",
+                    f"infer.weights_path={st_path}",
+                    f"infer.input={in_img}",
+                    f"infer.output_dir={tmp_path / 'e_scalar_multi'}",
+                ]
+            )
+        )
+
+    with pytest.raises(ValueError, match="per-component overrides"):
+        infer_mod.run_infer(
+            _compose_infer(
+                [
+                    dummy_arch_ov,
+                    "scale=2",
+                    f"infer.weights_path.dit={st_path}",
+                    f"infer.input={in_img}",
+                    f"infer.output_dir={tmp_path / 'e_comp_single'}",
                 ]
             )
         )
@@ -1167,7 +1193,8 @@ def test_infer_vosr_multi_arch_exp_dir_and_standalone(tmp_path: Path) -> None:
             "++arch={vae:{_target_:tests.dummy_arch.DummyVAE,z_dim:4,spatial_compression_ratio:2},"
             "dit:{_target_:tests.dummy_arch.DummyDiT,in_channels:8,out_channels:4,patch_size:2,hidden_ch:8,z_dims:null},"
             "dino:null}",
-            f"++infer.weights_path={{vae:{vae_nd_path},dit:{dit_nd_path}}}",
+            f"infer.weights_path.vae={vae_nd_path}",
+            f"infer.weights_path.dit={dit_nd_path}",
             f"infer.input={in_img}",
             f"infer.output_dir={out_standalone}",
             "infer.mixed_precision=no",
@@ -1179,6 +1206,48 @@ def test_infer_vosr_multi_arch_exp_dir_and_standalone(tmp_path: Path) -> None:
     assert sum_nd.mode == "standalone"
     assert sum_nd.weights_path == dit_nd_path
     assert (load_image(out_standalone / "vosr_in.png") - ref_nd).abs().max().item() <= (1.0 / 255.0) + 1e-5
+
+    # 6. Mode 1 partial component override via dot notation (`infer.weights_path.dit=...` + `infer.weights_key.dit=...`)
+    dit_override_pth = tmp_path / "override_dit.pth"
+    torch.save({"params_ema": sd_best["dit"], "params": sd_latest["dit"]}, dit_override_pth)
+    out_partial = tmp_path / "vosr_out_partial_override"
+    sum_partial = infer_mod.run_infer(
+        _compose_infer(
+            [
+                f"infer.exp_dir={exp_dir}",
+                f"infer.weights_path.dit={dit_override_pth}",
+                "infer.weights_key.dit=params_ema",
+                f"infer.input={in_img}",
+                f"infer.output_dir={out_partial}",
+                "infer.use_ema=false",
+                "infer.mixed_precision=no",
+                "infer.tile.overlap=4",
+            ]
+        )
+    )
+    assert sum_partial.weights_path == dit_override_pth
+    assert sum_partial.component_weights is not None
+    assert sum_partial.component_weights["dit"] == dit_override_pth
+    assert sum_partial.component_weights["vae"] == weights_dir / "latest_vae.safetensors"
+    assert sum_partial.component_weights["dino"] == weights_dir / "latest_dino.safetensors"
+
+    # 7. Providing inactive component override (`infer.weights_path.dino=...` when `arch.dino=null`) raises ValueError
+    with pytest.raises(ValueError, match="arch.dino is not active"):
+        infer_mod.run_infer(
+            _compose_infer(
+                [
+                    "scale=2",
+                    "++arch={vae:{_target_:tests.dummy_arch.DummyVAE,z_dim:4,spatial_compression_ratio:2},"
+                    "dit:{_target_:tests.dummy_arch.DummyDiT,in_channels:8,out_channels:4,patch_size:2,hidden_ch:8,z_dims:null},"
+                    "dino:null}",
+                    f"infer.weights_path.vae={vae_nd_path}",
+                    f"infer.weights_path.dit={dit_nd_path}",
+                    f"infer.weights_path.dino={dit_nd_path}",
+                    f"infer.input={in_img}",
+                    f"infer.output_dir={tmp_path / 'vosr_err_inactive_dino'}",
+                ]
+            )
+        )
 
 
 def test_infer_input_output_modes_single_dir_recursive_and_json(tmp_path: Path) -> None:

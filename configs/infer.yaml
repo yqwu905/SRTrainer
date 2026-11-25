@@ -9,7 +9,7 @@ defaults:
 
 # Mode 1 (recommended): infer.exp_dir=experiments/vosr2_onestep_text infer.input=/path/to/imgs
 # Mode 2 (standalone): model=vosr arch/vae=qwen_vae2d arch/dit=vosr2_dit arch/dino=dinov2_vitl14 scale=1
-#   infer.weights_path='{vae:/path/vae.safetensors,dit:/path/dit.safetensors,dino:/path/dino.safetensors}'
+#   infer.weights_path.vae=/path/vae.safetensors infer.weights_path.dit=/path/dit.safetensors infer.weights_path.dino=/path/dino.safetensors
 scale: 1
 
 hydra:

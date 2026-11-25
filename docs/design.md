@@ -795,7 +795,7 @@ val_use_ema: true
    - 仅需提供 `infer.exp_dir=experiments/vosr2_onestep_text`（可选通过 `infer.weights_path.{vae,dit,dino}` 覆盖单个组件权重）；
    - 自动加载 `${exp_dir}/config_resolved.yaml` 中的 `arch.{vae,dit,dino}`、`scale` 与 `data.gt_size`，为全部活跃组件按统一优先级还原权重（未显式指定时优先同一套 `best_*_{arch}` → `latest_{arch}_ema` → `latest_{arch}` → 冻结组件 `model.pretrain.{arch}.path` 或架构内置预训练权重）。
 2. **独立推理配置模式**：
-   - 通过 `infer.yaml` 显式指定 `arch/vae`、`arch/dit`（及可选 `arch/dino`）、`scale`、组件级 `infer.weights_path` 映射与 `tile` 参数，脱离训练实验目录即可独立组合并推理任意子架构权重。
+   - 通过 `infer.yaml` 显式指定 `arch/vae`、`arch/dit`（及可选 `arch/dino`）、`scale`、`infer.weights_path.{vae,dit,dino}` 与 `tile` 参数，脱离训练实验目录即可独立组合并推理任意子架构权重。
 
 ### 10.2 按训练输入尺寸自动 Tile 切块与 Overlap 无缝融合
 
@@ -804,7 +804,14 @@ val_use_ema: true
 ```yaml
 # configs/infer/default.yaml
 exp_dir: null                  # 非空时自动还原 exp_dir/config_resolved.yaml 与权重
-weights_path: null             # 可覆盖自动选中的权重路径
+weights_path:                  # 按组件覆盖权重（命令行支持 infer.weights_path.vae=... infer.weights_path.dit=...）；单架构也可直接赋单文件路径
+  vae: null
+  dit: null
+  dino: null
+weights_key:                   # 可选 .pth 嵌套键名（支持 infer.weights_key.{vae,dit,dino}=... 或单字符串）
+  vae: null
+  dit: null
+  dino: null
 use_ema: true                  # 当 weights_path 未指定时优先选 EMA 权重
 
 input: null                    # 支持单图路径 / 图片目录 / JSON 清单（读取 lq 或 gt 字段）

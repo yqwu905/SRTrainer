@@ -225,6 +225,34 @@ def _arch_has_builtin_pretrained(comp_cfg: DictConfig | Mapping[str, Any]) -> bo
     return False
 
 
+def _parse_single_arch_weights_path(raw_weights: Any) -> Path | None:
+    if raw_weights is None:
+        return None
+    if isinstance(raw_weights, (DictConfig, Mapping)):
+        non_null = [str(k) for k, v in raw_weights.items() if v is not None]
+        if not non_null:
+            return None
+        raise ValueError(
+            "For single-arch inference, `infer.weights_path` must be a single file path or null, "
+            f"got per-component overrides: {non_null}."
+        )
+    return _optional_path(raw_weights, "infer.weights_path")
+
+
+def _parse_single_arch_weights_key(raw_keys: Any) -> str | None:
+    if raw_keys is None:
+        return None
+    if isinstance(raw_keys, (DictConfig, Mapping)):
+        non_null = [str(k) for k, v in raw_keys.items() if v is not None]
+        if not non_null:
+            return None
+        raise ValueError(
+            "For single-arch inference, `infer.weights_key` must be a string or null, "
+            f"got per-component overrides: {non_null}."
+        )
+    return _optional_str(raw_keys, "infer.weights_key")
+
+
 def _parse_component_weights_override(
     raw_weights: Any,
     active_components: tuple[str, ...],
@@ -250,8 +278,9 @@ def _parse_component_weights_override(
             parsed[k_str] = p
         return parsed
     raise ValueError(
-        "For multi-arch VOSR inference, `infer.weights_path` must be null or a mapping "
-        "of component name -> weight path (e.g. `{vae: ..., dit: ..., dino: ...}`)."
+        "For multi-arch VOSR inference, specify per-component weight paths via "
+        "`infer.weights_path.vae=...`, `infer.weights_path.dit=...`, "
+        "`infer.weights_path.dino=...` (or leave `infer.weights_path` unset / null)."
     )
 
 
@@ -273,10 +302,17 @@ def _parse_component_weights_keys(
                     f"Unknown component {k_str!r} in infer.weights_key; "
                     f"expected subset of {list(_VOSR_COMPONENTS)}."
                 )
-            parsed[k_str] = _optional_str(val, f"infer.weights_key.{k_str}")
+            if val is not None and k_str not in active_components:
+                raise ValueError(
+                    f"infer.weights_key.{k_str} was provided, but arch.{k_str} is not active."
+                )
+            if k_str in active_components:
+                parsed[k_str] = _optional_str(val, f"infer.weights_key.{k_str}")
         return parsed
     raise ValueError(
-        f"infer.weights_key must be a string, mapping, or None, got {type(raw_keys).__name__}."
+        "For multi-arch VOSR inference, `infer.weights_key` must be null, a string, "
+        "or per-component overrides (`infer.weights_key.vae=...`, `infer.weights_key.dit=...`, "
+        f"`infer.weights_key.dino=...`), got {type(raw_keys).__name__}."
     )
 
 
@@ -572,8 +608,8 @@ def resolve_infer_config(
             )
 
         arch_cfg = _validate_arch_cfg(arch_raw, context=f"config_resolved.yaml ({config_path})")
-        weights_key = _optional_str(raw_weights_key, "infer.weights_key")
-        explicit_weights = _optional_path(raw_explicit_weights, "infer.weights_path")
+        weights_key = _parse_single_arch_weights_key(raw_weights_key)
+        explicit_weights = _parse_single_arch_weights_path(raw_explicit_weights)
         weights_path = resolve_exp_weights(
             exp_dir=exp_dir,
             train_cfg=train_cfg,
@@ -636,8 +672,8 @@ def resolve_infer_config(
         )
 
     arch_cfg = _validate_arch_cfg(arch_raw, context="Standalone inference config")
-    weights_key = _optional_str(raw_weights_key, "infer.weights_key")
-    explicit_weights = _optional_path(raw_explicit_weights, "infer.weights_path")
+    weights_key = _parse_single_arch_weights_key(raw_weights_key)
+    explicit_weights = _parse_single_arch_weights_path(raw_explicit_weights)
     if explicit_weights is None:
         raise ValueError(
             "Standalone inference mode (infer.exp_dir=null) requires `infer.weights_path`."

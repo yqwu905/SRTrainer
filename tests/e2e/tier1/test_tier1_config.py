@@ -378,11 +378,30 @@ def test_t1_infer_yaml_composition_and_tile_defaults(
 
     cfg = hydra_compose("infer")
     assert cfg.infer.exp_dir is None
-    assert cfg.infer.weights_path is None
+    assert cfg.infer.weights_path.vae is None
+    assert cfg.infer.weights_path.dit is None
+    assert cfg.infer.weights_path.dino is None
+    assert cfg.infer.weights_key.vae is None
+    assert cfg.infer.weights_key.dit is None
+    assert cfg.infer.weights_key.dino is None
     assert cfg.infer.use_ema is True
     assert cfg.infer.recursive is False
     assert cfg.infer.suffix == ""
     assert cfg.infer.save_format == "png"
+
+    cfg_dot = hydra_compose(
+        "infer",
+        overrides=[
+            "infer.weights_path.vae=/tmp/vae.safetensors",
+            "infer.weights_path.dit=/tmp/dit.safetensors",
+            "infer.weights_path.dino=/tmp/dino.safetensors",
+            "infer.weights_key.dit=params_ema",
+        ],
+    )
+    assert cfg_dot.infer.weights_path.vae == "/tmp/vae.safetensors"
+    assert cfg_dot.infer.weights_path.dit == "/tmp/dit.safetensors"
+    assert cfg_dot.infer.weights_path.dino == "/tmp/dino.safetensors"
+    assert cfg_dot.infer.weights_key.dit == "params_ema"
 
     tile = cfg.infer.tile
     assert tile.enabled is True
