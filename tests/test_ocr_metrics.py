@@ -216,7 +216,7 @@ def _make_trainer_cfg(
             config_name="train",
             overrides=["experiment=vosr2_onestep_text"],
         )
-    OmegaConf.set_struct(cfg, False)
+    cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
     cfg.exp_name = work_dir.name
     cfg.scale = 1
     cfg.seed = 42
@@ -236,7 +236,13 @@ def _make_trainer_cfg(
     cfg.model.scale = 1
     cfg.model.ema.enabled = False
     cfg.model.trainable = OmegaConf.create({"vae": False, "dit": True, "dino": False})
-    cfg.model.pretrain = None
+    cfg.model.pretrain = OmegaConf.create(
+        {
+            "vae": {"path": None, "strict": True, "key": None},
+            "dit": {"path": None, "strict": True, "key": None},
+            "dino": {"path": None, "strict": True, "key": None},
+        }
+    )
     cfg.data.gt_size = 16
     cfg.data.scale = 1
     cfg.data.batch_size_per_gpu = 1
@@ -270,7 +276,7 @@ def _make_trainer_cfg(
     cfg.trainer.max_keep_states = 2
     cfg.trainer.mixed_precision = "no"
     cfg.trainer.gradient_accumulation_steps = 1
-    cfg.trainer.log_with = None
+    cfg.trainer.log_with = []
     cfg.trainer.resume = None
     cfg.trainer.append_timestamp = False
     cfg.trainer.val_save_visuals = False
@@ -1389,17 +1395,17 @@ except ImportError:
         "data.persistent_workers=false",
         "data.degradation=null",
         f"data.sources={sources_override}",
+        "metric=base_metric",
         "metric.primary_dataset=text_odd5",
         "metric.primary_metric=cer",
-        "~metric.val_suites",
-        f"+metric.val_suites={val_suites_override}",
+        f"++metric.val_suites={val_suites_override}",
         "trainer.total_iters=1",
         "trainer.log_interval=1",
         "trainer.val_interval=1",
         "trainer.save_interval=1",
         "trainer.mixed_precision=no",
         "trainer.gradient_accumulation_steps=1",
-        "trainer.log_with=null",
+        "trainer.log_with=[]",
         "trainer.val_save_visuals=false",
         "trainer.val_use_ema=false",
         "trainer.val_tile.enabled=false",

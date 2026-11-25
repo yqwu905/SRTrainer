@@ -10,25 +10,18 @@ from typing import Any
 import hydra
 import torch
 from accelerate.state import AcceleratorState, GradientState, PartialState
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 
+from config import TrainConfig, load_train_config, register_configs
 from engine import Trainer
 from utils.npu import setup_npu
+
 IS_NPU = setup_npu()
+register_configs()
 
 __all__ = ["main", "run_train"]
 
 _CONFIG_DIR = str(Path(__file__).resolve().parents[1] / "configs")
-
-
-def _as_dict_config(cfg: DictConfig | Mapping[str, Any]) -> DictConfig:
-    if isinstance(cfg, DictConfig):
-        return cfg
-    if isinstance(cfg, Mapping):
-        created = OmegaConf.create(dict(cfg))
-        if isinstance(created, DictConfig):
-            return created
-    raise TypeError(f"Expected DictConfig or Mapping, got {type(cfg).__name__}.")
 
 
 def _reenable_srtrainer_loggers() -> None:
@@ -40,9 +33,9 @@ def _reenable_srtrainer_loggers() -> None:
             obj.disabled = False
 
 
-def run_train(cfg: DictConfig) -> Trainer:
-    """Run a full training lifecycle from a Hydra config and return the ``Trainer`` instance."""
-    cfg_oc = _as_dict_config(cfg)
+def run_train(cfg: TrainConfig | DictConfig | Mapping[str, Any]) -> Trainer:
+    """Validate config at entry, run a full training lifecycle, and return the ``Trainer``."""
+    train_cfg = load_train_config(cfg)
     had_existing_state = bool(PartialState._shared_state)
     had_existing_dist = (
         torch.distributed.is_available() and torch.distributed.is_initialized()
@@ -50,7 +43,7 @@ def run_train(cfg: DictConfig) -> Trainer:
     trainer: Trainer | None = None
     try:
         _reenable_srtrainer_loggers()
-        trainer = Trainer(cfg_oc)
+        trainer = Trainer(train_cfg)
         trainer.fit()
         return trainer
     finally:

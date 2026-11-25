@@ -15,8 +15,10 @@ from torch import nn
 import archs
 import losses
 from archs import AutoencoderKLQwenImage2D, DINOv2Encoder, VOSR2DiT
+from config import load_train_config
 from losses import L1Loss, LPIPSLoss
 from models import VOSRModel, VOSRPipeline
+from models.base_model import build_model
 from utils import normalize_mixed_precision
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -90,7 +92,7 @@ def test_train_requires_mandatory_groups_and_explicit_composition() -> None:
     assert cfg.optim.scheduler.T_max == 300000
     assert cfg.trainer.total_iters == 300000
     assert cfg.trainer.append_timestamp is False
-    assert cfg.trainer.val_tile.size == "auto"
+    assert cfg.trainer.val_tile.size is None
     assert cfg.trainer.mixed_precision == "bf16"
 
     # Hydra runtime safeguards
@@ -228,7 +230,7 @@ def test_infer_yaml_dual_modes(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cfg_default.infer.exp_dir is None
     assert cfg_default.infer.use_ema is True
     assert cfg_default.infer.tile.enabled is True
-    assert cfg_default.infer.tile.size == "auto"
+    assert cfg_default.infer.tile.size is None
     assert cfg_default.infer.tile.overlap == 16
     assert cfg_default.infer.tile.blend_mode == "cosine"
     assert cfg_default.hydra.job.chdir is False
@@ -322,7 +324,7 @@ def test_hydra_instantiate_components(monkeypatch: pytest.MonkeyPatch) -> None:
     with torch.no_grad():
         assert pipe(torch.rand(1, 3, 16, 20)).shape == (1, 3, 16, 20)
 
-    model_obj = instantiate(cfg_exp.model, cfg=cfg_exp, _recursive_=False)
+    model_obj = build_model(load_train_config(cfg_exp, require_data=False))
     assert isinstance(model_obj, VOSRModel)
 
     l1 = instantiate(cfg_exp.loss.l1.criterion)

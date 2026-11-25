@@ -204,7 +204,7 @@ def _make_train_cfg(
                 "gradient_accumulation_steps": grad_accum,
                 "grad_clip_norm": 1.0,
                 "compile": False,
-                "log_with": log_with,
+                "log_with": [] if log_with is None else log_with,
                 "tracker_init_kwargs": {},
                 "resume": None,
                 "append_timestamp": False,
@@ -235,7 +235,7 @@ def _read_tb_images(tb_dir: Path) -> dict[str, list[tuple[int, np.ndarray]]]:
 class _NoVisualsCustomModel(BaseModel):
     """Minimal BaseModel subclass that intentionally does not override visual capture hooks."""
 
-    def __init__(self, cfg: DictConfig | dict[str, Any], **kwargs: Any) -> None:
+    def __init__(self, cfg: Any) -> None:
         super().__init__(cfg)
         self.net = nn.Conv2d(3, 3, kernel_size=1)
         self.opt: torch.optim.Optimizer | None = None
@@ -401,8 +401,11 @@ def test_log_image_dict_to_trackers_batching_and_nan_safety(tmp_path: Path) -> N
 def test_vosr_model_train_visual_capture_and_grad_accum(tmp_path: Path) -> None:
     ds = _create_train_manifests(tmp_path, scale=2)
     cfg = _make_train_cfg(tmp_path / "vosr_unit", ds, scale=2, grad_accum=2)
+    from config import load_train_config
+    from models.base_model import build_model
+
     acc = Accelerator(mixed_precision="no", cpu=True, gradient_accumulation_steps=2)
-    model = hydra.utils.instantiate(cfg.model, cfg=cfg, _recursive_=False)
+    model = build_model(load_train_config(cfg))
     model.setup(acc)
 
     with pytest.raises(ValueError, match="enabled"):

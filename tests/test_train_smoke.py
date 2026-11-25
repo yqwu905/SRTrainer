@@ -312,7 +312,7 @@ def _make_base_train_cfg(
     with initialize_config_dir(version_base=None, config_dir=CONFIG_DIR):
         cfg = compose(config_name="train", overrides=["experiment=vosr2_onestep_text"])
 
-    OmegaConf.set_struct(cfg, False)
+    cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
     cfg.exp_name = work_dir.name
     cfg.scale = 2
     cfg.seed = 42
@@ -435,14 +435,18 @@ def _make_base_train_cfg(
     cfg.trainer.gradient_accumulation_steps = grad_accum
     cfg.trainer.grad_clip_norm = 1.0
     cfg.trainer.compile = False
-    cfg.trainer.log_with = log_with
+    cfg.trainer.log_with = (
+        []
+        if log_with is None
+        else ([log_with] if isinstance(log_with, str) else list(log_with))
+    )
     cfg.trainer.resume = resume
     cfg.trainer.append_timestamp = append_timestamp
     cfg.trainer.val_save_visuals = val_save_visuals
     cfg.trainer.val_max_save_images = 8
     cfg.trainer.val_use_ema = val_use_ema
     cfg.trainer.val_tile.enabled = True
-    cfg.trainer.val_tile.size = "auto"
+    cfg.trainer.val_tile.size = None
     cfg.trainer.val_tile.overlap = 4
     cfg.trainer.val_tile.batch_size = 2
     cfg.trainer.val_tile.blend_mode = "cosine"
@@ -842,10 +846,11 @@ def test_vosr_model_7step_setup_losses_pretrain_and_scheduler_gating(
         }
     )
 
-    import hydra
+    from config import load_train_config
+    from models.base_model import build_model
 
     acc = Accelerator(mixed_precision="no", gradient_accumulation_steps=2)
-    model = hydra.utils.instantiate(cfg.model, cfg=cfg, _recursive_=False)
+    model = build_model(load_train_config(cfg))
     assert isinstance(model, VOSRModel)
     model.setup(acc)
 
@@ -928,7 +933,7 @@ def test_vosr_model_7step_setup_losses_pretrain_and_scheduler_gating(
         dit_pretrain_key=None,
     )
     acc2 = Accelerator(mixed_precision="no")
-    model2 = hydra.utils.instantiate(cfg_partial.model, cfg=cfg_partial, _recursive_=False)
+    model2 = build_model(load_train_config(cfg_partial))
     model2.setup(acc2)
     infer_pipe = model2.get_infer_network(use_ema=True)
     assert isinstance(infer_pipe, VOSRPipeline)
@@ -938,10 +943,8 @@ def test_vosr_model_7step_setup_losses_pretrain_and_scheduler_gating(
 
     cfg_all_zero = _make_base_train_cfg(tmp_path / "vosr_zero_loss", ds)
     cfg_all_zero.loss.l1.weight = 0.0
-    acc3 = Accelerator(mixed_precision="no")
     with pytest.raises(ValueError, match="at least one active loss"):
-        hydra.utils.instantiate(cfg_all_zero.model, cfg=cfg_all_zero, _recursive_=False).setup(acc3)
-    acc3.end_training()
+        load_train_config(cfg_all_zero)
 
 
 # ---------------------------------------------------------------------------
@@ -1444,7 +1447,7 @@ def test_train_to_tools_infer_exp_dir_integration(
         model=ref_model,
         scale=2,
         tile_enabled=True,
-        tile_size="auto",
+        tile_size=None,
         tile_overlap=4,
         tile_batch_size=2,
         blend_mode="cosine",
@@ -1553,10 +1556,10 @@ def test_train_cli_distributed_2proc_cpu_torchrun_smoke(tmp_path: Path) -> None:
         f"optim.optimizer.lr={init_lr}",
         f"optim.scheduler.T_max={t_max}",
         f"optim.scheduler.eta_min={eta_min}",
+        "metric=base_metric",
         "metric.primary_dataset=val_odd5",
         "metric.primary_metric=meta_score",
-        "~metric.val_suites",
-        f"+metric.val_suites={val_suites_override}",
+        f"++metric.val_suites={val_suites_override}",
         f"trainer.total_iters={total_iters}",
         "trainer.log_interval=2",
         "trainer.val_interval=2",
@@ -1564,7 +1567,7 @@ def test_train_cli_distributed_2proc_cpu_torchrun_smoke(tmp_path: Path) -> None:
         "trainer.max_keep_states=2",
         "trainer.mixed_precision=bf16",
         "trainer.gradient_accumulation_steps=2",
-        "trainer.log_with=null",
+        "trainer.log_with=[]",
         "trainer.append_timestamp=true",
         "trainer.val_save_visuals=true",
         "trainer.val_max_save_images=8",
@@ -1699,16 +1702,16 @@ def test_train_cli_distributed_2proc_resume_auto(tmp_path: Path) -> None:
         "data.degradation.kernel_cfg.kernel_size=7",
         "data.degradation.kernel_cfg.kernel_range=[7]",
         "optim.scheduler.T_max=6",
+        "metric=base_metric",
         "metric.primary_dataset=val_tiny",
         "metric.primary_metric=psnr",
-        "~metric.val_suites",
-        f"+metric.val_suites={val_suites_override}",
+        f"++metric.val_suites={val_suites_override}",
         "trainer.log_interval=2",
         "trainer.val_interval=2",
         "trainer.save_interval=2",
         "trainer.mixed_precision=no",
         "trainer.gradient_accumulation_steps=1",
-        "trainer.log_with=null",
+        "trainer.log_with=[]",
         "trainer.val_save_visuals=false",
         "trainer.val_tile.overlap=4",
     ]

@@ -23,7 +23,6 @@ def test_t3_hydra_experiment_inheritance_into_vosr_model_lpips_and_cosine_t_max(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Seam A x B x E (F03-F06, F08, F12-F15, F43): experiment -> VOSRModel + LPIPS + Cosine LR."""
-    import hydra.utils
     import torch
     from accelerate import Accelerator
     from tests.dummy_arch import get_dummy_vosr_arch_dict
@@ -63,7 +62,10 @@ def test_t3_hydra_experiment_inheritance_into_vosr_model_lpips_and_cosine_t_max(
     assert cfg.loss.l1.weight == pytest.approx(1.0)
     assert cfg.loss.lpips.weight == pytest.approx(0.05)
 
-    model = hydra.utils.instantiate(cfg.model, cfg=cfg, _recursive_=False)
+    from config import load_train_config
+    from models.base_model import build_model
+
+    model = build_model(load_train_config(cfg, require_data=False, require_trainer_full=False))
     assert isinstance(model, VOSRModel)
     accelerator = Accelerator(cpu=True, mixed_precision="no")
     model.setup(accelerator)
@@ -117,7 +119,6 @@ def test_t3_mixed_dataset_weighted_sampler_usm_pool_degrader_and_vosr_model(
     minimal_train_cfg_factory: Callable[..., Any],
 ) -> None:
     """Seam C x E (F21-F23, F25-F29, F43): Mixed sources + Sampler + USM + Pool + VOSRModel."""
-    import hydra
     import torch
     from accelerate import Accelerator
     from torch.utils.data import DataLoader
@@ -161,7 +162,10 @@ def test_t3_mixed_dataset_weighted_sampler_usm_pool_degrader_and_vosr_model(
     cfg.data.degradation.kernel_cfg.kernel_range = [7]
     cfg.optim.optimizer.lr = 1.0e-3
 
-    model = hydra.utils.instantiate(cfg.model, cfg=cfg, _recursive_=False)
+    from config import load_train_config
+    from models.base_model import build_model
+
+    model = build_model(load_train_config(cfg))
     model.setup(Accelerator(cpu=True, mixed_precision="no"))
     init_sd = {
         k: v.detach().cpu().clone()
@@ -221,7 +225,6 @@ def test_t3_pure_paired_degradation_null_vosr_scale4_and_multistep_lr(
     mixed_dataset_factory: Callable[..., Any],
 ) -> None:
     """Seam A x B x C x E (F04, F05, F07, F08, F13, F14, F21-F23, F43): degradation=null + MultiStepLR."""
-    import hydra
     import torch
     from accelerate import Accelerator
     from tests.dummy_arch import get_dummy_vosr_arch_dict
@@ -266,7 +269,10 @@ def test_t3_pure_paired_degradation_null_vosr_scale4_and_multistep_lr(
     ds = mixed_dataset_factory([pair_src], gt_size=64, scale=4, has_degradation=False)
     loader = DataLoader(ds, batch_size=2, shuffle=False, num_workers=0)
 
-    model = hydra.utils.instantiate(cfg.model, cfg=cfg, _recursive_=False)
+    from config import load_train_config
+    from models.base_model import build_model
+
+    model = build_model(load_train_config(cfg, require_trainer_full=False))
     model.setup(Accelerator(cpu=True, mixed_precision="no"))
     assert isinstance(model.get_infer_network(use_ema=False), VOSRPipeline)
     assert next(iter(model.get_lr_dict().values())) == pytest.approx(2.0e-4, rel=1e-6)
@@ -324,7 +330,6 @@ def test_t3_pretrain_basicsr_pth_with_ema_warmup_grad_clip_and_accum(
     minimal_train_cfg_factory: Callable[..., Any],
 ) -> None:
     """Seam B x E (F13, F19, F42, F43): BasicSR .pth pretrain + EMA warmup + grad_clip + grad_accum."""
-    import hydra
     import torch
     from accelerate import Accelerator
     from tests.dummy_arch import DummyDiT
@@ -362,8 +367,11 @@ def test_t3_pretrain_basicsr_pth_with_ema_warmup_grad_clip_and_accum(
     cfg.trainer.grad_clip_norm = 0.5
     cfg.optim.optimizer.lr = 1.0e-2
 
+    from config import load_train_config
+    from models.base_model import build_model
+
     accelerator = Accelerator(cpu=True, mixed_precision="no", gradient_accumulation_steps=2)
-    model = hydra.utils.instantiate(cfg.model, cfg=cfg, _recursive_=False)
+    model = build_model(load_train_config(cfg))
     model.setup(accelerator)
 
     def _snapshot(use_ema: bool) -> dict[str, Any]:
@@ -443,7 +451,6 @@ def test_t3_sampler_o1_resume_coupled_with_checkpointer_and_train_state(
     accelerate_state_resetter: Callable[[], None],
 ) -> None:
     """Seam C x E (F25, F42-F45): Sampler O(1) seek + Checkpointer + TrainState exact parity."""
-    import hydra
     import torch
     from accelerate import Accelerator
     from accelerate.utils import ProjectConfiguration
@@ -483,7 +490,10 @@ def test_t3_sampler_o1_resume_coupled_with_checkpointer_and_train_state(
             gradient_accumulation_steps=2,
             project_config=proj_cfg,
         )
-        model = hydra.utils.instantiate(cfg.model, cfg=cfg, _recursive_=False)
+        from config import load_train_config
+        from models.base_model import build_model
+
+        model = build_model(load_train_config(cfg))
         model.setup(acc)
         train_state = TrainState()
         acc.register_for_checkpointing(train_state)
@@ -569,7 +579,6 @@ def test_t3_vosr_scales_export_weights_safetensors_reload_parity(
     accelerate_state_resetter: Callable[[], None],
 ) -> None:
     """Seam B x E (F13, F19, F42, F43, F45): VOSR x2/x4 per-arch export -> safetensors -> reload parity."""
-    import hydra
     import torch
     from accelerate import Accelerator
     from safetensors import safe_open
@@ -599,8 +608,11 @@ def test_t3_vosr_scales_export_weights_safetensors_reload_parity(
         cfg.optim.optimizer.lr = 5.0e-3
         cfg.model.ema.decay = 0.9
 
+        from config import load_train_config
+        from models.base_model import build_model
+
         accelerator = Accelerator(cpu=True, mixed_precision="no")
-        model = hydra.utils.instantiate(cfg.model, cfg=cfg, _recursive_=False)
+        model = build_model(load_train_config(cfg))
         model.setup(accelerator)
 
         for step in range(2):

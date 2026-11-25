@@ -114,7 +114,7 @@ def test_t1_tiled_inferencer_auto_int_and_hw_tile_sizes_from_config() -> None:
     configs = [
         {
             "enabled": True,
-            "size": "auto",
+            "size": None,
             "overlap": 4,
             "batch_size": 4,
             "blend_mode": "cosine",
@@ -122,7 +122,7 @@ def test_t1_tiled_inferencer_auto_int_and_hw_tile_sizes_from_config() -> None:
         },
         {
             "enabled": True,
-            "size": 16,
+            "size": [16, 16],
             "overlap": 4,
             "batch_size": 4,
             "blend_mode": "cosine",
@@ -331,7 +331,7 @@ def test_t1_tools_infer_mode1_exp_dir_restore_and_weight_priority(
             f"infer.output_dir={hydra_value_formatter(str(out_dir))}",
             "infer.mixed_precision='no'",
             "infer.tile.enabled=true",
-            "infer.tile.size=auto",
+            "infer.tile.size=null",
             "infer.tile.overlap=4",
             *(extra or []),
         ]
@@ -414,7 +414,7 @@ def test_t1_tools_infer_mode2_standalone_inputs_recursive_json_and_jpg(
         "++infer.weights_key=params_ema",
         "infer.mixed_precision='no'",
         "infer.tile.enabled=true",
-        "infer.tile.size=16",
+        "infer.tile.size=[16,16]",
         "infer.tile.overlap=4",
     ]
 
@@ -527,7 +527,7 @@ def test_t1_tools_infer_2proc_cpu_distributed_odd_image_count(
             f"infer.output_dir={hydra_value_formatter(str(out_dir))}",
             "infer.mixed_precision='no'",
             "infer.tile.enabled=true",
-            "infer.tile.size=auto",
+            "infer.tile.size=null",
             "infer.tile.overlap=4",
         ],
         nproc_per_node=2,

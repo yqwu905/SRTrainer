@@ -238,7 +238,7 @@ def test_t4_scenario1_mixed_blind_paired_train_to_auto_restore_infer(
             f"infer.output_dir={fmt(str(out_dir))}",
             "infer.mixed_precision='no'",
             "infer.tile.enabled=true",
-            "infer.tile.size=auto",
+            "infer.tile.size=null",
             "infer.tile.overlap=4",
             "infer.tile.blend_mode=cosine",
         ],
@@ -267,7 +267,7 @@ def test_t4_scenario1_mixed_blind_paired_train_to_auto_restore_infer(
         model=net_ref,
         scale=4,
         tile_enabled=True,
-        tile_size="auto",
+        tile_size=None,
         tile_overlap=4,
         tile_batch_size=4,
         blend_mode="cosine",
@@ -569,7 +569,7 @@ def test_t4_scenario4_standalone_basicsr_pth_infer_recursive_and_json(
         "++infer.weights_key=params_ema",
         "infer.mixed_precision='no'",
         "infer.tile.enabled=true",
-        "infer.tile.size=16",
+        "infer.tile.size=[16,16]",
         "infer.tile.overlap=4",
     ]
 
@@ -790,7 +790,7 @@ def test_t4_scenario5_distributed_2proc_train_val_and_offline_infer(
             f"infer.output_dir={fmt(str(out_dir))}",
             "infer.mixed_precision='no'",
             "infer.tile.enabled=true",
-            "infer.tile.size=auto",
+            "infer.tile.size=null",
             "infer.tile.overlap=4",
         ],
         nproc_per_node=2,
@@ -826,7 +826,6 @@ def test_t4_scenario6_two_stage_l1_to_l1_lpips_finetune_trackers_and_infer(
     accelerate_state_resetter: Callable[[], None],
 ) -> None:
     """Scenario 6: Stage 1 L1 -> Stage 2 pretrain+l1_lpips+USM+Pool+TB -> edge infer -> Reqs #1-#5."""
-    import hydra
     import torch
     import yaml
     from accelerate import Accelerator
@@ -928,9 +927,12 @@ def test_t4_scenario6_two_stage_l1_to_l1_lpips_finetune_trackers_and_infer(
     assert not re.search(r"\bnan\b", s2_log.lower())
 
     # 2. Pretrained weights cloned into BOTH live DiT and DiT EMA prior to step 0
+    from config import load_train_config
+    from models.base_model import build_model
+
     s2_resolved = load_resolved_config(stage2_dir / "config_resolved.yaml")
     accelerate_state_resetter()
-    probe_model = hydra.utils.instantiate(s2_resolved.model, cfg=s2_resolved, _recursive_=False)
+    probe_model = build_model(load_train_config(s2_resolved))
     probe_model.setup(Accelerator(cpu=True, mixed_precision="no"))
     probe_main_sd = probe_model.get_infer_network(use_ema=False).dit.state_dict()
     probe_ema_sd = probe_model.get_infer_network(use_ema=True).dit.state_dict()
@@ -956,7 +958,7 @@ def test_t4_scenario6_two_stage_l1_to_l1_lpips_finetune_trackers_and_infer(
             f"infer.output_dir={fmt(str(out_edge))}",
             "infer.mixed_precision='no'",
             "infer.tile.enabled=true",
-            "infer.tile.size=auto",
+            "infer.tile.size=null",
             "infer.tile.overlap=4",
         ],
         check=True,

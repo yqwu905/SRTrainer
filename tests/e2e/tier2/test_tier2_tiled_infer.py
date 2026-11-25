@@ -83,9 +83,9 @@ def test_t2_f02_tiled_inferencer_rejects_invalid_tile_size_blend_batch_and_auto_
         {"model": model_x2, "scale": 2, "tile_size": -4, "tile_overlap": 0},
         {"model": model_x2, "scale": 2, "tile_size": [16, 16, 16], "tile_overlap": 0},
         {"model": model_x2, "scale": 2, "tile_size": [16, 0], "tile_overlap": 0},
-        # tile_size="auto" derives gt_size // scale; reject cases where gt_size // scale <= 0.
-        {"model": model_x4, "scale": 4, "tile_size": "auto", "gt_size": 2, "tile_overlap": 0},
-        {"model": model_x4, "scale": 4, "tile_size": "auto", "gt_size": 0, "tile_overlap": 0},
+        # tile_size=None (auto) derives gt_size // scale; reject cases where gt_size // scale <= 0.
+        {"model": model_x4, "scale": 4, "tile_size": None, "gt_size": 2, "tile_overlap": 0},
+        {"model": model_x4, "scale": 4, "tile_size": None, "gt_size": 0, "tile_overlap": 0},
         {"model": model_x2, "scale": 2, "tile_size": 16, "tile_overlap": 4, "blend_mode": "cubic"},
         {"model": model_x2, "scale": 2, "tile_size": 16, "tile_overlap": 4, "tile_batch_size": 0},
         {"model": model_x2, "scale": 2, "tile_size": 16, "tile_overlap": 4, "tile_batch_size": -2},
@@ -128,7 +128,7 @@ def test_t2_f03_tiled_inferencer_auto_without_gt_size_falls_back_to_untiled() ->
         model=probe,
         scale=2,
         tile_enabled=True,
-        tile_size="auto",
+        tile_size=None,
         tile_overlap=4,
         gt_size=None,
         pad_multiple=8,
@@ -444,7 +444,7 @@ def test_t2_f08_tools_infer_bad_json_entry_and_non_recursive_dir_scan(
         f"infer.exp_dir={fmt(str(exp_info['exp_dir']))}",
         "infer.mixed_precision='no'",
         "infer.tile.enabled=true",
-        "infer.tile.size=auto",
+        "infer.tile.size=null",
         "infer.tile.overlap=4",
     ]
 
@@ -525,7 +525,7 @@ def test_t2_f09_tools_infer_2proc_cpu_single_image_idle_rank(
             f"infer.output_dir={fmt(str(out_dir))}",
             "infer.mixed_precision='no'",
             "infer.tile.enabled=true",
-            "infer.tile.size=auto",
+            "infer.tile.size=null",
             "infer.tile.overlap=4",
         ],
         nproc_per_node=2,

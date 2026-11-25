@@ -15,6 +15,8 @@ from typing import Any
 from omegaconf import ListConfig, OmegaConf
 from omegaconf.errors import OmegaConfBaseException
 
+from config.schema import DataSourceConfig
+from config.validation import load_structured_config
 from utils.text_geometry import canonical_quad
 
 __all__ = [
@@ -427,7 +429,7 @@ def load_train_manifest(
 
 
 def validate_sources_config(
-    sources: Sequence[Mapping[str, Any]] | ListConfig,
+    sources: Sequence[DataSourceConfig | Mapping[str, Any]] | ListConfig,
     has_degradation: bool,
     is_main_process: bool = True,
     logger: logging.Logger | None = None,
@@ -442,7 +444,7 @@ def validate_sources_config(
         normalized_sources, Sequence
     ):
         raise ValueError(
-            f"data.sources must be a non-empty sequence of source mappings, "
+            f"data.sources must be a non-empty sequence of source entries, "
             f"got {type(normalized_sources).__name__}."
         )
     if len(normalized_sources) == 0:
@@ -452,53 +454,57 @@ def validate_sources_config(
     ratios: list[float] = []
 
     for idx, raw_src in enumerate(normalized_sources):
-        src = _normalize_omegaconf(raw_src, f"data.sources[{idx}]")
-        if not isinstance(src, Mapping):
-            raise ValueError(
-                f"data.sources[{idx}] must be a mapping, got {type(src).__name__}."
+        if isinstance(raw_src, DataSourceConfig):
+            src_cfg = raw_src
+        else:
+            src_map = _normalize_omegaconf(raw_src, f"data.sources[{idx}]")
+            if not isinstance(src_map, Mapping):
+                raise ValueError(
+                    f"data.sources[{idx}] must be a DataSourceConfig or mapping, "
+                    f"got {type(src_map).__name__}."
+                )
+            if "mode" in src_map:
+                raise ValueError(
+                    f"Legacy 'mode' key is not allowed in data.sources[{idx}] "
+                    f"(name={src_map.get('name')!r}). Remove 'mode'; gt_only vs paired is "
+                    "auto-detected per sample from JSON."
+                )
+            missing = [k for k in _REQUIRED_SOURCE_KEYS if k not in src_map]
+            if missing:
+                raise ValueError(
+                    f"data.sources[{idx}] is missing required key(s): {', '.join(missing)}."
+                )
+            raw_ratio_pre = src_map["ratio"]
+            if isinstance(raw_ratio_pre, bool) or not isinstance(raw_ratio_pre, numbers.Real):
+                raise ValueError(
+                    f"data.sources[{idx}]['ratio'] must be a finite real number >= 0, "
+                    f"got {raw_ratio_pre!r}."
+                )
+            # Coerce Path fields before OmegaConf structured merge if caller passed Path objects.
+            coerced = {
+                k: (str(v) if isinstance(v, Path) else v)
+                for k, v in src_map.items()
+            }
+            src_cfg = load_structured_config(
+                DataSourceConfig, coerced, context=f"data.sources[{idx}]"
             )
 
-        # Explicitly reject legacy 'mode' key before any other validation.
-        if "mode" in src:
+        if not is_valid_rel_path(src_cfg.name):
             raise ValueError(
-                f"Legacy 'mode' key is not allowed in data.sources[{idx}] "
-                f"(name={src.get('name')!r}). Remove 'mode'; gt_only vs paired is "
-                "auto-detected per sample from JSON."
+                f"data.sources[{idx}]['name'] must be a non-empty string, got {src_cfg.name!r}."
             )
-
-        missing = [k for k in _REQUIRED_SOURCE_KEYS if k not in src]
-        if missing:
-            raise ValueError(
-                f"data.sources[{idx}] is missing required key(s): {', '.join(missing)}."
-            )
-
-        raw_name = src["name"]
-        if not is_valid_rel_path(raw_name):
-            raise ValueError(
-                f"data.sources[{idx}]['name'] must be a non-empty string, got {raw_name!r}."
-            )
-        src_name = raw_name.strip()
-
-        src_root_dir = _validate_path_arg(src["root_dir"], f"data.sources[{idx}]['root_dir']")
-        src_json_path = _validate_path_arg(src["json_path"], f"data.sources[{idx}]['json_path']")
-
-        raw_glyphs_json = src.get("glyphs_json", src.get("text_boxes", None))
+        src_name = src_cfg.name.strip()
+        src_root_dir = _validate_path_arg(src_cfg.root_dir, f"data.sources[{idx}]['root_dir']")
+        src_json_path = _validate_path_arg(src_cfg.json_path, f"data.sources[{idx}]['json_path']")
         src_glyphs_json = (
-            _validate_path_arg(raw_glyphs_json, f"data.sources[{idx}]['glyphs_json']")
-            if raw_glyphs_json is not None
+            _validate_path_arg(src_cfg.glyphs_json, f"data.sources[{idx}]['glyphs_json']")
+            if src_cfg.glyphs_json is not None
             else None
         )
-
-        raw_ratio = src["ratio"]
-        if isinstance(raw_ratio, bool) or not isinstance(raw_ratio, numbers.Real):
-            raise ValueError(
-                f"data.sources[{idx}]['ratio'] must be a finite real number >= 0, "
-                f"got {raw_ratio!r}."
-            )
-        ratio_f = float(raw_ratio)
+        ratio_f = float(src_cfg.ratio)
         if not math.isfinite(ratio_f) or ratio_f < 0.0:
             raise ValueError(
-                f"data.sources[{idx}]['ratio'] must be finite and >= 0, got {raw_ratio!r}."
+                f"data.sources[{idx}]['ratio'] must be finite and >= 0, got {src_cfg.ratio!r}."
             )
 
         parsed_configs.append((src_name, src_root_dir, src_json_path, ratio_f, src_glyphs_json))

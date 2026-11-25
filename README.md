@@ -120,7 +120,7 @@ uv run python tools/infer.py \
   infer.exp_dir=experiments/vosr2_onestep_text \
   infer.input=/data/test_imgs \
   infer.output_dir=outputs/vosr2_test \
-  infer.tile.size=auto \
+  infer.tile.size=null \
   infer.tile.overlap=64
 
 # 多卡分布式离线推理 JSON 清单
@@ -129,7 +129,7 @@ uv run accelerate launch --num_processes 4 tools/infer.py \
   infer.input=/data/manifests/large_test.json \
   infer.input_root=/data/large_test \
   infer.output_dir=outputs/vosr2_large_test \
-  infer.tile.size=auto \
+  infer.tile.size=null \
   infer.tile.overlap=64 \
   infer.tile.batch_size=1
 
@@ -139,9 +139,11 @@ uv run python tools/infer.py \
   arch/dit=vosr2_dit \
   arch/dino=dinov2_vitl14 \
   scale=1 \
-  '++infer.weights_path={vae:/path/to/vae.safetensors,dit:/path/to/dit.safetensors,dino:/path/to/dino.safetensors}' \
+  infer.component_weights.vae=/path/to/vae.safetensors \
+  infer.component_weights.dit=/path/to/dit.safetensors \
+  infer.component_weights.dino=/path/to/dino.safetensors \
   infer.input=/data/test.png \
-  infer.tile.size=512 \
+  'infer.tile.size=[512,512]' \
   infer.tile.overlap=64
 ```
 
