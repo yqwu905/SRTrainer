@@ -24,7 +24,7 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 from torch import nn
 
 from engine import Trainer
-from models import BaseModel, VOSRModel
+from models import BaseModel
 from tests.dummy_arch import get_dummy_vosr_arch_dict
 from utils.logging import log_image_dict_to_trackers, log_images_to_trackers
 
@@ -402,7 +402,7 @@ def test_vosr_model_train_visual_capture_and_grad_accum(tmp_path: Path) -> None:
     ds = _create_train_manifests(tmp_path, scale=2)
     cfg = _make_train_cfg(tmp_path / "vosr_unit", ds, scale=2, grad_accum=2)
     acc = Accelerator(mixed_precision="no", cpu=True, gradient_accumulation_steps=2)
-    model = VOSRModel(cfg)
+    model = hydra.utils.instantiate(cfg.model, cfg=cfg, _recursive_=False)
     model.setup(acc)
 
     with pytest.raises(ValueError, match="enabled"):

@@ -23,9 +23,8 @@ def test_t2_e01_vosr_model_empty_or_nonpositive_loss_fails_fast(
     accelerate_state_resetter: Callable[[], None],
 ) -> None:
     """F43: VOSRModel fails fast with ValueError when cfg.loss is empty or has no positive weights."""
+    import hydra
     from accelerate import Accelerator
-
-    from models import VOSRModel
 
     src = paired_train_source_factory(name="loss_fail_src", n_samples=2, lq_h=16, lq_w=16, scale=2)
     invalid_loss_cfgs: list[dict[str, Any]] = [
@@ -56,7 +55,7 @@ def test_t2_e01_vosr_model_empty_or_nonpositive_loss_fails_fast(
         )
         acc = Accelerator(cpu=True, mixed_precision="no")
         with pytest.raises(ValueError, match="."):
-            model = VOSRModel(cfg)
+            model = hydra.utils.instantiate(cfg.model, cfg=cfg, _recursive_=False)
             model.setup(acc)
 
 
@@ -67,11 +66,11 @@ def test_t2_e02_vosr_model_pretrain_edge_cases(
     accelerate_state_resetter: Callable[[], None],
 ) -> None:
     """F43: VOSRModel model.pretrain.dit enforces missing file/key/strict errors and partial load into EMA."""
+    import hydra
     import torch
     from accelerate import Accelerator
     from tests.dummy_arch import DummyDiT
 
-    from models import VOSRModel
     from utils.misc import save_safetensors
 
     torch.manual_seed(42)
@@ -102,7 +101,9 @@ def test_t2_e02_vosr_model_pretrain_edge_cases(
     cfg_a.model.pretrain.dit.strict = True
     cfg_a.model.pretrain.dit.key = None
     with pytest.raises(FileNotFoundError):
-        VOSRModel(cfg_a).setup(Accelerator(cpu=True, mixed_precision="no"))
+        hydra.utils.instantiate(cfg_a.model, cfg=cfg_a, _recursive_=False).setup(
+            Accelerator(cpu=True, mixed_precision="no")
+        )
 
     # (b) Missing pretrain key in .pth -> KeyError / ValueError
     accelerate_state_resetter()
@@ -113,7 +114,9 @@ def test_t2_e02_vosr_model_pretrain_edge_cases(
     cfg_b.model.pretrain.dit.strict = True
     cfg_b.model.pretrain.dit.key = "params_ema"
     with pytest.raises((KeyError, ValueError)):
-        VOSRModel(cfg_b).setup(Accelerator(cpu=True, mixed_precision="no"))
+        hydra.utils.instantiate(cfg_b.model, cfg=cfg_b, _recursive_=False).setup(
+            Accelerator(cpu=True, mixed_precision="no")
+        )
 
     # (c) Key mismatch with strict=True -> RuntimeError
     accelerate_state_resetter()
@@ -128,7 +131,9 @@ def test_t2_e02_vosr_model_pretrain_edge_cases(
     cfg_c.model.pretrain.dit.strict = True
     cfg_c.model.pretrain.dit.key = None
     with pytest.raises(RuntimeError):
-        VOSRModel(cfg_c).setup(Accelerator(cpu=True, mixed_precision="no"))
+        hydra.utils.instantiate(cfg_c.model, cfg=cfg_c, _recursive_=False).setup(
+            Accelerator(cpu=True, mixed_precision="no")
+        )
 
     # (d) Partial mismatch with strict=False succeeds & clones into DiT EMA
     accelerate_state_resetter()
@@ -142,7 +147,7 @@ def test_t2_e02_vosr_model_pretrain_edge_cases(
     cfg_d.model.pretrain.dit.path = str(st_mismatch)
     cfg_d.model.pretrain.dit.strict = False
     cfg_d.model.pretrain.dit.key = None
-    model_d = VOSRModel(cfg_d)
+    model_d = hydra.utils.instantiate(cfg_d.model, cfg=cfg_d, _recursive_=False)
     model_d.setup(Accelerator(cpu=True, mixed_precision="no"))
 
     main_sd = model_d.get_infer_network(use_ema=False).dit.state_dict()
@@ -158,10 +163,9 @@ def test_t2_e03_vosr_model_optimizer_step_was_skipped_gating(
     minimal_train_cfg_factory: Callable[..., Any],
 ) -> None:
     """F42, F43: optimizer_step_was_skipped=True freezes lr_scheduler and EMA; False advances both."""
+    import hydra
     import torch
     from accelerate import Accelerator
-
-    from models import VOSRModel
 
     class _OverflowSimAccelerator(Accelerator):
         """Genuine Accelerator subclass simulating FP16 GradScaler overflow on CPU."""
@@ -195,7 +199,7 @@ def test_t2_e03_vosr_model_optimizer_step_was_skipped_gating(
     cfg.model.ema.warmup_steps = 0
 
     acc = _OverflowSimAccelerator(cpu=True, mixed_precision="no", gradient_accumulation_steps=1)
-    model = VOSRModel(cfg)
+    model = hydra.utils.instantiate(cfg.model, cfg=cfg, _recursive_=False)
     model.setup(acc)
 
     lr_init = next(iter(model.get_lr_dict().values()))

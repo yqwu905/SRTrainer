@@ -826,6 +826,7 @@ def test_t4_scenario6_two_stage_l1_to_l1_lpips_finetune_trackers_and_infer(
     accelerate_state_resetter: Callable[[], None],
 ) -> None:
     """Scenario 6: Stage 1 L1 -> Stage 2 pretrain+l1_lpips+USM+Pool+TB -> edge infer -> Reqs #1-#5."""
+    import hydra
     import torch
     import yaml
     from accelerate import Accelerator
@@ -834,7 +835,6 @@ def test_t4_scenario6_two_stage_l1_to_l1_lpips_finetune_trackers_and_infer(
 
     import archs as archs_pkg
     import losses as losses_pkg
-    from models import VOSRModel
     from utils.config import load_resolved_config
     from utils.image import load_image
 
@@ -930,7 +930,7 @@ def test_t4_scenario6_two_stage_l1_to_l1_lpips_finetune_trackers_and_infer(
     # 2. Pretrained weights cloned into BOTH live DiT and DiT EMA prior to step 0
     s2_resolved = load_resolved_config(stage2_dir / "config_resolved.yaml")
     accelerate_state_resetter()
-    probe_model = VOSRModel(s2_resolved)
+    probe_model = hydra.utils.instantiate(s2_resolved.model, cfg=s2_resolved, _recursive_=False)
     probe_model.setup(Accelerator(cpu=True, mixed_precision="no"))
     probe_main_sd = probe_model.get_infer_network(use_ema=False).dit.state_dict()
     probe_ema_sd = probe_model.get_infer_network(use_ema=True).dit.state_dict()

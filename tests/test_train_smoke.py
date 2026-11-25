@@ -928,7 +928,7 @@ def test_vosr_model_7step_setup_losses_pretrain_and_scheduler_gating(
         dit_pretrain_key=None,
     )
     acc2 = Accelerator(mixed_precision="no")
-    model2 = VOSRModel(cfg_partial)
+    model2 = hydra.utils.instantiate(cfg_partial.model, cfg=cfg_partial, _recursive_=False)
     model2.setup(acc2)
     infer_pipe = model2.get_infer_network(use_ema=True)
     assert isinstance(infer_pipe, VOSRPipeline)
@@ -940,7 +940,7 @@ def test_vosr_model_7step_setup_losses_pretrain_and_scheduler_gating(
     cfg_all_zero.loss.l1.weight = 0.0
     acc3 = Accelerator(mixed_precision="no")
     with pytest.raises(ValueError, match="at least one active loss"):
-        VOSRModel(cfg_all_zero).setup(acc3)
+        hydra.utils.instantiate(cfg_all_zero.model, cfg=cfg_all_zero, _recursive_=False).setup(acc3)
     acc3.end_training()
 
 

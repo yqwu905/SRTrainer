@@ -26,7 +26,6 @@ if TYPE_CHECKING:
 
 __all__ = ["VOSRModel", "VOSRPipeline"]
 
-_UNSET: Any = object()
 _COMPONENT_ORDER: tuple[str, ...] = ("vae", "dit", "dino")
 _REQUIRED_COMPONENTS: frozenset[str] = frozenset({"vae", "dit"})
 _VALID_NOISE_INPUTS: frozenset[str] = frozenset({"gaussian", "zero"})
@@ -98,6 +97,40 @@ def _parse_bool(value: Any, name: str) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{name} must be a bool, got {type(value).__name__}: {value!r}.")
     return value
+
+
+def _parse_optional_int(value: Any, name: str) -> int | None:
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+        raise ValueError(f"{name} must be an int or None, got {value!r}.")
+    return value
+
+
+def _parse_noise_input(value: Any) -> str:
+    if value not in _VALID_NOISE_INPUTS:
+        raise ValueError(
+            f"model.noise_input must be one of {sorted(_VALID_NOISE_INPUTS)}, got {value!r}."
+        )
+    return str(value)
+
+
+def _parse_ema_config(raw_ema: Any) -> tuple[bool, float, int]:
+    if raw_ema is None:
+        return False, 0.999, 0
+    if not isinstance(raw_ema, (DictConfig, Mapping)):
+        raise TypeError(f"model.ema must be a mapping or None, got {type(raw_ema).__name__}.")
+    enabled = _parse_bool(raw_ema.get("enabled", True), "model.ema.enabled")
+    raw_decay = raw_ema.get("decay", 0.999)
+    if isinstance(raw_decay, bool) or not isinstance(raw_decay, numbers.Real):
+        raise ValueError(f"model.ema.decay must be a finite real in (0, 1], got {raw_decay!r}.")
+    decay = float(raw_decay)
+    if not math.isfinite(decay) or not (0.0 < decay <= 1.0):
+        raise ValueError(f"model.ema.decay must be in (0, 1], got {raw_decay!r}.")
+    raw_warmup = raw_ema.get("warmup_steps", 0)
+    if isinstance(raw_warmup, bool) or not isinstance(raw_warmup, int) or raw_warmup < 0:
+        raise ValueError(
+            f"model.ema.warmup_steps must be a non-negative integer, got {raw_warmup!r}."
+        )
+    return enabled, decay, int(raw_warmup)
 
 
 def _parse_positive_real_or_none(value: Any, name: str) -> float | None:
@@ -433,115 +466,27 @@ class VOSRModel(BaseModel):
     def __init__(
         self,
         cfg: DictConfig | Mapping[str, Any],
-        scale: int | None = _UNSET,
-        trainable: DictConfig | Mapping[str, Any] | None = _UNSET,
-        noise_input: str | None = _UNSET,
-        posterior_mode: bool | None = _UNSET,
-        clamp_decode_in_train: bool | None = _UNSET,
-        eval_seed: int | None = _UNSET,
-        ema: DictConfig | Mapping[str, Any] | None = _UNSET,
-        save_frozen_weights: bool | None = _UNSET,
-        pretrain: DictConfig | Mapping[str, Any] | None = _UNSET,
+        scale: int | None = None,
+        trainable: DictConfig | Mapping[str, Any] | None = None,
+        noise_input: str = "gaussian",
+        posterior_mode: bool = True,
+        clamp_decode_in_train: bool = True,
+        eval_seed: int | None = 42,
+        ema: DictConfig | Mapping[str, Any] | None = None,
+        save_frozen_weights: bool = True,
+        pretrain: DictConfig | Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(cfg)
 
-        raw_scale = (
-            OmegaConf.select(self.cfg, "model.scale", default=None) if scale is _UNSET else scale
-        )
-        if raw_scale is None:
-            raw_scale = OmegaConf.select(self.cfg, "scale", default=1)
-        self.scale: int = _parse_positive_int(raw_scale, "model.scale")
-
-        raw_trainable = (
-            OmegaConf.select(self.cfg, "model.trainable", default=None)
-            if trainable is _UNSET
-            else trainable
-        )
-        self.trainable: dict[str, bool] = _parse_trainable_map(raw_trainable)
-
-        raw_noise_input = (
-            OmegaConf.select(self.cfg, "model.noise_input", default="gaussian")
-            if noise_input is _UNSET
-            else noise_input
-        )
-        if raw_noise_input not in _VALID_NOISE_INPUTS:
-            raise ValueError(
-                f"model.noise_input must be one of {sorted(_VALID_NOISE_INPUTS)}, got {raw_noise_input!r}."
-            )
-        self.noise_input: str = str(raw_noise_input)
-
-        raw_posterior = (
-            OmegaConf.select(self.cfg, "model.posterior_mode", default=True)
-            if posterior_mode is _UNSET
-            else posterior_mode
-        )
-        self.posterior_mode: bool = _parse_bool(raw_posterior, "model.posterior_mode")
-
-        raw_clamp_train = (
-            OmegaConf.select(self.cfg, "model.clamp_decode_in_train", default=True)
-            if clamp_decode_in_train is _UNSET
-            else clamp_decode_in_train
-        )
-        self.clamp_decode_in_train: bool = _parse_bool(
-            raw_clamp_train, "model.clamp_decode_in_train"
-        )
-
-        raw_eval_seed = (
-            OmegaConf.select(self.cfg, "model.eval_seed", default=42)
-            if eval_seed is _UNSET
-            else eval_seed
-        )
-        if raw_eval_seed is not None and (
-            isinstance(raw_eval_seed, bool) or not isinstance(raw_eval_seed, int)
-        ):
-            raise ValueError(f"model.eval_seed must be an int or None, got {raw_eval_seed!r}.")
-        self.eval_seed: int | None = raw_eval_seed
-
-        raw_ema = (
-            OmegaConf.select(self.cfg, "model.ema", default=None) if ema is _UNSET else ema
-        )
-        if raw_ema is None:
-            self.ema_enabled: bool = False
-            self.ema_decay: float = 0.999
-            self.ema_warmup_steps: int = 0
-        elif isinstance(raw_ema, (DictConfig, Mapping)):
-            self.ema_enabled = _parse_bool(raw_ema.get("enabled", True), "model.ema.enabled")
-            raw_decay = raw_ema.get("decay", 0.999)
-            if isinstance(raw_decay, bool) or not isinstance(raw_decay, numbers.Real):
-                raise ValueError(
-                    f"model.ema.decay must be a finite real in (0, 1], got {raw_decay!r}."
-                )
-            decay_f = float(raw_decay)
-            if not math.isfinite(decay_f) or not (0.0 < decay_f <= 1.0):
-                raise ValueError(f"model.ema.decay must be in (0, 1], got {raw_decay!r}.")
-            self.ema_decay = decay_f
-
-            raw_warmup = raw_ema.get("warmup_steps", 0)
-            if isinstance(raw_warmup, bool) or not isinstance(raw_warmup, int) or raw_warmup < 0:
-                raise ValueError(
-                    f"model.ema.warmup_steps must be a non-negative integer, got {raw_warmup!r}."
-                )
-            self.ema_warmup_steps = int(raw_warmup)
-        else:
-            raise TypeError(
-                f"model.ema must be a mapping or None, got {type(raw_ema).__name__}."
-            )
-
-        raw_save_frozen = (
-            OmegaConf.select(self.cfg, "model.save_frozen_weights", default=True)
-            if save_frozen_weights is _UNSET
-            else save_frozen_weights
-        )
-        self.save_frozen_weights: bool = _parse_bool(
-            raw_save_frozen, "model.save_frozen_weights"
-        )
-
-        raw_pretrain = (
-            OmegaConf.select(self.cfg, "model.pretrain", default=None)
-            if pretrain is _UNSET
-            else pretrain
-        )
-        self.pretrain: dict[str, _PretrainSpec] = _parse_pretrain_map(raw_pretrain)
+        self.scale: int = _parse_positive_int(scale if scale is not None else self.cfg.get("scale", 1), "model.scale")
+        self.trainable: dict[str, bool] = _parse_trainable_map(trainable)
+        self.noise_input: str = _parse_noise_input(noise_input)
+        self.posterior_mode: bool = _parse_bool(posterior_mode, "model.posterior_mode")
+        self.clamp_decode_in_train: bool = _parse_bool(clamp_decode_in_train, "model.clamp_decode_in_train")
+        self.eval_seed: int | None = _parse_optional_int(eval_seed, "model.eval_seed")
+        self.ema_enabled, self.ema_decay, self.ema_warmup_steps = _parse_ema_config(ema)
+        self.save_frozen_weights: bool = _parse_bool(save_frozen_weights, "model.save_frozen_weights")
+        self.pretrain: dict[str, _PretrainSpec] = _parse_pretrain_map(pretrain)
 
         self.pipeline: nn.Module | None = None
         self.emas: dict[str, ModelEMA] = {}
