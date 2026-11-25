@@ -7,6 +7,12 @@ trainable:
   dit: true
   dino: false
 
+# Optional DiT LoRA fine-tuning (target modules are defined in models.lora.initialize_dit_ffn_big_lora)
+lora:
+  enabled: false
+  rank: 16
+  alpha: 16
+
 # One-step sampling & decoding options
 noise_input: gaussian           # gaussian | zero
 posterior_mode: true

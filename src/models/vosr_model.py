@@ -17,8 +17,10 @@ import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from torch import nn
 
+from models import lora as dit_lora
 from models.base_model import BaseModel
 from models.ema import ModelEMA, unwrap_model_for_ema
+from models.lora import DiTLoRAConfig
 from utils.misc import load_weights, pad_to_multiple, strip_state_dict_prefix, unpad_tensor
 
 if TYPE_CHECKING:
@@ -175,6 +177,22 @@ def _parse_pretrain_map(raw: Any) -> dict[str, _PretrainSpec]:
     return specs
 
 
+def _unwrap_dit_for_metadata(module: nn.Module) -> nn.Module:
+    """Unwrap PEFT/adapter wrappers (e.g. ``PeftModel.get_base_model()``) for metadata inspection."""
+    cur: nn.Module = module
+    visited: set[int] = set()
+    while id(cur) not in visited:
+        visited.add(id(cur))
+        get_base = getattr(cur, "get_base_model", None)
+        if callable(get_base):
+            base = get_base()
+            if isinstance(base, nn.Module) and base is not cur:
+                cur = base
+                continue
+        break
+    return cur
+
+
 def _module_accepts_kwarg(module: nn.Module, kwarg_name: str) -> bool:
     try:
         sig = inspect.signature(module.forward)
@@ -263,12 +281,13 @@ class VOSRPipeline(nn.Module):
 
         raw_vae = unwrap_model_for_ema(vae)
         raw_dit = unwrap_model_for_ema(dit)
+        meta_dit = _unwrap_dit_for_metadata(raw_dit)
         raw_dino = unwrap_model_for_ema(dino) if dino is not None else None
 
         vae_z_dim = getattr(raw_vae, "z_dim", getattr(raw_vae, "latent_channels", None))
-        dit_out_ch = getattr(raw_dit, "out_channels", None)
-        dit_in_ch = getattr(raw_dit, "in_channels", None)
-        dit_z_dims = getattr(raw_dit, "z_dims", None)
+        dit_out_ch = getattr(meta_dit, "out_channels", None)
+        dit_in_ch = getattr(meta_dit, "in_channels", None)
+        dit_z_dims = getattr(meta_dit, "z_dims", None)
 
         if isinstance(dit_in_ch, int) and isinstance(dit_out_ch, int) and dit_in_ch != 2 * dit_out_ch:
             raise ValueError(
@@ -285,13 +304,13 @@ class VOSRPipeline(nn.Module):
             )
 
         vae_factor = getattr(raw_vae, "spatial_compression_ratio", 1)
-        dit_patch = getattr(raw_dit, "patch_size", 1)
+        dit_patch = getattr(meta_dit, "patch_size", 1)
         self._spatial_quantum: int = _parse_positive_int(
             int(vae_factor), "vae.spatial_compression_ratio"
         ) * _parse_positive_int(int(dit_patch), "dit.patch_size")
-        self._dit_accepts_z: bool = _module_accepts_kwarg(raw_dit, "z")
+        self._dit_accepts_z: bool = _module_accepts_kwarg(meta_dit, "z")
         self._dit_uses_z: bool = raw_dino is not None and (
-            dit_z_dims is not None or not hasattr(raw_dit, "z_dims")
+            dit_z_dims is not None or not hasattr(meta_dit, "z_dims")
         )
 
         self.vae: nn.Module = vae
@@ -435,6 +454,7 @@ class VOSRModel(BaseModel):
         cfg: DictConfig | Mapping[str, Any],
         scale: int | None = _UNSET,
         trainable: DictConfig | Mapping[str, Any] | None = _UNSET,
+        lora: DictConfig | Mapping[str, Any] | None = _UNSET,
         noise_input: str | None = _UNSET,
         posterior_mode: bool | None = _UNSET,
         clamp_decode_in_train: bool | None = _UNSET,
@@ -458,6 +478,13 @@ class VOSRModel(BaseModel):
             else trainable
         )
         self.trainable: dict[str, bool] = _parse_trainable_map(raw_trainable)
+
+        raw_lora = (
+            OmegaConf.select(self.cfg, "model.lora", default=None) if lora is _UNSET else lora
+        )
+        self.lora: DiTLoRAConfig = dit_lora.parse_dit_lora_config(raw_lora)
+        if self.lora.enabled and not self.trainable["dit"]:
+            raise ValueError("Cannot enable model.lora when model.trainable.dit is False.")
 
         raw_noise_input = (
             OmegaConf.select(self.cfg, "model.noise_input", default="gaussian")
@@ -551,6 +578,7 @@ class VOSRModel(BaseModel):
         self.lr_scheduler: Any | None = None
         self.grad_clip_norm: float | None = None
         self._active_components: tuple[str, ...] = ()
+        self.dit_lora_target_modules: list[str] | None = None
 
         self._is_setup: bool = False
         self._accum_steps: int = 0
@@ -802,16 +830,33 @@ class VOSRModel(BaseModel):
                         unexpected_keys,
                     )
 
+        # Step 2.5: Optional DiT LoRA injection AFTER base pretrain loading, BEFORE trainability / EMA / compile / DDP.
+        dit_lora_target_modules: list[str] | None = None
+        if self.lora.enabled:
+            dit_with_lora, raw_targets = dit_lora.initialize_dit_ffn_big_lora(
+                raw_components["dit"],
+                self.lora.rank,
+                self.lora.alpha,
+            )
+            if not isinstance(dit_with_lora, nn.Module):
+                raise TypeError(
+                    "initialize_dit_ffn_big_lora must return (nn.Module, lora_target_modules), "
+                    f"got {type(dit_with_lora).__name__} as first element."
+                )
+            raw_components["dit"] = dit_with_lora
+            dit_lora_target_modules = list(raw_targets) if raw_targets is not None else []
+
         # Step 3: Apply per-arch trainability switches BEFORE EMA / compile / DDP.
         trainable_names: list[str] = []
         trainable_params: list[nn.Parameter] = []
         for comp_name in active_components:
             comp_mod = raw_components[comp_name]
             if self.trainable[comp_name]:
-                comp_mod.requires_grad_(True)
-                freeze_unused = getattr(comp_mod, "freeze_unused_parameters", None)
-                if callable(freeze_unused):
-                    freeze_unused()
+                if not (comp_name == "dit" and self.lora.enabled):
+                    comp_mod.requires_grad_(True)
+                    freeze_unused = getattr(comp_mod, "freeze_unused_parameters", None)
+                    if callable(freeze_unused):
+                        freeze_unused()
                 comp_params = [p for p in comp_mod.parameters() if p.requires_grad]
                 if not comp_params:
                     raise ValueError(
@@ -906,6 +951,21 @@ class VOSRModel(BaseModel):
                 frozen_names,
                 list(emas.keys()),
             )
+            if self.lora.enabled:
+                dit_mod = raw_components["dit"]
+                dit_total = sum(p.numel() for p in dit_mod.parameters())
+                dit_trainable = sum(p.numel() for p in dit_mod.parameters() if p.requires_grad)
+                dit_pct = (100.0 * dit_trainable / dit_total) if dit_total > 0 else 0.0
+                logger.info(
+                    "[Model] DiT LoRA enabled | rank=%d | alpha=%s | targets=%d | "
+                    "trainable_params=%d / %d (%.2f%%)",
+                    self.lora.rank,
+                    self.lora.alpha,
+                    len(dit_lora_target_modules or ()),
+                    dit_trainable,
+                    dit_total,
+                    dit_pct,
+                )
 
         self.accelerator = accelerator
         self.grad_clip_norm = grad_clip_norm
@@ -916,6 +976,7 @@ class VOSRModel(BaseModel):
         self.optimizer = prepared_optimizer
         self.lr_scheduler = lr_scheduler
         self._active_components = active_components
+        self.dit_lora_target_modules = dit_lora_target_modules
         self._reset_loss_accumulators()
         self._clear_train_visuals()
         self._is_setup = True

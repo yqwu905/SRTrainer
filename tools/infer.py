@@ -19,6 +19,8 @@ from omegaconf import DictConfig, OmegaConf
 from torch import nn
 
 from engine.inferencer import TiledInferencer
+from models import lora as dit_lora
+from models.lora import DiTLoRAConfig
 from models.vosr_model import (
     VOSRPipeline,
     _clone_arch_cfg_skip_pretrained,
@@ -64,6 +66,7 @@ class ResolvedInferConfig:
     component_weights: dict[str, Path | None] | None = None
     component_weights_keys: dict[str, str | None] | None = None
     pipeline_kwargs: dict[str, Any] | None = None
+    dit_lora_cfg: DiTLoRAConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -302,6 +305,15 @@ def _extract_pipeline_kwargs(cfg_node: DictConfig | Mapping[str, Any] | None) ->
         "clamp_decode_in_train": bool(model_cfg.get("clamp_decode_in_train", True)),
         "eval_seed": model_cfg.get("eval_seed", 42),
     }
+
+
+def _extract_dit_lora_config(cfg_node: DictConfig | Mapping[str, Any] | None) -> DiTLoRAConfig:
+    if cfg_node is None or not isinstance(cfg_node, (DictConfig, Mapping)):
+        return DiTLoRAConfig()
+    model_cfg = cfg_node.get("model", None)
+    if not isinstance(model_cfg, (DictConfig, Mapping)):
+        return DiTLoRAConfig()
+    return dit_lora.parse_dit_lora_config(model_cfg.get("lora", None))
 
 
 def resolve_exp_weights(
@@ -569,6 +581,7 @@ def resolve_infer_config(
                 component_weights=comp_weights,
                 component_weights_keys=comp_keys,
                 pipeline_kwargs=_extract_pipeline_kwargs(train_cfg),
+                dit_lora_cfg=_extract_dit_lora_config(train_cfg),
             )
 
         arch_cfg = _validate_arch_cfg(arch_raw, context=f"config_resolved.yaml ({config_path})")
@@ -633,6 +646,7 @@ def resolve_infer_config(
             component_weights=comp_weights,
             component_weights_keys=comp_keys,
             pipeline_kwargs=_extract_pipeline_kwargs(cfg_oc),
+            dit_lora_cfg=_extract_dit_lora_config(cfg_oc),
         )
 
     arch_cfg = _validate_arch_cfg(arch_raw, context="Standalone inference config")
@@ -928,6 +942,7 @@ def _build_infer_model(
     if resolved.component_weights is not None:
         comp_modules: dict[str, nn.Module] = {}
         comp_keys = resolved.component_weights_keys or {}
+        lora_cfg = resolved.dit_lora_cfg
         for comp in _VOSR_COMPONENTS:
             if comp not in resolved.component_weights:
                 continue
@@ -944,13 +959,33 @@ def _build_infer_model(
                 raise TypeError(
                     f"Instantiated arch.{comp} must be torch.nn.Module, got {type(comp_mod).__name__}."
                 )
-            if weight_path is not None:
-                _load_component_weights(
+            use_dit_lora = comp == "dit" and lora_cfg is not None and lora_cfg.enabled
+            if use_dit_lora:
+                comp_mod, _ = dit_lora.initialize_dit_ffn_big_lora(
                     comp_mod,
-                    weight_path,
-                    strict=True,
-                    key=comp_keys.get(comp),
+                    lora_cfg.rank,
+                    lora_cfg.alpha,
                 )
+                if not isinstance(comp_mod, nn.Module):
+                    raise TypeError(
+                        "initialize_dit_ffn_big_lora must return (nn.Module, lora_target_modules), "
+                        f"got {type(comp_mod).__name__} as first element."
+                    )
+            if weight_path is not None:
+                if use_dit_lora:
+                    load_weights(
+                        comp_mod,
+                        weight_path,
+                        strict=True,
+                        key=comp_keys.get(comp),
+                    )
+                else:
+                    _load_component_weights(
+                        comp_mod,
+                        weight_path,
+                        strict=True,
+                        key=comp_keys.get(comp),
+                    )
             comp_modules[comp] = comp_mod
 
         pipe_kwargs = dict(resolved.pipeline_kwargs or {})
