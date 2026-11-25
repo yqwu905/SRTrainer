@@ -456,7 +456,7 @@ def test_vosr_model_per_arch_trainability_combinations_ema_and_separate_export(
     )
 
     acc = Accelerator(cpu=True, mixed_precision="no")
-    model = VOSRModel(cfg)
+    model = hydra.utils.instantiate(cfg.model, cfg=cfg, _recursive_=False)
     model.setup(acc)
 
     # Non-zero final_layer so step 1 propagates gradients through frozen DiT into VAE encoder / DINO too!
@@ -541,7 +541,7 @@ def test_vosr_model_invalid_trainability_and_missing_dino_fail_fast(
     # All components frozen -> fail fast
     acc = Accelerator(cpu=True, mixed_precision="no")
     with pytest.raises(ValueError, match="At least one active VOSR arch"):
-        VOSRModel(base_cfg).setup(acc)
+        hydra.utils.instantiate(base_cfg["model"], cfg=base_cfg, _recursive_=False).setup(acc)
     acc.end_training()
 
     # trainable.dino=True when arch.dino is None -> fail fast
@@ -549,14 +549,14 @@ def test_vosr_model_invalid_trainability_and_missing_dino_fail_fast(
     cfg_bad_dino.model.trainable.dino = True
     acc2 = Accelerator(cpu=True, mixed_precision="no")
     with pytest.raises(ValueError, match="trainable.dino"):
-        VOSRModel(cfg_bad_dino).setup(acc2)
+        hydra.utils.instantiate(cfg_bad_dino.model, cfg=cfg_bad_dino, _recursive_=False).setup(acc2)
     acc2.end_training()
 
     # Unknown component in trainable -> fail fast
     cfg_unknown = OmegaConf.create(base_cfg)
     cfg_unknown.model.trainable.unknown_arch = True
     with pytest.raises(ValueError, match="Unknown component"):
-        VOSRModel(cfg_unknown)
+        VOSRModel(cfg_unknown, trainable=cfg_unknown.model.trainable)
 
 
 # ---------------------------------------------------------------------------

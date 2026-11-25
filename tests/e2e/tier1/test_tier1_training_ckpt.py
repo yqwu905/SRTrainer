@@ -179,11 +179,10 @@ def test_t1_vosr_model_named_loss_dict_raw_values_and_skip_nonpositive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """F43: Named L1/LPIPS loss dict logs raw sub-losses, weighted total, skips weight <= 0."""
+    import hydra
     import torch
     from accelerate import Accelerator
     from tests.helpers.fake_backends import patch_lpips_offline
-
-    from models import VOSRModel
 
     patch_lpips_offline(monkeypatch)
     # gt_size=64 so AlexNet LPIPS runs cleanly at 64x64.
@@ -217,7 +216,7 @@ def test_t1_vosr_model_named_loss_dict_raw_values_and_skip_nonpositive(
     )
 
     accelerator = Accelerator(cpu=True, mixed_precision="no")
-    model = VOSRModel(cfg)
+    model = hydra.utils.instantiate(cfg.model, cfg=cfg, _recursive_=False)
     model.setup(accelerator)
 
     torch.manual_seed(12)
@@ -246,12 +245,12 @@ def test_t1_vosr_model_pretrain_safetensors_and_basicsr_pth_cloned_to_ema(
     minimal_train_cfg_factory: Callable[..., Any],
 ) -> None:
     """F43: Per-arch pretrain (.safetensors and .pth params_ema) loads into DiT and clones to EMA."""
+    import hydra
     import torch
     from accelerate import Accelerator
     from accelerate.state import AcceleratorState, GradientState
     from tests.dummy_arch import DummyDiT
 
-    from models import VOSRModel
     from utils.misc import save_safetensors
 
     torch.manual_seed(21)
@@ -287,7 +286,7 @@ def test_t1_vosr_model_pretrain_safetensors_and_basicsr_pth_cloned_to_ema(
     cfg_st.model.pretrain.dit.key = None
 
     acc1 = Accelerator(cpu=True, mixed_precision="no")
-    model_st = VOSRModel(cfg_st)
+    model_st = hydra.utils.instantiate(cfg_st.model, cfg=cfg_st, _recursive_=False)
     model_st.setup(acc1)
     for use_ema in (False, True):
         dit_sd = model_st.get_infer_network(use_ema=use_ema).dit.state_dict()
@@ -313,7 +312,7 @@ def test_t1_vosr_model_pretrain_safetensors_and_basicsr_pth_cloned_to_ema(
     cfg_pth.model.pretrain.dit.key = "params_ema"
 
     acc2 = Accelerator(cpu=True, mixed_precision="no")
-    model_pth = VOSRModel(cfg_pth)
+    model_pth = hydra.utils.instantiate(cfg_pth.model, cfg=cfg_pth, _recursive_=False)
     model_pth.setup(acc2)
     for use_ema in (False, True):
         dit_sd = model_pth.get_infer_network(use_ema=use_ema).dit.state_dict()
@@ -329,10 +328,9 @@ def test_t1_vosr_model_grad_accum_and_lr_scheduler_step_cadence(
     minimal_train_cfg_factory: Callable[..., Any],
 ) -> None:
     """F43: grad_accum=2 cadence, lr_scheduler NOT prepared, Step 7 checkpointing of LR & EMA."""
+    import hydra
     import torch
     from accelerate import Accelerator
-
-    from models import VOSRModel
 
     base_lr = 2.0e-4
     eta_min = 1.0e-6
@@ -353,7 +351,7 @@ def test_t1_vosr_model_grad_accum_and_lr_scheduler_step_cadence(
     cfg.optim.scheduler.eta_min = eta_min
 
     accelerator = Accelerator(cpu=True, mixed_precision="no", gradient_accumulation_steps=2)
-    model = VOSRModel(cfg)
+    model = hydra.utils.instantiate(cfg.model, cfg=cfg, _recursive_=False)
     model.setup(accelerator)
 
     # Guardrail #5: lr_scheduler must NEVER be passed to accelerator.prepare().
