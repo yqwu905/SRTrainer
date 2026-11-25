@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 from PIL import Image
 
 _SRC_DIR = str(Path(__file__).resolve().parents[1] / "src")
@@ -67,8 +68,9 @@ from utils.rapidocr import (  # noqa: E402
     ensure_rapidocr_models_ready,
     get_rapidocr_model_root,
     import_rapidocr,
-    onnx_device_params,
-    resolve_onnx_model,
+    resolve_rec_dict_path,
+    resolve_torch_model,
+    torch_device_params,
 )
 from utils.text_geometry import canonical_quad  # noqa: E402
 
@@ -171,35 +173,25 @@ def _compute_run_fingerprint(
 
 
 def _detect_accelerator_devices(device_type: str = "auto") -> list[str]:
-    """Auto-detect available CUDA or Ascend NPU devices supported by ONNX Runtime."""
+    """Auto-detect available CUDA, Ascend NPU, or MPS devices supported by PyTorch."""
     norm_type = device_type.strip().lower()
-    if norm_type not in {"auto", "cuda", "gpu", "npu", "cpu"}:
+    if norm_type not in {"auto", "cuda", "gpu", "npu", "mps", "cpu"}:
         raise ValueError(
-            f"Unsupported device_type={device_type!r}; expected auto, cuda, npu, or cpu."
+            f"Unsupported device_type={device_type!r}; expected auto, cuda, npu, mps, or cpu."
         )
     if norm_type == "cpu":
         return ["cpu"]
 
-    _, onnxruntime = import_rapidocr(context="Offline text-line detection")
-    providers = set(onnxruntime.get_available_providers())
-
     def _cuda_count() -> int:
         try:
-            import torch
-
             if torch.cuda.is_available():
                 return int(torch.cuda.device_count())
         except Exception:
             pass
-        vis = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
-        if vis and vis not in {"-1", "none", "NoDevFiles"}:
-            return len([tok for tok in vis.split(",") if tok.strip()])
         return 0
 
     def _npu_count() -> int:
         try:
-            import torch
-
             try:
                 import torch_npu  # noqa: F401
             except ImportError:
@@ -208,30 +200,41 @@ def _detect_accelerator_devices(device_type: str = "auto") -> list[str]:
                 return int(torch.npu.device_count())
         except Exception:
             pass
-        vis = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "").strip()
-        if vis:
-            return len([tok for tok in vis.split(",") if tok.strip()])
         return 0
 
-    if norm_type in {"auto", "cuda", "gpu"} and "CUDAExecutionProvider" in providers:
+    def _mps_available() -> bool:
+        try:
+            mps_backend = getattr(torch.backends, "mps", None)
+            return bool(mps_backend is not None and mps_backend.is_available())
+        except Exception:
+            return False
+
+    if norm_type in {"auto", "cuda", "gpu"}:
         count = _cuda_count()
         if count > 0:
             return [f"cuda:{i}" for i in range(count)]
         if norm_type in {"cuda", "gpu"}:
-            return ["cuda:0"]
+            raise RuntimeError(
+                f"Requested --device-type={norm_type!r}, but CUDA is not available in PyTorch."
+            )
 
-    if norm_type in {"auto", "npu"} and "CANNExecutionProvider" in providers:
+    if norm_type in {"auto", "npu"}:
         count = _npu_count()
         if count > 0:
             return [f"npu:{i}" for i in range(count)]
         if norm_type == "npu":
-            return ["npu:0"]
+            raise RuntimeError(
+                "Requested --device-type='npu', but Ascend NPU is not available via `torch_npu`."
+            )
 
-    if norm_type in {"cuda", "gpu", "npu"}:
-        raise RuntimeError(
-            f"Requested --device-type={norm_type!r}, but no matching ONNX Runtime execution "
-            f"provider is available (available={sorted(providers)})."
-        )
+    if norm_type in {"auto", "mps"}:
+        if _mps_available():
+            return ["mps"]
+        if norm_type == "mps":
+            raise RuntimeError(
+                "Requested --device-type='mps', but Apple Silicon MPS is not available in PyTorch."
+            )
+
     return ["cpu"]
 
 
@@ -272,20 +275,23 @@ def parse_devices(
                 if inferred_prefix is None:
                     detected = _detect_accelerator_devices("auto")
                     inferred_prefix = detected[0].partition(":")[0]
-                    if inferred_prefix == "cpu":
+                    if inferred_prefix in {"cpu", "mps"}:
                         raise ValueError(
-                            f"Bare device index {token!r} requires a GPU/NPU backend or explicit "
-                            "`--device-type cuda|npu` (or write `cuda:{token}` / `npu:{token}`)."
+                            f"Bare device index {token!r} requires a multi-device CUDA/NPU backend "
+                            "or explicit `--device-type cuda|npu` (or write "
+                            f"`cuda:{token}` / `npu:{token}`)."
                         )
                 base_devices.append(f"{inferred_prefix}:{low}")
             elif low == "cpu":
                 base_devices.append("cpu")
+            elif low in {"mps", "mps:0"}:
+                base_devices.append("mps")
             else:
                 name, sep, dev_id = low.partition(":")
                 if name not in {"cuda", "gpu", "npu"} or (sep and not dev_id.isdecimal()):
                     raise ValueError(
                         f"Invalid device entry {token!r}; expected cpu, cuda[:ID], gpu[:ID], "
-                        "npu[:ID], or a numeric device index."
+                        "npu[:ID], mps, or a numeric device index."
                     )
                 canonical_name = "cuda" if name == "gpu" else name
                 base_devices.append(f"{canonical_name}:{dev_id or '0'}")
@@ -315,10 +321,14 @@ def build_rapidocr_params(
     cfg: DetectConfig,
     device: str,
     rapidocr: Any,
-    onnxruntime: Any,
 ) -> tuple[dict[str, Any], tuple[str, ...], Path]:
-    """Build RapidOCR 3.x ``params`` dict, auto-download model keys, and cache root."""
-    det_version, det_type, det_path = resolve_onnx_model(
+    """Build RapidOCR 3.x PyTorch ``params`` dict, auto-download model keys, and cache root."""
+    if cfg.intra_threads is not None and (
+        isinstance(cfg.intra_threads, bool) or int(cfg.intra_threads) < 1
+    ):
+        raise ValueError(f"intra_threads must be a positive integer, got {cfg.intra_threads!r}.")
+
+    det_version, det_type, det_path = resolve_torch_model(
         cfg.det_model, cfg.det_model_dir, "detection", DET_MODELS
     )
     model_root = get_rapidocr_model_root()
@@ -329,7 +339,7 @@ def build_rapidocr_params(
         "Global.use_rec": not bool(cfg.det_only),
         "Global.text_score": float(cfg.text_score),
         "Global.model_root_dir": str(model_root),
-        "Det.engine_type": rapidocr.EngineType.ONNXRUNTIME,
+        "Det.engine_type": rapidocr.EngineType.TORCH,
         "Det.ocr_version": rapidocr.OCRVersion(det_version),
         "Det.model_type": rapidocr.ModelType(det_type),
         "Det.lang_type": det_lang,
@@ -338,24 +348,22 @@ def build_rapidocr_params(
         "Det.limit_type": str(cfg.limit_type),
         "Det.box_thresh": float(cfg.box_thresh),
         "Det.unclip_ratio": float(cfg.unclip_ratio),
-        **onnx_device_params(device, onnxruntime, cpu_fallback_hint="`--devices cpu`"),
+        **torch_device_params(device, cpu_fallback_hint="`--devices cpu`"),
     }
-    if cfg.intra_threads is not None:
-        params["EngineConfig.onnxruntime.intra_op_num_threads"] = int(cfg.intra_threads)
 
     download_keys: list[str] = []
     if det_path is None:
-        download_keys.append(f"det:{det_version}:{det_type}:ch")
+        download_keys.append(f"torch:det:{det_version}:{det_type}:ch")
 
     if not cfg.det_only:
-        rec_version, rec_type, rec_path = resolve_onnx_model(
+        rec_version, rec_type, rec_path = resolve_torch_model(
             cfg.rec_model, cfg.rec_model_dir, "recognition", REC_MODELS
         )
         if rec_path is None:
-            download_keys.append(f"rec:{rec_version}:{rec_type}:ch")
+            download_keys.append(f"torch:rec:{rec_version}:{rec_type}:ch")
         params.update(
             {
-                "Rec.engine_type": rapidocr.EngineType.ONNXRUNTIME,
+                "Rec.engine_type": rapidocr.EngineType.TORCH,
                 "Rec.ocr_version": rapidocr.OCRVersion(rec_version),
                 "Rec.model_type": rapidocr.ModelType(rec_type),
                 "Rec.lang_type": "ch",
@@ -364,19 +372,19 @@ def build_rapidocr_params(
             }
         )
         if rec_path is not None:
-            dict_path = rec_path.with_name("dict.txt")
-            if dict_path.is_file():
+            dict_path = resolve_rec_dict_path(rec_path, rec_version)
+            if dict_path is not None:
                 params["Rec.rec_keys_path"] = str(dict_path)
 
     if cfg.use_cls:
-        cls_version, cls_type, cls_path = resolve_onnx_model(
+        cls_version, cls_type, cls_path = resolve_torch_model(
             cfg.cls_model, cfg.cls_model_dir, "orientation", CLS_MODELS
         )
         if cls_path is None:
-            download_keys.append(f"cls:{cls_version}:{cls_type}")
+            download_keys.append(f"torch:cls:{cls_version}:{cls_type}")
         params.update(
             {
-                "Cls.engine_type": rapidocr.EngineType.ONNXRUNTIME,
+                "Cls.engine_type": rapidocr.EngineType.TORCH,
                 "Cls.ocr_version": rapidocr.OCRVersion(cls_version),
                 "Cls.model_type": rapidocr.ModelType(cls_type),
                 "Cls.model_path": str(cls_path) if cls_path is not None else None,
@@ -388,9 +396,9 @@ def build_rapidocr_params(
 
 
 def _prefetch_models_before_spawn(cfg: DetectConfig) -> None:
-    """Pre-download any uncached ONNX models once on CPU before spawning GPU/NPU workers."""
-    rapidocr, onnxruntime = import_rapidocr(context="Offline text-line detection")
-    params, download_keys, model_root = build_rapidocr_params(cfg, "cpu", rapidocr, onnxruntime)
+    """Pre-download any uncached PyTorch weights & dicts once on CPU before spawning workers."""
+    rapidocr = import_rapidocr(context="Offline text-line detection")
+    params, download_keys, model_root = build_rapidocr_params(cfg, "cpu", rapidocr)
     if download_keys:
         ensure_rapidocr_models_ready(
             params,
@@ -401,8 +409,14 @@ def _prefetch_models_before_spawn(cfg: DetectConfig) -> None:
 
 
 def _create_rapidocr_engine(cfg: DetectConfig, device: str, *, skip_download_lock: bool = False) -> Any:
-    rapidocr, onnxruntime = import_rapidocr(context="Offline text-line detection")
-    params, download_keys, model_root = build_rapidocr_params(cfg, device, rapidocr, onnxruntime)
+    if cfg.intra_threads is not None:
+        if isinstance(cfg.intra_threads, bool) or int(cfg.intra_threads) < 1:
+            raise ValueError(
+                f"intra_threads must be a positive integer, got {cfg.intra_threads!r}."
+            )
+        torch.set_num_threads(int(cfg.intra_threads))
+    rapidocr = import_rapidocr(context="Offline text-line detection")
+    params, download_keys, model_root = build_rapidocr_params(cfg, device, rapidocr)
     return create_rapidocr_engine(
         params,
         rapidocr=rapidocr,
@@ -1000,7 +1014,7 @@ def run_detect_manifest(
                 if progress_bar is not None:
                     progress_bar.update(1)
         else:
-            # Pre-download any missing ONNX weights once on CPU so all GPU/NPU workers initialize
+            # Pre-download any missing PyTorch weights & dicts once on CPU so all workers initialize
             # concurrently without contending on WeakFileLock.
             _prefetch_models_before_spawn(cfg)
 
@@ -1140,15 +1154,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help=(
-            "Comma-separated device list, e.g. 'cuda:0,cuda:1', 'npu:0,npu:1', '0,1,2,3', or "
-            "'cpu'. Omit to auto-use all available GPUs/NPUs (or CPU)."
+            "Comma-separated device list, e.g. 'cuda:0,cuda:1', 'npu:0,npu:1', '0,1,2,3', 'mps', "
+            "or 'cpu'. Omit to auto-use all available GPUs/NPUs/MPS (or CPU)."
         ),
     )
     parser.add_argument(
         "--device-type",
         type=str,
         default="auto",
-        choices=("auto", "cuda", "gpu", "npu", "cpu"),
+        choices=("auto", "cuda", "gpu", "npu", "mps", "cpu"),
         help="Backend type for auto-detection or bare numeric --devices indices (default: auto).",
     )
     parser.add_argument(
@@ -1199,7 +1213,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--det-model-dir",
         type=str,
         default=None,
-        help="Optional local detection .onnx file or directory containing it.",
+        help="Optional local detection PyTorch .pth file or directory containing it.",
     )
     parser.add_argument(
         "--rec-model",
@@ -1211,7 +1225,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--rec-model-dir",
         type=str,
         default=None,
-        help="Optional local recognition .onnx file or directory containing it.",
+        help="Optional local recognition PyTorch .pth file or directory containing it (with dict.txt/ppocrv5_dict.txt).",
     )
     parser.add_argument(
         "--cls-model",
@@ -1223,7 +1237,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--cls-model-dir",
         type=str,
         default=None,
-        help="Optional local orientation .onnx file or directory containing it.",
+        help="Optional local orientation PyTorch .pth file or directory containing it.",
     )
     parser.add_argument(
         "--rec-batch-size",
@@ -1272,7 +1286,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--intra-threads",
         type=int,
         default=None,
-        help="Optional ONNX Runtime intra_op_num_threads per worker process.",
+        help="Optional PyTorch CPU intra-op thread count (torch.set_num_threads) per worker process.",
     )
     parser.add_argument(
         "--on-error",

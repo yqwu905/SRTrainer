@@ -757,11 +757,13 @@ def test_rapidocr_text_recognizer_cls_180_rotation_local_paths_and_count_errors(
 ) -> None:
     rec_dir = tmp_path / "rec_model"
     rec_dir.mkdir()
-    rec_path = rec_dir / "inference.onnx"
+    rec_path = rec_dir / "ch_PP-OCRv5_rec_server.pth"
     rec_path.touch()
-    dict_path = rec_dir / "dict.txt"
+    # Extra unrelated .pth verifies canonical stem disambiguation inside a shared directory.
+    (rec_dir / "ch_PP-OCRv5_det_server.pth").touch()
+    dict_path = rec_dir / "ppocrv5_dict.txt"
     dict_path.touch()
-    cls_path = tmp_path / "cls.onnx"
+    cls_path = tmp_path / "ch_ppocr_mobile_v2.0_cls_mobile.pth"
     cls_path.touch()
 
     init_calls: list[dict[str, Any]] = []
@@ -790,25 +792,28 @@ def test_rapidocr_text_recognizer_cls_180_rotation_local_paths_and_count_errors(
         RapidOCR=_FakeRapidOCR,
         OCRVersion=str,
         ModelType=str,
-        EngineType=types.SimpleNamespace(ONNXRUNTIME="onnxruntime"),
+        EngineType=types.SimpleNamespace(TORCH="torch"),
     )
-    onnxruntime = types.SimpleNamespace(get_available_providers=lambda: ["CPUExecutionProvider"])
-    monkeypatch.setattr(ocr_mod, "_import_rapidocr", lambda: (rapidocr, onnxruntime))
+    monkeypatch.setattr(ocr_mod, "_import_rapidocr", lambda: rapidocr)
+    monkeypatch.setattr("utils.rapidocr._is_npu_available", lambda: (False, 0))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
-    with pytest.raises(FileNotFoundError, match="ONNX"):
+    with pytest.raises(FileNotFoundError, match="PyTorch"):
         RapidOCRTextRecognizer(model_dir=tmp_path / "does_not_exist")
-    with pytest.raises(FileNotFoundError, match="ONNX"):
+    with pytest.raises(FileNotFoundError, match="PyTorch"):
         RapidOCRTextRecognizer(
-            cls_model_name="PP-LCNet_x1_0_textline_ori", cls_model_dir=tmp_path / "missing_cls"
+            cls_model_name="ch_ppocr_mobile_v2.0_cls", cls_model_dir=tmp_path / "missing_cls"
         )
     with pytest.raises(ValueError, match="Unknown OCR recognition model"):
         RapidOCRTextRecognizer(model_name="other_model")
-    with pytest.raises(ValueError, match="requires CANNExecutionProvider"):
+    with pytest.raises(ValueError, match="Unknown OCR orientation model"):
+        RapidOCRTextRecognizer(cls_model_name="PP-LCNet_x1_0_textline_ori")
+    with pytest.raises(ValueError, match="torch_npu"):
         RapidOCRTextRecognizer(device="npu:1")
 
     recognizer = RapidOCRTextRecognizer(
         model_dir=rec_dir,
-        cls_model_name="PP-LCNet_x1_0_textline_ori",
+        cls_model_name="ch_ppocr_mobile_v2.0_cls",
         cls_model_dir=cls_path,
         device="cpu",
         batch_size=2,
@@ -816,9 +821,11 @@ def test_rapidocr_text_recognizer_cls_180_rotation_local_paths_and_count_errors(
     (params,) = init_calls
     assert params["Global.use_det"] is False
     assert params["Global.use_cls"] is True
-    assert params["Rec.engine_type"] == params["Cls.engine_type"] == "onnxruntime"
-    assert params["Rec.ocr_version"] == params["Cls.ocr_version"] == "PP-OCRv5"
-    assert params["Rec.model_type"] == params["Cls.model_type"] == "server"
+    assert params["Rec.engine_type"] == params["Cls.engine_type"] == "torch"
+    assert params["Rec.ocr_version"] == "PP-OCRv5"
+    assert params["Rec.model_type"] == "server"
+    assert params["Cls.ocr_version"] == "PP-OCRv4"
+    assert params["Cls.model_type"] == "mobile"
     assert params["Rec.lang_type"] == "ch"
     assert params["Rec.model_path"] == str(rec_path)
     assert params["Rec.rec_keys_path"] == str(dict_path)
@@ -840,12 +847,27 @@ def test_rapidocr_text_recognizer_cls_180_rotation_local_paths_and_count_errors(
                 recognizer([crop0, crop1])
         counts[output] = 2
 
-    onnxruntime.get_available_providers = lambda: ["CUDAExecutionProvider"]
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
     RapidOCRTextRecognizer(device="gpu:2")
-    assert init_calls[-1]["EngineConfig.onnxruntime.use_cuda"] is True
-    assert init_calls[-1]["EngineConfig.onnxruntime.cuda_ep_cfg.device_id"] == 2
+    assert init_calls[-1]["EngineConfig.torch.use_cuda"] is True
+    assert init_calls[-1]["EngineConfig.torch.cuda_ep_cfg.device_id"] == 2
     assert init_calls[-1]["Global.use_cls"] is False
     assert init_calls[-1]["Rec.model_path"] is None
+
+    with pytest.raises(ValueError, match="out of range"):
+        RapidOCRTextRecognizer(device="cuda:4")
+
+    monkeypatch.setattr("utils.rapidocr._is_npu_available", lambda: (True, 8))
+    RapidOCRTextRecognizer(device="npu:3")
+    assert init_calls[-1]["EngineConfig.torch.use_npu"] is True
+    assert init_calls[-1]["EngineConfig.torch.npu_ep_cfg.device_id"] == 3
+
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    RapidOCRTextRecognizer(device="mps")
+    assert init_calls[-1]["EngineConfig.torch.use_mps"] is True
+    with pytest.raises(ValueError, match="MPS only supports device index 0"):
+        RapidOCRTextRecognizer(device="mps:1")
 
 
 def test_missing_optional_dependencies_raise_actionable_import_error(
@@ -855,12 +877,13 @@ def test_missing_optional_dependencies_raise_actionable_import_error(
     real_import = builtins.__import__
 
     def _block_optional(name: str, *args: Any, **kwargs: Any) -> Any:
-        if name in {"rapidocr", "onnxruntime"}:
+        if name == "rapidocr" or name.startswith("rapidocr."):
             raise ImportError(f"No module named {name!r}")
         if name == "cv2" or name.startswith("cv2."):
             raise ImportError("No module named 'cv2'")
         return real_import(name, *args, **kwargs)
 
+    monkeypatch.delitem(sys.modules, "rapidocr", raising=False)
     monkeypatch.delitem(sys.modules, "cv2", raising=False)
     monkeypatch.setattr(builtins, "__import__", _block_optional)
 
@@ -1292,11 +1315,8 @@ fake_rapidocr = types.ModuleType("rapidocr")
 fake_rapidocr.RapidOCR = _DeterministicRapidOCR
 fake_rapidocr.OCRVersion = str
 fake_rapidocr.ModelType = str
-fake_rapidocr.EngineType = types.SimpleNamespace(ONNXRUNTIME="onnxruntime")
+fake_rapidocr.EngineType = types.SimpleNamespace(TORCH="torch")
 sys.modules["rapidocr"] = fake_rapidocr
-fake_onnxruntime = types.ModuleType("onnxruntime")
-fake_onnxruntime.__spec__ = ModuleSpec("onnxruntime", loader=None)
-sys.modules["onnxruntime"] = fake_onnxruntime
 
 try:
     import cv2 as _cv2_check
