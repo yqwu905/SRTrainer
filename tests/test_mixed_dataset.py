@@ -111,6 +111,21 @@ def _build_synthetic_sources(tmp_path: Path, scale: int = 4) -> dict[str, Any]:
     }
 
 
+def test_rectangular_mixed_batch_preserves_shape_under_rotation(tmp_path: Path, monkeypatch) -> None:
+    sources = _build_synthetic_sources(tmp_path)
+    ds = MixedSRDataset(
+        sources=[sources["gt_only"], sources["paired"]],
+        gt_size=OmegaConf.create([24, 40]),
+        scale=4,
+        augment={"rot90": True},
+    )
+    monkeypatch.setattr("random.randint", lambda low, high: high)
+    batch = next(iter(DataLoader(ds, batch_sampler=[[(0, 3), (1, 0)]])))
+    assert batch["gt"].shape == (2, 3, 24, 40)
+    assert batch["lq"].shape == (2, 3, 6, 10)
+    assert batch["need_degradation"].tolist() == [True, False]
+
+
 def test_data_package_all_exports() -> None:
     expected = {
         "MixedSRDataset",

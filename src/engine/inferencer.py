@@ -15,7 +15,7 @@ from torch import nn
 from config.schema import BlendMode, MixedPrecision, TileConfig
 from config.validation import load_tile_config
 from utils.config import normalize_mixed_precision
-from utils.misc import pad_to_min_size, pad_to_multiple, unpad_tensor
+from utils.misc import normalize_gt_size, pad_to_min_size, pad_to_multiple, unpad_tensor
 
 __all__ = [
     "TiledInferencer",
@@ -133,7 +133,7 @@ class TiledInferencer:
     """Shared tiled/untiled inference engine used by both validation and ``tools/infer.py``.
 
     Supports:
-    - Auto tile size derivation (``tile_size=None`` -> ``gt_size // scale``) with graceful
+    - Auto tile size derivation (divide each GT dimension by scale when ``tile_size=None``) with graceful
       untiled fallback + warning when ``gt_size`` is unavailable.
     - Explicit square (``int``) or rectangular (``[tile_h, tile_w]``) tile sizes.
     - Overlap validation (``0 <= tile_overlap < min(tile_h, tile_w) // 2``; ``0`` = hard stitch).
@@ -151,7 +151,7 @@ class TiledInferencer:
         tile_batch_size: int = 4,
         blend_mode: str | BlendMode = BlendMode.cosine,
         pad_multiple: int = 8,
-        gt_size: int | None = None,
+        gt_size: int | Sequence[int] | None = None,
         mixed_precision: str | MixedPrecision = MixedPrecision.no,
         device: torch.device | str | None = None,
     ) -> None:
@@ -177,13 +177,7 @@ class TiledInferencer:
         norm_blend_mode = _normalize_blend_mode(blend_mode)
         norm_mp = normalize_mixed_precision(mixed_precision)
 
-        if gt_size is not None:
-            if not _is_positive_int(gt_size):
-                raise ValueError(f"gt_size must be a positive integer or None, got {gt_size!r}.")
-            if gt_size % scale != 0:
-                raise ValueError(
-                    f"gt_size ({gt_size}) must be evenly divisible by scale ({scale})."
-                )
+        crop_size = None if gt_size is None else normalize_gt_size(gt_size, scale)
 
         resolved_device: torch.device | None
         if device is None:
@@ -213,7 +207,7 @@ class TiledInferencer:
         if not tile_enabled:
             return
 
-        resolved_tile_size = self._resolve_tile_size(tile_size, gt_size=gt_size, scale=scale)
+        resolved_tile_size = self._resolve_tile_size(tile_size, gt_size=crop_size, scale=scale)
         if resolved_tile_size is None:
             logging.getLogger("srtrainer").warning(
                 "TiledInferencer: tile_size=None (auto) requires gt_size, which is None; "
@@ -244,14 +238,14 @@ class TiledInferencer:
     @staticmethod
     def _resolve_tile_size(
         tile_size: int | Sequence[int] | None,
-        gt_size: int | None,
+        gt_size: tuple[int, int] | None,
         scale: int,
     ) -> tuple[int, int] | None:
         if tile_size is None:
             if gt_size is None:
                 return None
-            dim = gt_size // scale
-            return (dim, dim)
+            height, width = gt_size
+            return height // scale, width // scale
 
         if isinstance(tile_size, bool):
             raise ValueError(f"tile_size cannot be a bool, got {tile_size!r}.")
@@ -285,7 +279,7 @@ class TiledInferencer:
         model: nn.Module,
         scale: int,
         tile_cfg: TileConfig | DictConfig | Mapping[str, Any] | None,
-        gt_size: int | None = None,
+        gt_size: int | Sequence[int] | None = None,
         mixed_precision: str | MixedPrecision = MixedPrecision.no,
         device: torch.device | str | None = None,
     ) -> TiledInferencer:

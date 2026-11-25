@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import is_dataclass
 from pathlib import Path
 from typing import Any, TypeVar
@@ -32,6 +32,7 @@ from config.schema import (
     TrainerConfig,
     VOSRModelConfig,
 )
+from utils.misc import normalize_gt_size
 
 __all__ = [
     "ConfigValidationError",
@@ -133,7 +134,7 @@ def validate_tile_config(
     *,
     field_prefix: str = "tile",
     scale: int | None = None,
-    gt_size: int | None = None,
+    gt_size: int | Sequence[int] | None = None,
 ) -> None:
     """Validate business ranges and cross-field constraints on ``TileConfig``."""
     if tile.overlap < 0:
@@ -163,14 +164,15 @@ def validate_tile_config(
                     f"for size={tile.size}."
                 )
     elif tile.enabled and tile.overlap > 0 and scale is not None and gt_size is not None:
-        if scale >= 1 and gt_size >= 1 and gt_size % scale == 0:
-            auto_dim = gt_size // scale
-            if tile.overlap >= auto_dim // 2:
-                raise ConfigValidationError(
-                    f"{field_prefix}.overlap={tile.overlap} must satisfy "
-                    f"0 <= overlap < (gt_size // scale) // 2 ({auto_dim // 2}) "
-                    f"for auto tile size ({auto_dim}, {auto_dim})."
-                )
+        height, width = normalize_gt_size(gt_size, scale)
+        tile_h, tile_w = height // scale, width // scale
+        limit = min(tile_h, tile_w) // 2
+        if tile.overlap >= limit:
+            raise ConfigValidationError(
+                f"{field_prefix}.overlap={tile.overlap} must satisfy "
+                f"0 <= overlap < min(tile_h, tile_w) // 2 ({limit}) "
+                f"for auto tile size ({tile_h}, {tile_w})."
+            )
 
 
 def _validate_ema_config(ema: EMAConfig) -> None:
@@ -275,12 +277,10 @@ def _validate_data(data: DataConfig, global_scale: int) -> None:
         raise ConfigValidationError(
             f"data.scale ({data.scale}) must match scale ({global_scale})."
         )
-    if data.gt_size < 1:
-        raise ConfigValidationError(f"data.gt_size must be >= 1, got {data.gt_size!r}.")
-    if data.gt_size % global_scale != 0:
-        raise ConfigValidationError(
-            f"data.gt_size ({data.gt_size}) must be evenly divisible by scale ({global_scale})."
-        )
+    try:
+        normalize_gt_size(data.gt_size, global_scale, field_name="data.gt_size")
+    except ValueError as exc:
+        raise ConfigValidationError(str(exc)) from exc
     if data.batch_size_per_gpu < 1:
         raise ConfigValidationError(
             f"data.batch_size_per_gpu must be >= 1, got {data.batch_size_per_gpu!r}."
@@ -375,7 +375,7 @@ def _validate_trainer(
     trainer: TrainerConfig,
     *,
     scale: int,
-    gt_size: int,
+    gt_size: int | Sequence[int],
     has_val_suites: bool,
 ) -> None:
     if trainer.total_iters < 1:

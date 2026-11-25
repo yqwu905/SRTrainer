@@ -19,6 +19,7 @@
   - `RealESRGANDegrader` 在 GPU FP32 下仅对 `gt_only` 子集执行二阶模糊/缩放/噪声/DiffJPEG/Sinc 退化，与真实 `paired` 样本在同 Batch 平滑混合。
 - **验证集内聚于 `metric` 配置组**：每个验证套件在 `configs/metric/` 中独立绑定数据集与所需指标，并将 JSON 附加字段（如 `label` / `text_lines` / `annotation_size`）完整透传到 `BaseMetric.compute(pred, target, meta)` 与 `BaseMetric.compute_stats(pred, target, meta)`；内置 BasicSR/MATLAB BT.601 对齐的 `PSNRMetric`、`SSIMMetric`、`LPIPSMetric`，以及基于 RapidOCR 的文本识别指标 `OCRAccuracyMetric`（OCR-A）、`CERMetric`（CER）与 `OneMinusNEDMetric`（1-NED）。
 - **双轨 Checkpoint（按架构独立保存）**：滚动保存完整续训状态（`checkpoints/state_iter_XXXXXX/`，支持 `resume=auto`）+ 按架构原子导出纯推理权重（`weights/iter_XXXXXX_{vae,dit,dino}.safetensors`、可训练组件 `*_ema.safetensors`、`latest_{arch}[_ema].safetensors`、`best_<val>_<metric>_{arch}.safetensors`）并持久化 `config_resolved.yaml`。
+- **矩形裁剪**：`data.gt_size` 可填整数或 `[高, 宽]`。例如 `gt_size: [256, 512]` 配合 `scale: 4`，训练时的 LQ 裁剪和推理时的自动分块均为 64×128，此时可将分块重叠设为 16 像素。矩形裁剪启用旋转增强时只使用 0° 和 180°，保持批内尺寸一致。
 - **共享 `TiledInferencer` + `tools/infer.py` 分布式推理**：支持实验目录自动还原与独立 `infer.yaml` 两种模式；支持按训练输入尺寸自动推导 `tile_size`（`gt_size // scale`）与可配置 `overlap` 羽化无缝融合；支持单卡与 Accelerate 多卡分布式离线推理。
 
 ## 安装

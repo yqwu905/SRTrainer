@@ -148,7 +148,7 @@ class Trainer:
 
         self.seed: int = config.seed
         self.scale: int = config.scale
-        self.gt_size: int = d_cfg.gt_size
+        self.gt_size = d_cfg.gt_size
         self.primary_dataset: str | None = m_cfg.primary_dataset
         self.primary_metric: str | None = m_cfg.primary_metric
 

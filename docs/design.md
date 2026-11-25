@@ -498,7 +498,7 @@ class TrainState:
 > `configs/data/` 仅负责**训练数据与在线退化**；验证集与对应评测指标统一在 `configs/metric/` 中配置（见第 7 节）。
 
 ```yaml
-gt_size: 256                  # 训练 GT 裁剪尺寸；LQ 输入尺寸自动为 gt_size // scale (= 64)
+gt_size: 256                  # 训练 GT 裁剪尺寸，也支持 [高, 宽]；每个维度须能被 scale 整除
 scale: ${scale}
 batch_size_per_gpu: 8
 num_workers: 8
@@ -820,7 +820,7 @@ mixed_precision: bf16          # no | fp16 | bf16
 # Tile 推理策略
 tile:
   enabled: true
-  size: auto                   # auto -> 自动推导为 train_cfg.data.gt_size // scale；也可填具体整数如 64 或 [64, 64]
+  size: null                   # null 表示按训练尺寸逐轴推导，也可填 [高, 宽]
   overlap: 16                  # LQ 空间重叠像素（必须 < tile_size // 2），0 表示硬拼接
   batch_size: 4                # 单次并行前向的 tile 数量，提升 GPU 利用率
   blend_mode: cosine           # cosine | linear | mean（重叠区羽化融合权重策略）
@@ -830,7 +830,7 @@ tile:
 #### 自动 Tile 切块与羽化融合算法细节
 
 1. **`tile_size` 自动推导**：
-   - 当 `tile.size == "auto"` 时，自动计算 `tile_h = tile_w = train_cfg.data.gt_size // scale`（例如训练 `gt_size=256, scale=4` → 自动 `tile_size = 64`，与训练网络见过的 LQ patch 尺寸完全一致！）；
+   - 当 `tile.size` 为 `null` 时，自动计算 `(tile_h, tile_w) = (gt_h // scale, gt_w // scale)`（例如训练 `gt_size=256, scale=4` → 自动 `tile_size = (64, 64)`，与训练网络见过的 LQ patch 尺寸完全一致！）；
    - 若独立模式无 `data.gt_size`，则提示用户显式指定 `tile.size` 或退回整图模式（并自动执行 `pad_multiple`）。
 2. **小图 / 边界保护**：
    - 若输入图 `H < tile_h` 或 `W < tile_w`，先用 `reflect` 模式（超边时降级 `replicate`）向右下方 padding 至至少 `(tile_h, tile_w)`，推理完毕后按 `(orig_H * scale, orig_W * scale)` 精确裁回。
@@ -862,7 +862,7 @@ accelerate launch --num_processes 4 tools/infer.py \
   infer.input=/data/manifests/large_test.json \
   infer.input_root=/data/large_test \
   infer.output_dir=outputs/exp01_large_test \
-  infer.tile.size=auto \
+  infer.tile.size=null \
   infer.tile.overlap=16 \
   infer.tile.batch_size=8
 ```

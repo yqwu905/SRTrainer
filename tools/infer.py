@@ -42,7 +42,7 @@ from models.vosr_model import (
 from utils.config import load_resolved_config
 from utils.image import IMAGE_EXTENSIONS, load_image, save_image
 from utils.logging import setup_logger
-from utils.misc import load_weights
+from utils.misc import load_weights, normalize_gt_size
 
 register_configs()
 
@@ -72,7 +72,7 @@ class ResolvedInferConfig:
     mode: Literal["exp_dir", "standalone"]
     arch_cfg: DictConfig
     scale: int
-    gt_size: int | None
+    gt_size: tuple[int, int] | None
     weights_path: Path
     weights_key: str | None
     exp_dir: Path | None = None
@@ -450,11 +450,11 @@ def resolve_infer_config(
             if ("data" in train_cfg and train_cfg.data is not None)
             else None
         )
-        if raw_gt_size is not None and (
-            isinstance(raw_gt_size, bool) or not isinstance(raw_gt_size, int) or raw_gt_size < 1
-        ):
-            raise ValueError(f"data.gt_size must be a positive integer, got {raw_gt_size!r}.")
-        gt_size = int(raw_gt_size) if raw_gt_size is not None else None
+        gt_size = (
+            normalize_gt_size(raw_gt_size, scale, field_name="data.gt_size")
+            if raw_gt_size is not None
+            else None
+        )
 
         model_cfg, _, _ = _extract_exp_subconfigs(train_cfg)
 

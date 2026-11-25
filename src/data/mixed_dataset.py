@@ -27,6 +27,7 @@ from data.transforms import (
     random_crop_with_coords,
 )
 from utils.image import load_image
+from utils.misc import normalize_gt_size
 from utils.text_geometry import canonical_quad
 
 __all__ = ["MixedSRDataset", "train_collate_fn"]
@@ -147,15 +148,15 @@ def _crop_text_lines(
     *,
     crop_left: int,
     crop_top: int,
-    crop_size: int,
+    crop_size: tuple[int, int],
     orig_h: int,
     orig_w: int,
 ) -> list[dict[str, Any]]:
     """Translate HR line quads and glyph quads to crop-relative coordinates."""
     if not text_lines:
         return []
-    max_x = float(min(crop_size, orig_w - crop_left))
-    max_y = float(min(crop_size, orig_h - crop_top))
+    max_x = float(min(crop_size[1], orig_w - crop_left))
+    max_y = float(min(crop_size[0], orig_h - crop_top))
     if max_x <= 0.0 or max_y <= 0.0:
         return []
 
@@ -213,7 +214,7 @@ class MixedSRDataset(Dataset[dict[str, Any]]):
     def __init__(
         self,
         sources: Sequence[DataSourceConfig | Mapping[str, Any]],
-        gt_size: int,
+        gt_size: int | Sequence[int],
         scale: int = 1,
         augment: AugmentConfig | Mapping[str, Any] | None = None,
         has_degradation: bool = True,
@@ -222,13 +223,10 @@ class MixedSRDataset(Dataset[dict[str, Any]]):
         logger: Any = None,
         text_crop_prob: float = 0.0,
     ) -> None:
-        self.gt_size: int = _validate_positive_int(gt_size, "gt_size")
-        self.scale: int = _validate_positive_int(scale, "scale")
-        if self.gt_size % self.scale != 0:
-            raise ValueError(
-                f"gt_size ({self.gt_size}) must be divisible by scale ({self.scale})."
-            )
-        self.lq_size: int = self.gt_size // self.scale
+        self.scale = _validate_positive_int(scale, "scale")
+        self.gt_size = normalize_gt_size(gt_size, self.scale)
+        crop_h, crop_w = self.gt_size
+        self.lq_size = (crop_h // self.scale, crop_w // self.scale)
         self.text_crop_prob: float = _validate_prob(text_crop_prob, "text_crop_prob")
 
         if not isinstance(has_degradation, bool):
@@ -404,6 +402,7 @@ class MixedSRDataset(Dataset[dict[str, Any]]):
                     hflip=self._hflip,
                     vflip=self._vflip,
                     rot90=self._rot90,
+                    preserve_shape=True,
                 )
 
             item: dict[str, Any] = {
@@ -448,9 +447,10 @@ class MixedSRDataset(Dataset[dict[str, Any]]):
                 hflip=self._hflip,
                 vflip=self._vflip,
                 rot90=self._rot90,
+                preserve_shape=True,
             )
 
-        lq = torch.zeros((3, self.lq_size, self.lq_size), dtype=torch.float32)
+        lq = torch.zeros((3, *self.lq_size), dtype=torch.float32)
         kernel1, kernel2, sinc_kernel = self.kernel_generator.sample()
         out_item: dict[str, Any] = {
             "gt": gt.contiguous(),

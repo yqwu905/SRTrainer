@@ -100,8 +100,8 @@ class SaveFormat(str, Enum):
 class TileConfig:
     """Shared tiled inference configuration for validation and offline inference.
 
-    ``size=None`` derives square tiles automatically from ``gt_size // scale`` (falling back
-    to untiled inference when ``gt_size`` is unavailable). Explicit tile size is always a
+    ``size=None`` divides each GT crop dimension by scale to derive the tile size. Inference
+    falls back to untiled mode when ``gt_size`` is unavailable. Explicit tile size is a
     2-element ``[tile_h, tile_w]`` list of positive integers.
     """
 
@@ -302,7 +302,8 @@ class RealESRGANDegraderConfig:
 class DataConfig:
     """Training data pipeline configuration (validation suites belong strictly in ``MetricConfig``)."""
 
-    gt_size: int = 512
+    # OmegaConf does not support int | list[int]. Validation accepts a side or [height, width].
+    gt_size: Any = 512
     scale: int = 1
     batch_size_per_gpu: int = 1
     num_workers: int = 8

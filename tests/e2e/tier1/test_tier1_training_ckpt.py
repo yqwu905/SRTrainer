@@ -569,7 +569,7 @@ def test_t1_trainer_fit_full_dir_layout_train_log_visuals_and_best(
         primary_dataset="set5",
         primary_metric="psnr",
         scale=2,
-        gt_size=32,
+        gt_size=[32, 40],
         batch_size=2,
         total_iters=4,
         log_interval=2,

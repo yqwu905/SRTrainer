@@ -845,7 +845,7 @@ def test_end_to_end_mixed_dataset_loader_and_degrader(tmp_path: Path) -> None:
             {"name": "gt_src", "root_dir": str(gt_root), "json_path": str(gt_json), "ratio": 0.6},
             {"name": "p_src", "root_dir": str(paired_root), "json_path": str(paired_json), "ratio": 0.4},
         ],
-        gt_size=64,
+        gt_size=[48, 64],
         scale=4,
         augment={"hflip": True, "vflip": True, "rot90": True},
         has_degradation=True,
@@ -872,8 +872,8 @@ def test_end_to_end_mixed_dataset_loader_and_degrader(tmp_path: Path) -> None:
             unique_k1_hashes.add(k1.numpy().tobytes())
         orig_paired_lq = raw_batch["lq"][~mask].clone()
         out = degrader(raw_batch)
-        assert out["lq"].shape == (6, 3, 16, 16)
-        assert out["gt"].shape == (6, 3, 64, 64)
+        assert out["lq"].shape == (6, 3, 12, 16)
+        assert out["gt"].shape == (6, 3, 48, 64)
         assert torch.isfinite(out["lq"]).all()
         assert torch.equal(out["lq"][~mask], orig_paired_lq)
         if mask.any():

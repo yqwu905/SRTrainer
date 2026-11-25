@@ -38,6 +38,7 @@ from config import (
     load_kernel_config,
     load_tile_config,
     load_train_config,
+    validate_tile_config,
 )
 from engine.inferencer import TiledInferencer
 from engine.trainer import Trainer
@@ -258,6 +259,22 @@ def test_unified_yaml_rejects_polymorphic_and_unknown_fields(tmp_path: Path) -> 
 # ---------------------------------------------------------------------------
 # Principle 4: Business Validation (Ranges & Cross-Field Dependencies)
 # ---------------------------------------------------------------------------
+
+
+def test_rectangular_gt_size_and_auto_tile_overlap(tmp_path: Path) -> None:
+    raw = _minimal_train_dict(tmp_path)
+    raw["data"]["gt_size"] = [24, 40]
+    cfg = load_train_config(raw)
+    assert cfg.data.gt_size == [24, 40]
+
+    validate_tile_config(TileConfig(overlap=5), scale=cfg.scale, gt_size=cfg.data.gt_size)
+    with pytest.raises(ConfigValidationError, match=r"auto tile size \(12, 20\)"):
+        validate_tile_config(TileConfig(overlap=6), scale=cfg.scale, gt_size=cfg.data.gt_size)
+
+    for bad_size in ([24], [24, 41], [23, 40], [24, True], "24"):
+        raw["data"]["gt_size"] = bad_size
+        with pytest.raises(ConfigValidationError, match=r"data\.gt_size"):
+            load_train_config(raw)
 
 
 def test_business_range_and_cross_field_validations(tmp_path: Path) -> None:
