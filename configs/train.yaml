@@ -1,4 +1,5 @@
 defaults:
+  - base_train
   - arch/vae: ???
   - arch/dit: ???
   - arch/dino: null
@@ -12,14 +13,8 @@ defaults:
   - experiment: ???
   - override hydra/job_logging: disabled
 
-# Global variables shared across config groups via ${...} interpolation
-exp_name: debug_vosr2
-scale: 1
-seed: 42
-output_root: experiments
-work_dir: ${output_root}/${exp_name}
-
-# Disable Hydra chdir and .hydra subdir; Trainer manages dirs & config_resolved.yaml on Rank 0
+# Global defaults (exp_name, scale, seed, output_root, work_dir) live in TrainConfig (src/config/schema.py).
+# Disable Hydra chdir and .hydra subdir; Trainer manages dirs & config_resolved.yaml on Rank 0.
 hydra:
   job:
     chdir: false

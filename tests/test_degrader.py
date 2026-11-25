@@ -517,7 +517,7 @@ def test_realesrgan_degrader_hydra_instantiation() -> None:
     assert deg.queue_size == 0
     assert deg.jpeg_range == (30.0, 95.0)
     assert deg.jpeg_range2 == (30.0, 95.0)
-    assert deg.kernel_cfg is not None and deg.kernel_cfg["kernel_size"] == 21
+    assert deg.kernel_cfg is not None and deg.kernel_cfg.kernel_size == 21
 
 
 def test_realesrgan_degrader_mask_modes_and_usm(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -17,6 +17,8 @@ from omegaconf import OmegaConf
 from omegaconf.errors import OmegaConfBaseException
 from torch.utils.data import Dataset, default_collate
 
+from config.schema import AugmentConfig, DataSourceConfig, KernelConfig
+from config.validation import load_augment_config, load_kernel_config
 from data.degradation.kernels import KernelGenerator
 from data.manifest import SourceStats, TrainSample, validate_sources_config
 from data.transforms import (
@@ -210,12 +212,12 @@ class MixedSRDataset(Dataset[dict[str, Any]]):
 
     def __init__(
         self,
-        sources: Sequence[Mapping[str, Any]],
+        sources: Sequence[DataSourceConfig | Mapping[str, Any]],
         gt_size: int,
         scale: int = 1,
-        augment: Mapping[str, Any] | None = None,
+        augment: AugmentConfig | Mapping[str, Any] | None = None,
         has_degradation: bool = True,
-        kernel_cfg: Mapping[str, Any] | None = None,
+        kernel_cfg: KernelConfig | Mapping[str, Any] | None = None,
         is_main_process: bool = True,
         logger: Any = None,
         text_crop_prob: float = 0.0,
@@ -236,26 +238,30 @@ class MixedSRDataset(Dataset[dict[str, Any]]):
         self.has_degradation: bool = has_degradation
 
         if augment is None:
-            self._hflip = False
-            self._vflip = False
-            self._rot90 = False
+            aug_cfg = AugmentConfig(hflip=False, vflip=False, rot90=False)
+        elif isinstance(augment, AugmentConfig):
+            aug_cfg = augment
         else:
             norm_aug = _normalize_omegaconf(augment, "augment")
             if not isinstance(norm_aug, Mapping):
                 raise TypeError(
-                    f"augment must be a mapping or None, got {type(norm_aug).__name__}."
+                    f"augment must be an AugmentConfig, mapping, or None, got {type(norm_aug).__name__}."
                 )
-            flags: dict[str, bool] = {}
             for key in ("hflip", "vflip", "rot90"):
-                val = norm_aug.get(key, False)
-                if not isinstance(val, bool):
+                if key in norm_aug and not isinstance(norm_aug[key], bool):
                     raise TypeError(
-                        f"augment[{key!r}] must be a bool, got {type(val).__name__}."
+                        f"augment[{key!r}] must be a bool, got {type(norm_aug[key]).__name__}."
                     )
-                flags[key] = val
-            self._hflip = flags["hflip"]
-            self._vflip = flags["vflip"]
-            self._rot90 = flags["rot90"]
+            aug_cfg = load_augment_config(
+                {
+                    "hflip": norm_aug.get("hflip", False),
+                    "vflip": norm_aug.get("vflip", False),
+                    "rot90": norm_aug.get("rot90", False),
+                }
+            )
+        self._hflip = aug_cfg.hflip
+        self._vflip = aug_cfg.vflip
+        self._rot90 = aug_cfg.rot90
 
         # Intentionally do NOT store `logger` on `self` to keep dataset picklable for num_workers>0.
         samples_per_source, source_stats = validate_sources_config(
@@ -289,16 +295,16 @@ class MixedSRDataset(Dataset[dict[str, Any]]):
             )
 
         if self.has_degradation:
-            if kernel_cfg is None:
-                plain_kernel_cfg: dict[str, Any] = {}
-            else:
-                norm_kcfg = _normalize_omegaconf(kernel_cfg, "kernel_cfg")
-                if not isinstance(norm_kcfg, Mapping):
-                    raise TypeError(
-                        f"kernel_cfg must be a mapping or None, got {type(norm_kcfg).__name__}."
-                    )
-                plain_kernel_cfg = dict(norm_kcfg)
-            self.kernel_generator: KernelGenerator | None = KernelGenerator(plain_kernel_cfg)
+            if kernel_cfg is not None and not isinstance(kernel_cfg, (KernelConfig, Mapping)):
+                raise TypeError(
+                    f"kernel_cfg must be a KernelConfig, mapping, or None, got {type(kernel_cfg).__name__}."
+                )
+            resolved_kcfg = (
+                kernel_cfg
+                if isinstance(kernel_cfg, KernelConfig)
+                else (load_kernel_config(kernel_cfg) if kernel_cfg is not None else KernelConfig())
+            )
+            self.kernel_generator: KernelGenerator | None = KernelGenerator(resolved_kcfg)
             self.kernel_size: int | None = self.kernel_generator.kernel_size
         else:
             self.kernel_generator = None

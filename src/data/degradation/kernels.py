@@ -13,24 +13,15 @@ from omegaconf import OmegaConf
 from omegaconf.errors import OmegaConfBaseException
 from scipy import special
 
+from config.schema import VALID_KERNEL_TYPES, KernelConfig
+from config.validation import load_kernel_config
+
 __all__ = [
     "VALID_KERNEL_TYPES",
     "circular_lowpass_kernel",
     "random_mixed_kernels",
     "KernelGenerator",
 ]
-
-VALID_KERNEL_TYPES: tuple[str, ...] = (
-    "iso",
-    "aniso",
-    "generalized_iso",
-    "generalized_aniso",
-    "plateau_iso",
-    "plateau_aniso",
-)
-
-_DEFAULT_KERNEL_LIST: tuple[str, ...] = VALID_KERNEL_TYPES
-_DEFAULT_KERNEL_PROB: tuple[float, ...] = (0.45, 0.25, 0.12, 0.03, 0.12, 0.03)
 
 
 def _normalize_omegaconf(obj: Any, context: str) -> Any:
@@ -311,29 +302,28 @@ class KernelGenerator:
     DataLoader multi-worker reseeding automatically yields distinct kernels per worker.
     """
 
-    def __init__(self, kernel_cfg: Mapping[str, Any] | None = None) -> None:
+    def __init__(self, kernel_cfg: KernelConfig | Mapping[str, Any] | None = None) -> None:
         if kernel_cfg is None:
-            cfg: dict[str, Any] = {}
+            kcfg = KernelConfig()
+        elif isinstance(kernel_cfg, KernelConfig):
+            kcfg = kernel_cfg
         else:
             normalized = _normalize_omegaconf(kernel_cfg, "kernel_cfg")
             if not isinstance(normalized, Mapping):
                 raise TypeError(
-                    f"kernel_cfg must be a mapping or None, got {type(normalized).__name__}."
+                    f"kernel_cfg must be a KernelConfig, mapping, or None, "
+                    f"got {type(normalized).__name__}."
                 )
-            cfg = dict(normalized)
+            kcfg = load_kernel_config(normalized)
 
-        self.kernel_size: int = _validate_odd_kernel_size(
-            cfg.get("kernel_size", 21), "kernel_size"
-        )
+        self.kernel_size: int = _validate_odd_kernel_size(kcfg.kernel_size, "kernel_size")
 
-        raw_range = cfg.get("kernel_range")
+        raw_range = kcfg.kernel_range
         if raw_range is None:
             default_range = [k for k in range(7, self.kernel_size + 1, 2)]
             raw_range = default_range if default_range else [self.kernel_size]
-        else:
-            raw_range = _to_1d_list(raw_range, "kernel_range")
-            if len(raw_range) == 0:
-                raise ValueError("kernel_range must not be empty.")
+        elif len(raw_range) == 0:
+            raise ValueError("kernel_range must not be empty.")
 
         clean_range: list[int] = []
         for idx, k in enumerate(raw_range):
@@ -346,41 +336,27 @@ class KernelGenerator:
         self.kernel_range: tuple[int, ...] = tuple(clean_range)
 
         self.kernel_list, self.kernel_prob = _validate_kernel_types_and_probs(
-            cfg.get("kernel_list", _DEFAULT_KERNEL_LIST),
-            cfg.get("kernel_prob", _DEFAULT_KERNEL_PROB),
+            kcfg.kernel_list,
+            kcfg.kernel_prob,
             list_name="kernel_list",
             prob_name="kernel_prob",
         )
-        self.blur_sigma = _validate_range(
-            cfg.get("blur_sigma", (0.2, 3.0)), "blur_sigma", positive_only=True
-        )
-        self.betag_range = _validate_range(
-            cfg.get("betag_range", (0.5, 4.0)), "betag_range", positive_only=True
-        )
-        self.betap_range = _validate_range(
-            cfg.get("betap_range", (1.0, 2.0)), "betap_range", positive_only=True
-        )
-        self.sinc_prob = _validate_scalar_prob(cfg.get("sinc_prob", 0.1), "sinc_prob")
+        self.blur_sigma = _validate_range(kcfg.blur_sigma, "blur_sigma", positive_only=True)
+        self.betag_range = _validate_range(kcfg.betag_range, "betag_range", positive_only=True)
+        self.betap_range = _validate_range(kcfg.betap_range, "betap_range", positive_only=True)
+        self.sinc_prob = _validate_scalar_prob(kcfg.sinc_prob, "sinc_prob")
 
         self.kernel_list2, self.kernel_prob2 = _validate_kernel_types_and_probs(
-            cfg.get("kernel_list2", _DEFAULT_KERNEL_LIST),
-            cfg.get("kernel_prob2", _DEFAULT_KERNEL_PROB),
+            kcfg.kernel_list2,
+            kcfg.kernel_prob2,
             list_name="kernel_list2",
             prob_name="kernel_prob2",
         )
-        self.blur_sigma2 = _validate_range(
-            cfg.get("blur_sigma2", (0.2, 1.5)), "blur_sigma2", positive_only=True
-        )
-        self.betag_range2 = _validate_range(
-            cfg.get("betag_range2", (0.5, 4.0)), "betag_range2", positive_only=True
-        )
-        self.betap_range2 = _validate_range(
-            cfg.get("betap_range2", (1.0, 2.0)), "betap_range2", positive_only=True
-        )
-        self.sinc_prob2 = _validate_scalar_prob(cfg.get("sinc_prob2", 0.1), "sinc_prob2")
-        self.final_sinc_prob = _validate_scalar_prob(
-            cfg.get("final_sinc_prob", 0.8), "final_sinc_prob"
-        )
+        self.blur_sigma2 = _validate_range(kcfg.blur_sigma2, "blur_sigma2", positive_only=True)
+        self.betag_range2 = _validate_range(kcfg.betag_range2, "betag_range2", positive_only=True)
+        self.betap_range2 = _validate_range(kcfg.betap_range2, "betap_range2", positive_only=True)
+        self.sinc_prob2 = _validate_scalar_prob(kcfg.sinc_prob2, "sinc_prob2")
+        self.final_sinc_prob = _validate_scalar_prob(kcfg.final_sinc_prob, "final_sinc_prob")
 
     def _sample_blur_kernel(
         self,

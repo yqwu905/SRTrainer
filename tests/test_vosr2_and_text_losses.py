@@ -455,8 +455,11 @@ def test_vosr_model_per_arch_trainability_combinations_ema_and_separate_export(
         }
     )
 
+    from config import load_train_config
+    from models.base_model import build_model
+
     acc = Accelerator(cpu=True, mixed_precision="no")
-    model = hydra.utils.instantiate(cfg.model, cfg=cfg, _recursive_=False)
+    model = build_model(load_train_config(cfg, require_data=False, require_trainer_full=False))
     model.setup(acc)
 
     # Non-zero final_layer so step 1 propagates gradients through frozen DiT into VAE encoder / DINO too!
@@ -538,25 +541,23 @@ def test_vosr_model_invalid_trainability_and_missing_dino_fail_fast(
         },
     }
 
+    from config import load_train_config
+
     # All components frozen -> fail fast
-    acc = Accelerator(cpu=True, mixed_precision="no")
     with pytest.raises(ValueError, match="At least one active VOSR arch"):
-        hydra.utils.instantiate(base_cfg["model"], cfg=base_cfg, _recursive_=False).setup(acc)
-    acc.end_training()
+        load_train_config(base_cfg, require_data=False, require_trainer_full=False)
 
     # trainable.dino=True when arch.dino is None -> fail fast
     cfg_bad_dino = OmegaConf.create(base_cfg)
     cfg_bad_dino.model.trainable.dino = True
-    acc2 = Accelerator(cpu=True, mixed_precision="no")
     with pytest.raises(ValueError, match="trainable.dino"):
-        hydra.utils.instantiate(cfg_bad_dino.model, cfg=cfg_bad_dino, _recursive_=False).setup(acc2)
-    acc2.end_training()
+        load_train_config(cfg_bad_dino, require_data=False, require_trainer_full=False)
 
-    # Unknown component in trainable -> fail fast
+    # Unknown component in trainable -> fail fast (Structured Config rejects unknown keys)
     cfg_unknown = OmegaConf.create(base_cfg)
     cfg_unknown.model.trainable.unknown_arch = True
-    with pytest.raises(ValueError, match="Unknown component"):
-        VOSRModel(cfg_unknown, trainable=cfg_unknown.model.trainable)
+    with pytest.raises(ValueError, match="unknown_arch"):
+        load_train_config(cfg_unknown, require_data=False, require_trainer_full=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1170,7 +1171,6 @@ def test_end_to_end_trainer_vosr2_with_ocr_kl_and_glyph_losses_and_per_arch_savi
                 "eval_seed": 42,
                 "ema": {"enabled": True, "decay": 0.99, "warmup_steps": 0},
                 "save_frozen_weights": True,
-                "pretrain": None,
             },
             "data": {
                 "gt_size": 32,
@@ -1229,7 +1229,7 @@ def test_end_to_end_trainer_vosr2_with_ocr_kl_and_glyph_losses_and_per_arch_savi
                 "gradient_accumulation_steps": 1,
                 "grad_clip_norm": 1.0,
                 "compile": False,
-                "log_with": None,
+                "log_with": [],
                 "resume": None,
                 "append_timestamp": False,
                 "val_save_visuals": False,

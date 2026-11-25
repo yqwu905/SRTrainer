@@ -33,13 +33,6 @@ trainer:
   total_iters: 10000
   val_interval: 1000
   save_interval: 1000
-  mixed_precision: bf16
-  gradient_accumulation_steps: 1
-  grad_clip_norm: 1.0
   val_tile:
-    enabled: true
-    size: auto
     overlap: 64
-    batch_size: 4
-    blend_mode: cosine
     pad_multiple: 16

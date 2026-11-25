@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 from collections.abc import Mapping
+from dataclasses import is_dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -16,9 +17,13 @@ import yaml
 from omegaconf import DictConfig, OmegaConf
 from omegaconf.errors import OmegaConfBaseException
 
+from config.schema import InferRootConfig, MixedPrecision, TrainConfig
+
 
 def normalize_mixed_precision(value: Any) -> str:
     """Normalize YAML/CLI mixed precision values to Accelerate's ``'no' | 'fp16' | 'bf16'``."""
+    if isinstance(value, MixedPrecision):
+        return value.value
     if value is None:
         return "no"
     if isinstance(value, bool):
@@ -42,14 +47,16 @@ def normalize_mixed_precision(value: Any) -> str:
     )
 
 
-def _as_dict_config(cfg: DictConfig | Mapping[str, Any]) -> DictConfig:
+def _as_dict_config(cfg: TrainConfig | InferRootConfig | DictConfig | Mapping[str, Any]) -> DictConfig:
     if isinstance(cfg, DictConfig):
         return cfg
+    if is_dataclass(cfg) and not isinstance(cfg, type):
+        return OmegaConf.structured(cfg)
     if isinstance(cfg, Mapping):
         created = OmegaConf.create(dict(cfg))
         if isinstance(created, DictConfig):
             return created
-    raise TypeError(f"Expected DictConfig or Mapping, got {type(cfg).__name__}.")
+    raise TypeError(f"Expected TrainConfig, DictConfig, or Mapping, got {type(cfg).__name__}.")
 
 
 def _parse_int_env(key: str, default: int) -> int:
@@ -96,7 +103,7 @@ def _with_timestamp(base: Path) -> str:
     return f"{str(base).rstrip('/')}_{ts}"
 
 
-def resolve_work_dir(cfg: DictConfig) -> Path:
+def resolve_work_dir(cfg: TrainConfig | DictConfig | Mapping[str, Any]) -> Path:
     """Resolve experiment working directory with multi-rank safe timestamp broadcast.
 
     - When ``trainer.append_timestamp`` is False or ``trainer.resume`` is set, returns
@@ -109,14 +116,20 @@ def resolve_work_dir(cfg: DictConfig) -> Path:
         ``PartialState(cpu=...)`` appropriately and broadcasts Rank 0's timestamped path via
         ``accelerate.utils.broadcast_object_list``.
     """
-    cfg_oc = _as_dict_config(cfg)
-    raw_work_dir = OmegaConf.select(cfg_oc, "work_dir", default=None)
+    if isinstance(cfg, TrainConfig):
+        raw_work_dir: Any = cfg.work_dir
+        append_timestamp = bool(cfg.trainer.append_timestamp)
+        resume: Any = cfg.trainer.resume
+    else:
+        cfg_oc = _as_dict_config(cfg)
+        raw_work_dir = OmegaConf.select(cfg_oc, "work_dir", default=None)
+        append_timestamp = bool(OmegaConf.select(cfg_oc, "trainer.append_timestamp", default=False))
+        resume = OmegaConf.select(cfg_oc, "trainer.resume", default=None)
+
     if raw_work_dir is None or not str(raw_work_dir).strip():
         raise ValueError("cfg.work_dir must be a non-empty path.")
 
     base_dir = Path(str(raw_work_dir))
-    append_timestamp = bool(OmegaConf.select(cfg_oc, "trainer.append_timestamp", default=False))
-    resume = OmegaConf.select(cfg_oc, "trainer.resume", default=None)
     is_resuming = resume is not None and str(resume).strip().lower() not in {
         "",
         "none",
@@ -162,7 +175,10 @@ def setup_experiment_dirs(work_dir: Path, is_main_process: bool) -> dict[str, Pa
     return dirs
 
 
-def save_resolved_config(cfg: DictConfig, path: Path) -> None:
+def save_resolved_config(
+    cfg: TrainConfig | InferRootConfig | DictConfig | Mapping[str, Any],
+    path: Path,
+) -> None:
     """Atomically save a fully resolved OmegaConf config to YAML."""
     cfg_oc = _as_dict_config(cfg)
     yaml_text = OmegaConf.to_yaml(cfg_oc, resolve=True)
@@ -278,14 +294,10 @@ def _flatten_into(
         out[prefix] = "null"
         return
 
-    # Check Enum before (bool, int, float, str) so IntEnum / StrEnum serialize as enum.name
-    # matching OmegaConf.to_container(..., enum_to_str=True) and staying YAML-safe.
     if isinstance(obj, enum.Enum):
         out[prefix] = str(obj.name)
         return
 
-    # Check bool before int because bool is a subclass of int in Python;
-    # coerce to exact built-in primitives so subclasses never leak.
     if isinstance(obj, bool):
         out[prefix] = bool(obj)
         return
@@ -305,18 +317,24 @@ def _flatten_into(
     out[prefix] = str(obj)
 
 
-def flatten_config_for_tracker(cfg: DictConfig) -> dict[str, int | float | str | bool]:
+def flatten_config_for_tracker(
+    cfg: TrainConfig | InferRootConfig | DictConfig | Mapping[str, Any],
+) -> dict[str, int | float | str | bool]:
     """Flatten a resolved config into a tracker-safe flat dict of ``bool | int | float | str``.
 
     Safe for PyTorch TensorBoard ``SummaryWriter.add_hparams`` and ``yaml.dump`` (no ``None``,
     no nested dicts/lists, no OmegaConf container nodes).
     """
-    if OmegaConf.is_config(cfg):
+    if is_dataclass(cfg) and not isinstance(cfg, type):
+        container: Any = OmegaConf.to_container(
+            OmegaConf.structured(cfg), resolve=True, enum_to_str=True
+        )
+    elif OmegaConf.is_config(cfg):
         container = OmegaConf.to_container(cfg, resolve=True, enum_to_str=True)
     elif isinstance(cfg, Mapping):
         container = dict(cfg)
     else:
-        raise TypeError(f"Expected DictConfig or Mapping, got {type(cfg).__name__}.")
+        raise TypeError(f"Expected TrainConfig, DictConfig, or Mapping, got {type(cfg).__name__}.")
 
     if not isinstance(container, Mapping):
         raise ValueError(

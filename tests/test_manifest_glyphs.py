@@ -244,7 +244,7 @@ def test_legacy_list_bare_stem_inline_priority_and_text_boxes_alias(tmp_path: Pa
     plain_samples, _ = load_train_manifest(plain_manifest, tmp_path, glyphs_json=None)
     assert plain_samples[0].text_lines is None
 
-    # validate_sources_config supports text_boxes alias and isolates indices per source
+    # validate_sources_config isolates glyphs_json indices per source
     g1 = _write_json(tmp_path / "g1.json", {"dir_a/same.png": [_line("中")]})
     g2 = _write_json(tmp_path / "g2.json", {"dir_b/same.png": [_line("文")]})
     m1 = _write_json(tmp_path / "m1.json", [{"gt": "x/same.png"}])
@@ -262,7 +262,7 @@ def test_legacy_list_bare_stem_inline_priority_and_text_boxes_alias(tmp_path: Pa
                 "name": "src2",
                 "root_dir": str(tmp_path),
                 "json_path": str(m2),
-                "text_boxes": str(g2),
+                "glyphs_json": str(g2),
                 "ratio": 0.5,
             },
         ],

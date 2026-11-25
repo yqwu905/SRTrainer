@@ -15,6 +15,8 @@ from omegaconf.errors import OmegaConfBaseException
 from torch import nn
 from torch.nn import functional as F
 
+from config.schema import KernelConfig
+from config.validation import load_kernel_config
 from data.degradation.diffjpeg import DiffJPEG
 
 __all__ = [
@@ -434,7 +436,7 @@ class RealESRGANDegrader(nn.Module):
         scale: int = 1,
         use_usm: bool = False,
         queue_size: int = 0,
-        kernel_cfg: Mapping[str, Any] | None = None,
+        kernel_cfg: KernelConfig | Mapping[str, Any] | None = None,
         # 1st-order degradation params
         resize_prob: Sequence[float] = (0.2, 0.7, 0.1),
         resize_range: Sequence[float] = (0.15, 1.5),
@@ -466,14 +468,17 @@ class RealESRGANDegrader(nn.Module):
         self.queue_size: int = _validate_int(queue_size, "queue_size", min_value=0)
 
         if kernel_cfg is None:
-            self.kernel_cfg: dict[str, Any] | None = None
+            self.kernel_cfg: KernelConfig | None = None
+        elif isinstance(kernel_cfg, KernelConfig):
+            self.kernel_cfg = kernel_cfg
         else:
             norm_kcfg = _normalize_omegaconf(kernel_cfg, "kernel_cfg")
             if not isinstance(norm_kcfg, Mapping):
                 raise TypeError(
-                    f"kernel_cfg must be a mapping or None, got {type(norm_kcfg).__name__}."
+                    f"kernel_cfg must be a KernelConfig, mapping, or None, "
+                    f"got {type(norm_kcfg).__name__}."
                 )
-            self.kernel_cfg = dict(norm_kcfg)
+            self.kernel_cfg = load_kernel_config(norm_kcfg)
 
         # 1st-order parameters
         self.resize_prob = _validate_prob_triple(resize_prob, "resize_prob")

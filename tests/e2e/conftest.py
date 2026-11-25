@@ -624,7 +624,7 @@ def make_bias_tagged_exp_dir(
 
     arch_dict = get_toy_model_arch_dict(scale=scale)
     cfg = compose_hydra_cfg("train", overrides=["experiment=vosr2_onestep_text"])
-    OmegaConf.set_struct(cfg, False)
+    cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
     cfg.scale = scale
     cfg.exp_name = exp_path.name
     cfg.output_root = str(exp_path.parent)
@@ -778,7 +778,7 @@ def make_minimal_train_cfg(
 
     work_path = Path(work_dir)
     cfg = compose_hydra_cfg("train", overrides=["experiment=vosr2_onestep_text"])
-    OmegaConf.set_struct(cfg, False)
+    cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
 
     cfg.scale = scale
     cfg.exp_name = work_path.name
@@ -835,7 +835,11 @@ def make_minimal_train_cfg(
     cfg.trainer.mixed_precision = CPU_MIXED_PRECISION
     cfg.trainer.gradient_accumulation_steps = grad_accum
     cfg.trainer.compile = False
-    cfg.trainer.log_with = log_with
+    cfg.trainer.log_with = (
+        []
+        if log_with is None
+        else ([log_with] if isinstance(log_with, str) else list(log_with))
+    )
     cfg.trainer.resume = resume
     cfg.trainer.append_timestamp = append_timestamp
     cfg.trainer.val_save_visuals = val_save_visuals
@@ -890,6 +894,11 @@ def make_minimal_train_overrides(
     if not has_loss_override:
         overrides.append("loss=l1")
 
+    normalized_log_with = (
+        []
+        if log_with is None
+        else ([log_with] if isinstance(log_with, str) else list(log_with))
+    )
     overrides.extend(
         [
             f"scale={scale}",
@@ -916,49 +925,35 @@ def make_minimal_train_overrides(
             "trainer.compile=false",
             "++trainer.append_timestamp=false",
             f"++trainer.val_tile.overlap={safe_overlap}",
-            f"trainer.log_with={fmt_hydra_value(log_with)}",
+            f"trainer.log_with={fmt_hydra_value(normalized_log_with)}",
         ]
     )
 
     if not has_degradation:
         overrides.append("data.degradation=null")
 
-    overrides.append("~metric.val_suites")
+    overrides.append("metric=base_metric")
     if not val_suites:
-        overrides.append("+metric.val_suites={}")
         overrides.append("metric.primary_dataset=null")
         overrides.append("metric.primary_metric=null")
     else:
+        serialized_suites: dict[str, Any] = {}
         for suite_name, suite_cfg in val_suites.items():
             ds = suite_cfg["dataset"]
-            overrides.append(
-                f"+metric.val_suites.{suite_name}.dataset.root_dir="
-                f"{fmt_hydra_value(str(ds['root_dir']))}"
-            )
-            overrides.append(
-                f"+metric.val_suites.{suite_name}.dataset.json_path="
-                f"{fmt_hydra_value(str(ds['json_path']))}"
-            )
+            entry: dict[str, Any] = {
+                "dataset": {
+                    "root_dir": str(ds["root_dir"]),
+                    "json_path": str(ds["json_path"]),
+                },
+                "metrics": {
+                    m_name: dict(m_cfg or {})
+                    for m_name, m_cfg in (suite_cfg.get("metrics") or {}).items()
+                },
+            }
             if "max_save_images" in suite_cfg:
-                overrides.append(
-                    f"+metric.val_suites.{suite_name}.max_save_images="
-                    f"{fmt_hydra_value(suite_cfg['max_save_images'])}"
-                )
-            metrics_cfg = suite_cfg.get("metrics") or {}
-            if not metrics_cfg:
-                overrides.append(f"+metric.val_suites.{suite_name}.metrics={{}}")
-            else:
-                for m_name, m_cfg in metrics_cfg.items():
-                    if not m_cfg:
-                        overrides.append(
-                            f"+metric.val_suites.{suite_name}.metrics.{m_name}={{}}"
-                        )
-                    else:
-                        for mk, mv in m_cfg.items():
-                            overrides.append(
-                                f"+metric.val_suites.{suite_name}.metrics.{m_name}.{mk}="
-                                f"{fmt_hydra_value(mv)}"
-                            )
+                entry["max_save_images"] = suite_cfg["max_save_images"]
+            serialized_suites[suite_name] = entry
+        overrides.append(f"++metric.val_suites={fmt_hydra_value(serialized_suites)}")
         overrides.append(f"metric.primary_dataset={fmt_hydra_value(primary_dataset)}")
         overrides.append(f"metric.primary_metric={fmt_hydra_value(primary_metric)}")
 

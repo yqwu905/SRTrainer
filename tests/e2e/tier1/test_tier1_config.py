@@ -386,7 +386,7 @@ def test_t1_infer_yaml_composition_and_tile_defaults(
 
     tile = cfg.infer.tile
     assert tile.enabled is True
-    assert tile.size == "auto"
+    assert tile.size is None
     assert tile.overlap == 16
     assert tile.batch_size == 4
     assert tile.blend_mode == "cosine"

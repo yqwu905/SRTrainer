@@ -1,7 +1,11 @@
+defaults:
+  - base_metric
+  - _self_
+
 # Validation datasets and metrics are co-located exclusively under metric.val_suites
 # (never in configs/data/), supporting per-suite metrics and extra JSON fields via meta.
 primary_dataset: realce          # Benchmark suite used to select best checkpoint
-primary_metric: lpips           # Metric name within primary_dataset for best checkpoint
+primary_metric: lpips            # Metric name within primary_dataset for best checkpoint
 
 val_suites:
   realce:
