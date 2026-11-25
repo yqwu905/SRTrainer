@@ -13,10 +13,15 @@ ocr_kl:
   criterion:
     _target_: losses.OCRKLLoss
     checkpoint: PaddlePaddle/PP-OCRv5_server_rec_safetensors
-    strip_height: 64
-    strip_stride: 32
     temperature: 1.0
     input_range: "0_1"
+    strip_batch_size: 4
+    max_lines_per_image: 8
+    max_strip_width: 512
+    width_bucket_step: 32
+    amp_dtype: bf16
+    use_checkpoint: true
+    sync_ddp_counts: true
 glyph:
   weight: 1.0
   criterion:
