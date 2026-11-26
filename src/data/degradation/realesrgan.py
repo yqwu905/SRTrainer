@@ -631,6 +631,19 @@ class RealESRGANDegrader(nn.Module):
                 f"got {tuple(lq.shape)}."
             )
 
+        patch_mask = batch.get("text_patch_mask")
+        if "text_patch_mask" in batch and (
+            not isinstance(patch_mask, torch.Tensor) or patch_mask.shape != (b, 1, target_h, target_w)
+        ):
+            raise ValueError(f"Expected batch['text_patch_mask'] of shape {(b, 1, target_h, target_w)}.")
+
+        bg_gt = batch.get("text_patch_bg_gt")
+        if "text_patch_bg_gt" in batch:
+            if not isinstance(bg_gt, torch.Tensor) or bg_gt.shape != gt.shape:
+                raise ValueError(f"Expected batch['text_patch_bg_gt'] of shape {tuple(gt.shape)}.")
+            batch = dict(batch)
+            del batch["text_patch_bg_gt"]
+
         if raw_mask.dtype != torch.bool:
             raise ValueError(
                 f"Expected batch['need_degradation'] to have dtype torch.bool, "
@@ -683,8 +696,10 @@ class RealESRGANDegrader(nn.Module):
             gt_out = gt.detach().float().clone()
             lq_out = lq.detach().to(device=device, dtype=torch.float32).clone()
 
-            gt_sub = gt_out[mask]
-            b_sub = int(gt_sub.shape[0])
+            deg_src = gt_out[mask] if bg_gt is None else bg_gt[mask.to(bg_gt.device)].to(
+                device=device, dtype=torch.float32
+            )
+            b_sub = deg_src.shape[0]
             k1 = _slice_kernel(batch["kernel1"], mask, device)
             k2 = _slice_kernel(batch["kernel2"], mask, device)
             sk = _slice_kernel(batch["sinc_kernel"], mask, device)
@@ -692,11 +707,13 @@ class RealESRGANDegrader(nn.Module):
             # Optional USM sharpening on GT[mask] only (GT[~mask] stays bit-exact).
             if self.usm_sharpener is not None:
                 gt_out[mask] = self.usm_sharpener(
-                    gt_sub, weight=self.usm_weight, threshold=self.usm_threshold
+                    deg_src if bg_gt is None else gt_out[mask],
+                    weight=self.usm_weight,
+                    threshold=self.usm_threshold,
                 )
 
             # -------- 1st-order degradation --------
-            out = filter2d(gt_sub, k1)
+            out = filter2d(deg_src, k1)
             out = self._random_resize(
                 out,
                 ref_h=gt_h,
@@ -747,6 +764,10 @@ class RealESRGANDegrader(nn.Module):
                 out = self.jpeger(out.clamp(0.0, 1.0), quality=jpeg_p2)
                 out = F.interpolate(out, size=(target_h, target_w), mode=final_mode)
                 out = filter2d(out, sk)
+
+            if patch_mask is not None:
+                coverage = patch_mask.to(device=device, dtype=torch.float32)[mask]
+                out = (out.clamp(0.0, 1.0) * (1.0 - coverage) + lq_out[mask]).clamp(0.0, 1.0)
 
             # 8-bit quantization rounding
             out = torch.clamp((out * 255.0).round(), 0.0, 255.0) / 255.0

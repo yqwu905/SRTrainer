@@ -20,7 +20,8 @@ from torch.utils.data import Dataset, default_collate
 from config.schema import AugmentConfig, DataSourceConfig, KernelConfig
 from config.validation import load_augment_config, load_kernel_config
 from data.degradation.kernels import KernelGenerator
-from data.manifest import SourceStats, TrainSample, validate_sources_config
+from data.manifest import SourceStats, TrainSample, _validate_sources_with_configs
+from data.text_patch import TextPatchOverlay
 from data.transforms import (
     augment_tensors_with_flags,
     paired_random_crop_with_coords,
@@ -152,6 +153,7 @@ def _crop_text_lines(
     crop_w: int,
     orig_h: int,
     orig_w: int,
+    keep_transcripts: bool = False,
 ) -> list[dict[str, Any]]:
     """Translate HR line quads and glyph quads to crop-relative coordinates."""
     if not text_lines:
@@ -172,6 +174,10 @@ def _crop_text_lines(
             kept_quad = _crop_line_quad(line["quad"], offset, extent)
             if kept_quad is not None:
                 kept_line["quad"] = kept_quad
+                if keep_transcripts and "transcript" in line:
+                    # Only a complete line still matches the original transcription.
+                    if np.array_equal(kept_quad, np.asarray(line["quad"]) - offset):
+                        kept_line["transcript"] = line["transcript"]
 
         kept_glyphs: list[dict[str, Any]] = []
         for glyph in line.get("glyphs", ()):
@@ -277,11 +283,13 @@ class MixedSRDataset(Dataset[dict[str, Any]]):
             )
 
         # Intentionally do NOT store `logger` on `self` to keep dataset picklable for num_workers>0.
-        samples_per_source, source_stats = validate_sources_config(
-            sources=sources,
-            has_degradation=has_degradation,
-            is_main_process=is_main_process,
-            logger=logger,
+        samples_per_source, source_stats, source_configs, patch_samples_per_source = (
+            _validate_sources_with_configs(
+                sources=sources,
+                has_degradation=has_degradation,
+                is_main_process=is_main_process,
+                logger=logger,
+            )
         )
 
         self._samples_per_source: list[list[TrainSample]] = samples_per_source
@@ -290,14 +298,30 @@ class MixedSRDataset(Dataset[dict[str, Any]]):
         self._source_ratios: list[float] = [st.ratio for st in source_stats]
         self._cum_sizes: list[int] = list(itertools.accumulate(self._source_sizes))
         self._total_len: int = self._cum_sizes[-1]
-        self.has_text_annotations: bool = any(
+        self.has_source_text_annotations = any(
             sample.text_lines is not None
             for src_samples in samples_per_source
             for sample in src_samples
         )
 
-        if self.has_text_annotations and (self._hflip or self._vflip or self._rot90) and is_main_process:
-            active_logger = logger if logger is not None else logging.getLogger("srtrainer")
+        active_logger = logger if logger is not None else logging.getLogger("srtrainer")
+        self._text_patches: list[TextPatchOverlay | None] = []
+        for src, patch_samples in zip(source_configs, patch_samples_per_source, strict=True):
+            cfg = src.text_patch
+            overlay = (
+                TextPatchOverlay(cfg, self.scale, samples=patch_samples)
+                if cfg.is_configured()
+                else None
+            )
+            self._text_patches.append(overlay)
+            if is_main_process and overlay is not None:
+                active_logger.info(
+                    f"[Data] {src.name} text_patch: {len(overlay.samples)} pairs from {cfg.json_path}"
+                )
+        self.has_text_patch = any(overlay is not None for overlay in self._text_patches)
+        self.has_text_annotations = self.has_source_text_annotations or self.has_text_patch
+
+        if self.has_source_text_annotations and (self._hflip or self._vflip or self._rot90) and is_main_process:
             active_logger.warning(
                 "[Data] Glyph annotations detected with geometric augmentations enabled "
                 "(hflip=%s, vflip=%s, rot90=%s). Flipped/rotated crops will omit glyph "
@@ -392,7 +416,7 @@ class MixedSRDataset(Dataset[dict[str, Any]]):
 
         focus_center: tuple[float, float] | None = None
         if (
-            self.has_text_annotations
+            self.has_source_text_annotations
             and self.text_crop_prob > 0.0
             and sample.text_lines
             and random.random() < self.text_crop_prob
@@ -431,52 +455,38 @@ class MixedSRDataset(Dataset[dict[str, Any]]):
                 item["kernel1"] = torch.zeros((k, k), dtype=torch.float32)
                 item["kernel2"] = torch.zeros((k, k), dtype=torch.float32)
                 item["sinc_kernel"] = torch.zeros((k, k), dtype=torch.float32)
-            if self.has_text_annotations:
-                item["text_lines"] = (
-                    []
-                    if geom_changed
-                    else _crop_text_lines(
-                        sample.text_lines,
-                        crop_left=gt_left,
-                        crop_top=gt_top,
-                        crop_h=self.gt_size[0],
-                        crop_w=self.gt_size[1],
-                        orig_h=orig_h,
-                        orig_w=orig_w,
-                    )
-                )
-            return item
-
-        assert self.kernel_generator is not None
-        gt = load_image(sample.gt_path)
-        gt, gt_top, gt_left, orig_h, orig_w = random_crop_with_coords(
-            gt,
-            gt_size=self.gt_size,
-            pad_if_smaller=True,
-            focus_center=focus_center,
-        )
-        geom_changed = False
-        if do_aug:
-            [gt], geom_changed = augment_tensors_with_flags(
-                [gt],
-                hflip=self._hflip,
-                vflip=self._vflip,
-                rot90=self._rot90,
+        else:
+            assert self.kernel_generator is not None
+            gt = load_image(sample.gt_path)
+            gt, gt_top, gt_left, orig_h, orig_w = random_crop_with_coords(
+                gt,
+                gt_size=self.gt_size,
+                pad_if_smaller=True,
+                focus_center=focus_center,
             )
+            geom_changed = False
+            if do_aug:
+                [gt], geom_changed = augment_tensors_with_flags(
+                    [gt],
+                    hflip=self._hflip,
+                    vflip=self._vflip,
+                    rot90=self._rot90,
+                )
 
-        lq = torch.zeros((3, self.lq_size[0], self.lq_size[1]), dtype=torch.float32)
-        kernel1, kernel2, sinc_kernel = self.kernel_generator.sample()
-        out_item: dict[str, Any] = {
-            "gt": gt.contiguous(),
-            "lq": lq,
-            "need_degradation": torch.tensor(True, dtype=torch.bool),
-            "source_id": torch.tensor(source_id, dtype=torch.long),
-            "kernel1": kernel1,
-            "kernel2": kernel2,
-            "sinc_kernel": sinc_kernel,
-        }
+            lq = torch.zeros((3, self.lq_size[0], self.lq_size[1]), dtype=torch.float32)
+            kernel1, kernel2, sinc_kernel = self.kernel_generator.sample()
+            item = {
+                "gt": gt.contiguous(),
+                "lq": lq,
+                "need_degradation": torch.tensor(True, dtype=torch.bool),
+                "source_id": torch.tensor(source_id, dtype=torch.long),
+                "kernel1": kernel1,
+                "kernel2": kernel2,
+                "sinc_kernel": sinc_kernel,
+            }
+        overlay = self._text_patches[source_id]
         if self.has_text_annotations:
-            out_item["text_lines"] = (
+            item["text_lines"] = (
                 []
                 if geom_changed
                 else _crop_text_lines(
@@ -487,6 +497,16 @@ class MixedSRDataset(Dataset[dict[str, Any]]):
                     crop_w=self.gt_size[1],
                     orig_h=orig_h,
                     orig_w=orig_w,
+                    keep_transcripts=overlay is not None,
                 )
             )
-        return out_item
+        mask = None
+        if self.has_degradation and self.has_text_patch:
+            item["text_patch_mask"] = lq.new_zeros((1, *self.lq_size))
+            item["text_patch_bg_gt"] = item["gt"]
+            if overlay is not None and sample.need_degradation:
+                item["text_patch_bg_gt"] = item["gt"].clone()
+                mask = item["text_patch_mask"]
+        if overlay is not None:
+            item["text_lines"] = overlay.apply(item["gt"], item["lq"], item["text_lines"], mask)
+        return item
