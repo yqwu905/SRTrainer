@@ -15,7 +15,7 @@ import hydra
 import torch
 from accelerate import Accelerator
 from accelerate.state import AcceleratorState, GradientState, PartialState
-from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
+from accelerate.utils import ProjectConfiguration, set_seed
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 
@@ -172,15 +172,11 @@ class Trainer:
                 logging_dir=str(self.work_dir / "trackers"),
                 automatic_checkpoint_naming=False,
             )
-            ddp_kwargs = DistributedDataParallelKwargs(
-                find_unused_parameters=t_cfg.ddp_find_unused_parameters,
-            )
             self.accelerator = Accelerator(
                 mixed_precision=self.mixed_precision,
                 gradient_accumulation_steps=self.grad_accum_steps,
                 log_with=active_log_with,
                 project_config=project_config,
-                kwargs_handlers=[ddp_kwargs],
             )
 
             # Step 4: Rank-0 experiment directory creation & config_resolved.yaml persistence.
