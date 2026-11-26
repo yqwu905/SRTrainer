@@ -8,15 +8,15 @@ import logging
 import math
 import numbers
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from omegaconf import ListConfig, OmegaConf
 from omegaconf.errors import OmegaConfBaseException
 
-from config.schema import DataSourceConfig
-from config.validation import load_structured_config
+from config.schema import DataSourceConfig, TextPatchConfig
+from config.validation import load_structured_config, validate_text_patch_config
 from utils.text_geometry import canonical_quad
 
 __all__ = [
@@ -192,6 +192,8 @@ def _normalize_text_lines(
         for geom_key in ("quad", "points", "bbox", "box"):
             if geom_key in line:
                 entry["quad"] = canonical_quad(line[geom_key], name=f"{context}[{idx}]").tolist()
+                if isinstance(transcript, str) and transcript:
+                    entry["transcript"] = transcript
                 break
         normalized.append(entry)
     return tuple(normalized)
@@ -435,6 +437,28 @@ def validate_sources_config(
     logger: logging.Logger | None = None,
 ) -> tuple[list[list[TrainSample]], list[SourceStats]]:
     """Validate training ``data.sources``, parse all manifests, log Rank-0 stats, and fail-fast."""
+    samples, stats, _, _ = _validate_sources_with_configs(
+        sources, has_degradation, is_main_process, logger
+    )
+    return samples, stats
+
+
+def _stringify_source_paths(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, TextPatchConfig):
+        value = asdict(value)
+    if isinstance(value, Mapping):
+        return {key: _stringify_source_paths(val) for key, val in value.items()}
+    return value
+
+
+def _validate_sources_with_configs(
+    sources: Sequence[DataSourceConfig | Mapping[str, Any]] | ListConfig,
+    has_degradation: bool,
+    is_main_process: bool,
+    logger: logging.Logger | None,
+) -> tuple[list[list[TrainSample]], list[SourceStats], list[DataSourceConfig], list[list[Any] | None]]:
     if not isinstance(has_degradation, bool):
         raise TypeError(
             f"has_degradation must be a bool, got {type(has_degradation).__name__}."
@@ -450,12 +474,16 @@ def validate_sources_config(
     if len(normalized_sources) == 0:
         raise ValueError("data.sources must be a non-empty list.")
 
-    parsed_configs: list[tuple[str, Path, Path, float, Path | None]] = []
+    configs: list[DataSourceConfig] = []
     ratios: list[float] = []
 
     for idx, raw_src in enumerate(normalized_sources):
         if isinstance(raw_src, DataSourceConfig):
-            src_cfg = raw_src
+            src_cfg = load_structured_config(
+                DataSourceConfig,
+                _stringify_source_paths(asdict(raw_src)),
+                context=f"data.sources[{idx}]",
+            )
         else:
             src_map = _normalize_omegaconf(raw_src, f"data.sources[{idx}]")
             if not isinstance(src_map, Mapping):
@@ -480,34 +508,26 @@ def validate_sources_config(
                     f"data.sources[{idx}]['ratio'] must be a finite real number >= 0, "
                     f"got {raw_ratio_pre!r}."
                 )
-            # Coerce Path fields before OmegaConf structured merge if caller passed Path objects.
-            coerced = {
-                k: (str(v) if isinstance(v, Path) else v)
-                for k, v in src_map.items()
-            }
             src_cfg = load_structured_config(
-                DataSourceConfig, coerced, context=f"data.sources[{idx}]"
+                DataSourceConfig, _stringify_source_paths(src_map), context=f"data.sources[{idx}]"
             )
 
+        validate_text_patch_config(src_cfg.text_patch, field_prefix=f"data.sources[{idx}].text_patch")
         if not is_valid_rel_path(src_cfg.name):
             raise ValueError(
                 f"data.sources[{idx}]['name'] must be a non-empty string, got {src_cfg.name!r}."
             )
-        src_name = src_cfg.name.strip()
-        src_root_dir = _validate_path_arg(src_cfg.root_dir, f"data.sources[{idx}]['root_dir']")
-        src_json_path = _validate_path_arg(src_cfg.json_path, f"data.sources[{idx}]['json_path']")
-        src_glyphs_json = (
+        _validate_path_arg(src_cfg.root_dir, f"data.sources[{idx}]['root_dir']")
+        _validate_path_arg(src_cfg.json_path, f"data.sources[{idx}]['json_path']")
+        if src_cfg.glyphs_json is not None:
             _validate_path_arg(src_cfg.glyphs_json, f"data.sources[{idx}]['glyphs_json']")
-            if src_cfg.glyphs_json is not None
-            else None
-        )
         ratio_f = float(src_cfg.ratio)
         if not math.isfinite(ratio_f) or ratio_f < 0.0:
             raise ValueError(
                 f"data.sources[{idx}]['ratio'] must be finite and >= 0, got {src_cfg.ratio!r}."
             )
 
-        parsed_configs.append((src_name, src_root_dir, src_json_path, ratio_f, src_glyphs_json))
+        configs.append(src_cfg)
         ratios.append(ratio_f)
 
     if max(ratios) <= 0.0:
@@ -517,21 +537,33 @@ def validate_sources_config(
 
     all_samples: list[list[TrainSample]] = []
     all_stats: list[SourceStats] = []
-    for src_name, src_root_dir, src_json_path, ratio_f, src_glyphs_json in parsed_configs:
+    all_patch_samples: list[list[Any] | None] = []
+    for idx, src_cfg in enumerate(configs):
         samples, stats = load_train_manifest(
-            json_path=src_json_path,
-            root_dir=src_root_dir,
-            source_name=src_name,
-            glyphs_json=src_glyphs_json,
+            json_path=src_cfg.json_path,
+            root_dir=src_cfg.root_dir,
+            source_name=src_cfg.name,
+            glyphs_json=src_cfg.glyphs_json,
         )
+        patch_samples: list[Any] | None = None
+        if src_cfg.text_patch.is_configured():
+            from data.text_patch import load_text_patch_manifest
+
+            assert src_cfg.text_patch.json_path is not None and src_cfg.text_patch.root_dir is not None
+            patch_samples = load_text_patch_manifest(
+                src_cfg.text_patch.json_path,
+                src_cfg.text_patch.root_dir,
+                field_prefix=f"data.sources[{idx}].text_patch",
+            )
         all_samples.append(samples)
+        all_patch_samples.append(patch_samples)
         all_stats.append(
             SourceStats(
                 name=stats.name,
                 total=stats.total,
                 gt_only=stats.gt_only,
                 paired=stats.paired,
-                ratio=ratio_f,
+                ratio=float(src_cfg.ratio),
             )
         )
 
@@ -549,7 +581,7 @@ def validate_sources_config(
             "paths for all samples."
         )
 
-    return all_samples, all_stats
+    return all_samples, all_stats, configs, all_patch_samples
 
 
 def _resolve_val_path(raw_path: str, base_dir: Path | None, json_parent: Path) -> Path:

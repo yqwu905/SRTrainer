@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import numbers
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import is_dataclass
@@ -18,6 +19,7 @@ from config.schema import (
     ArchGroupConfig,
     AugmentConfig,
     DataConfig,
+    DataSourceConfig,
     EMAConfig,
     InferRootConfig,
     InferSettingsConfig,
@@ -27,6 +29,7 @@ from config.schema import (
     MetricConfig,
     OptimConfig,
     PretrainEntryConfig,
+    TextPatchConfig,
     TileConfig,
     TrainConfig,
     TrainerConfig,
@@ -39,12 +42,14 @@ __all__ = [
     "load_structured_config",
     "load_train_config",
     "load_infer_config",
+    "load_text_patch_config",
     "load_tile_config",
     "load_augment_config",
     "load_kernel_config",
     "load_model_config",
     "validate_train_config",
     "validate_infer_config",
+    "validate_text_patch_config",
     "validate_tile_config",
     "to_resolved_dict_config",
 ]
@@ -86,11 +91,37 @@ def load_structured_config(
 
     raw_dc = _to_omegaconf_input(raw, label)
     try:
+        if isinstance(raw, DictConfig):
+            # Strip per-node struct=False flags (e.g. from Hydra `+` overrides) so merging into
+            # the Structured Config base still strictly rejects unknown keys.
+            plain = OmegaConf.to_container(
+                raw_dc, resolve=False, throw_on_missing=False, enum_to_str=False
+            )
+            created = OmegaConf.create(plain)
+            if not isinstance(created, DictConfig):
+                raise ConfigValidationError(
+                    f"Expected {label} mapping, got {type(created).__name__}."
+                )
+            raw_dc = created
         base = OmegaConf.structured(schema_cls)
         merged = OmegaConf.merge(base, raw_dc)
         OmegaConf.resolve(merged)
         obj = OmegaConf.to_object(merged)
     except OmegaConfBaseException as exc:
+        # OmegaConf merges list elements detached from their parent. Recover the
+        # source index for patch schema errors using the same structured merge.
+        if (
+            schema_cls is TrainConfig
+            and exc.object_type is not TrainConfig
+            and (exc.full_key or "").partition(".")[0] == "text_patch"
+        ):
+            for idx, source in enumerate(raw_dc.data.sources):
+                try:
+                    OmegaConf.merge(OmegaConf.structured(DataSourceConfig), source)
+                except OmegaConfBaseException as source_exc:
+                    raise ConfigValidationError(
+                        f"Invalid data.sources[{idx}].{source_exc.full_key}: {source_exc}"
+                    ) from source_exc
         raise ConfigValidationError(f"Invalid {label}: {exc}") from exc
 
     if not isinstance(obj, schema_cls):
@@ -274,6 +305,52 @@ def _validate_optim(optim: OptimConfig) -> None:
         _require_target(optim.scheduler, "optim.scheduler")
 
 
+def validate_text_patch_config(
+    cfg: TextPatchConfig, *, field_prefix: str = "text_patch"
+) -> None:
+    _require_optional_non_empty_str(cfg.json_path, f"{field_prefix}.json_path")
+    _require_optional_non_empty_str(cfg.root_dir, f"{field_prefix}.root_dir")
+    if (cfg.json_path is None) != (cfg.root_dir is None):
+        raise ConfigValidationError(f"{field_prefix}.json_path and root_dir must be set together.")
+
+    counts = cfg.num_patches
+    if (
+        len(counts) != 2
+        or any(type(v) is not int for v in counts)
+        or not 0 <= counts[0] <= counts[1]
+    ):
+        raise ConfigValidationError(
+            f"{field_prefix}.num_patches requires integers 0 <= min <= max."
+        )
+    for name, bounds in (("scale_range", cfg.scale_range), ("rotate_range", cfg.rotate_range)):
+        if len(bounds) != 2 or not all(_is_finite_real(v) for v in bounds) or bounds[0] > bounds[1]:
+            raise ConfigValidationError(
+                f"{field_prefix}.{name} requires two ordered finite bounds."
+            )
+    if cfg.scale_range[0] <= 0:
+        raise ConfigValidationError(f"{field_prefix}.scale_range requires positive scales.")
+    if not _is_finite_real(cfg.prob) or not 0 <= cfg.prob <= 1:
+        raise ConfigValidationError(f"{field_prefix}.prob must be finite and in [0, 1].")
+    if type(cfg.max_attempts) is not int or cfg.max_attempts < 1:
+        raise ConfigValidationError(f"{field_prefix}.max_attempts must be a positive integer.")
+
+
+def _is_finite_real(value: Any) -> bool:
+    return isinstance(value, numbers.Real) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def load_text_patch_config(
+    raw: TextPatchConfig | DictConfig | Mapping[str, Any] | None,
+) -> TextPatchConfig:
+    cfg = (
+        TextPatchConfig()
+        if raw is None
+        else load_structured_config(TextPatchConfig, raw, context="text_patch")
+    )
+    validate_text_patch_config(cfg)
+    return cfg
+
+
 def _validate_data(data: DataConfig, global_scale: int) -> None:
     if data.scale < 1:
         raise ConfigValidationError(f"data.scale must be >= 1, got {data.scale!r}.")
@@ -307,6 +384,18 @@ def _validate_data(data: DataConfig, global_scale: int) -> None:
         )
     if not data.sources:
         raise ConfigValidationError("data.sources must be a non-empty list.")
+    if data.degradation is not None:
+        _require_target(data.degradation, "data.degradation")
+    queue_size = (
+        data.degradation.get("queue_size") if isinstance(data.degradation, Mapping)
+        else getattr(data.degradation, "queue_size", None)
+    )
+    if queue_size is not None and (
+        isinstance(queue_size, bool) or not isinstance(queue_size, int) or queue_size < 0
+    ):
+        raise ConfigValidationError(
+            f"data.degradation.queue_size must be a non-negative integer, got {queue_size!r}."
+        )
     ratios: list[float] = []
     for idx, src in enumerate(data.sources):
         _require_non_empty_str(src.name, f"data.sources[{idx}].name")
@@ -317,13 +406,18 @@ def _validate_data(data: DataConfig, global_scale: int) -> None:
             raise ConfigValidationError(
                 f"data.sources[{idx}].ratio must be finite and >= 0, got {src.ratio!r}."
             )
+        prefix = f"data.sources[{idx}].text_patch"
+        validate_text_patch_config(src.text_patch, field_prefix=prefix)
+        if src.text_patch.is_configured() and queue_size is not None and queue_size > 0:
+            raise ConfigValidationError(
+                f"{prefix} cannot be combined with data.degradation.queue_size > 0 "
+                "because the pool swaps images independently of their text annotations."
+            )
         ratios.append(src.ratio)
     if max(ratios) <= 0.0:
         raise ConfigValidationError(
             f"Sum of data.sources ratios must be finite and > 0, got {ratios!r}."
         )
-    if data.degradation is not None:
-        _require_target(data.degradation, "data.degradation")
 
 
 def _validate_metric(metric: MetricConfig) -> None:

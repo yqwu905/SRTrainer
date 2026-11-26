@@ -35,6 +35,7 @@ __all__ = [
     "AugmentConfig",
     "KernelConfig",
     "RealESRGANDegraderConfig",
+    "TextPatchConfig",
     "DataConfig",
     "OptimConfig",
     "ValDatasetConfig",
@@ -218,6 +219,27 @@ class LossEntryConfig:
 
 
 @dataclass
+class TextPatchConfig:
+    """Paired text crops to overlay after geometric augmentation.
+
+    Each sample draws its target patch count from the inclusive `num_patches` range
+    [min, max]. Each placement gets up to `max_attempts` tries. If space runs out,
+    the sample keeps all patches placed successfully.
+    """
+
+    json_path: Optional[str] = None
+    root_dir: Optional[str] = None
+    num_patches: list[int] = field(default_factory=lambda: [1, 3])
+    scale_range: list[float] = field(default_factory=lambda: [1.0, 1.0])
+    rotate_range: list[float] = field(default_factory=lambda: [0.0, 0.0])
+    prob: float = 1.0
+    max_attempts: int = 50
+
+    def is_configured(self) -> bool:
+        return self.json_path is not None and self.root_dir is not None
+
+
+@dataclass
 class DataSourceConfig:
     """Single training dataset source manifest definition (never contains legacy ``mode``)."""
 
@@ -226,6 +248,7 @@ class DataSourceConfig:
     json_path: str = MISSING
     ratio: float = 1.0
     glyphs_json: Optional[str] = None
+    text_patch: TextPatchConfig = field(default_factory=TextPatchConfig)
 
 
 @dataclass

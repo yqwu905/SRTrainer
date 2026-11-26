@@ -28,6 +28,7 @@ from data import (
     val_collate_fn,
 )
 from data.mixed_dataset import train_collate_fn
+from data.text_patch import load_text_patch_manifest
 from engine.checkpointer import Checkpointer
 from engine.inferencer import TiledInferencer
 from engine.state import TrainState
@@ -130,6 +131,13 @@ class Trainer:
         t_cfg = config.trainer
         d_cfg = config.data
         m_cfg = config.metric
+        for idx, src in enumerate(d_cfg.sources):
+            patch = src.text_patch
+            if patch.is_configured():
+                assert patch.json_path is not None and patch.root_dir is not None
+                load_text_patch_manifest(
+                    patch.json_path, patch.root_dir, field_prefix=f"data.sources[{idx}].text_patch"
+                )
 
         self.total_iters: int = t_cfg.total_iters
         self.log_interval: int = t_cfg.log_interval
