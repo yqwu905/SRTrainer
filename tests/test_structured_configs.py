@@ -14,7 +14,6 @@ from omegaconf import OmegaConf
 from config import (
     AugmentConfig,
     BlendMode,
-    ComponentWeightsConfig,
     ConfigValidationError,
     DataConfig,
     DataSourceConfig,
@@ -289,8 +288,14 @@ def test_business_range_and_cross_field_validations(tmp_path: Path) -> None:
     with pytest.raises(ConfigValidationError, match="lora.checkpoint"):
         load_train_config(raw)
 
-    with pytest.raises(ConfigValidationError, match="lora_rank"):
-        load_infer_config({"model": {"lora": {"enable": True, "lora_rank": -4}}})
+    # Custom models own the interpretation of their parameters.
+    custom = {"_target_": "torch.nn.Identity", "custom_option": 7}
+    assert load_infer_config({"model": custom}).model == custom
+
+    # infer.suffix rejects path separators and traversal tokens
+    for bad_suffix in ("../escape", "sub/dir", "a\\b"):
+        with pytest.raises(ConfigValidationError, match="infer.suffix"):
+            load_infer_config({"infer": {"suffix": bad_suffix}})
 
     # All VOSR components frozen
     raw = _minimal_train_dict(tmp_path)
@@ -332,16 +337,10 @@ def test_business_range_and_cross_field_validations(tmp_path: Path) -> None:
     assert isinstance(aug, AugmentConfig)
     assert aug == AugmentConfig(hflip=True, vflip=False, rot90=True)
 
-    # Infer config: weights_path and component_weights mutually exclusive
-    with pytest.raises(ConfigValidationError, match="Cannot set both"):
-        load_infer_config(
-            {
-                "infer": {
-                    "weights_path": "a.safetensors",
-                    "component_weights": {"dit": "b.safetensors"},
-                }
-            }
-        )
+    with pytest.raises(ConfigValidationError, match="weights_path"):
+        load_infer_config({"infer": {"weights_path": "old.safetensors"}})
+    with pytest.raises(ConfigValidationError, match="infer.device"):
+        load_infer_config({"infer": {"device": " "}})
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +382,7 @@ def test_centralized_validation_returns_typed_dataclasses_and_roundtrips(tmp_pat
     assert isinstance(infer_typed, InferRootConfig)
     assert isinstance(infer_typed.infer, InferSettingsConfig)
     assert isinstance(infer_typed.infer.tile, TileConfig)
-    assert isinstance(infer_typed.infer.component_weights, ComponentWeightsConfig)
+    assert infer_typed.model is None
     assert infer_typed.infer.save_format is SaveFormat.png
 
     # save_resolved_config -> load_resolved_config -> load_train_config roundtrip

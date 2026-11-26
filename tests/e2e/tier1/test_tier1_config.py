@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-import tomllib
+import tomli as tomllib
 
 
 def _parse_dep_name(spec: str) -> str:
@@ -377,10 +377,9 @@ def test_t1_infer_yaml_composition_and_tile_defaults(
     import yaml
 
     cfg = hydra_compose("infer")
-    assert cfg.infer.exp_dir is None
-    assert cfg.infer.weights_path is None
-    assert cfg.infer.use_ema is True
-    assert cfg.infer.recursive is False
+    assert cfg.model is None
+    assert cfg.infer.input is None
+    assert cfg.infer.device is None
     assert cfg.infer.suffix == ""
     assert cfg.infer.save_format == "png"
 

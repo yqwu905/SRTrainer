@@ -384,29 +384,6 @@ def make_aligned_paired_images(
 # ---------------------------------------------------------------------------
 # Opaque-box signature adapters & config builders
 # ---------------------------------------------------------------------------
-def get_toy_model_arch_dict(
-    scale: int = CPU_SCALE,
-    *,
-    num_feat: int = 8,
-    num_block: int = 1,
-) -> dict[str, Any]:
-    """Build a compact Hydra ``_target_`` dict for test-only ``DummySRNet``."""
-    from tests.dummy_arch import DummySRNet
-
-    params = inspect.signature(DummySRNet.__init__).parameters
-    arch: dict[str, Any] = {"_target_": "tests.dummy_arch.DummySRNet"}
-    for key, val in (
-        ("num_in_ch", 3),
-        ("num_out_ch", 3),
-        ("num_feat", num_feat),
-        ("num_block", num_block),
-        ("scale", scale),
-    ):
-        if key in params:
-            arch[key] = val
-    return arch
-
-
 def build_mixed_dataset(
     sources: Sequence[Mapping[str, Any]],
     *,
@@ -544,142 +521,6 @@ def call_validate_sources_config(
     return validate_sources_config(sources)
 
 
-def build_constant_bias_state_dict(
-    net: Any,
-    target_val: float,
-) -> tuple[dict[str, Any], float]:
-    """Build a valid state_dict whose forward pass on zeros yields a distinct constant mean.
-
-    Works regardless of internal layer names or residual/interpolation skip
-    connections by probing on an all-zero input tensor (where any linear/bicubic
-    skip branch evaluates to 0) and measuring the exact clamped output mean.
-    """
-    import torch
-
-    base_sd = {
-        k: torch.zeros_like(v) if torch.is_floating_point(v) else v.clone()
-        for k, v in net.state_dict().items()
-    }
-    bias_keys = [
-        k for k, v in base_sd.items() if k.endswith(".bias") and torch.is_floating_point(v)
-    ]
-    probe_in = torch.zeros(1, 3, 16, 16, dtype=torch.float32)
-
-    chosen_sd = base_sd
-    observed_mean = 0.0
-    for bkey in reversed(bias_keys):
-        cand = {k: v.clone() for k, v in base_sd.items()}
-        cand[bkey].fill_(float(target_val))
-        net.load_state_dict(cand, strict=True)
-        net.eval()
-        with torch.no_grad():
-            probe = net(probe_in).clamp(0.0, 1.0)
-            mean_val = float(probe.mean().item())
-        if abs(mean_val - float(target_val)) < 0.05:
-            return cand, mean_val
-        chosen_sd, observed_mean = cand, mean_val
-
-    if not bias_keys:
-        weight_keys = [
-            k for k, v in base_sd.items() if k.endswith(".weight") and torch.is_floating_point(v)
-        ]
-        if weight_keys:
-            chosen_sd = {k: v.clone() for k, v in base_sd.items()}
-            chosen_sd[weight_keys[-1]].fill_(float(target_val))
-            net.load_state_dict(chosen_sd, strict=True)
-            net.eval()
-            with torch.no_grad():
-                observed_mean = float(net(probe_in).clamp(0.0, 1.0).mean().item())
-    return chosen_sd, observed_mean
-
-
-_build_constant_bias_state_dict = build_constant_bias_state_dict
-
-
-def make_bias_tagged_exp_dir(
-    exp_dir: Path | str,
-    *,
-    scale: int = CPU_SCALE,
-    gt_size: int = CPU_GT_SIZE,
-    include_best: bool = True,
-    include_ema: bool = True,
-    best_val_name: str = "set5",
-    best_metric_name: str = "psnr",
-) -> dict[str, Any]:
-    """Create a synthetic ToyModel experiment directory with bias-tagged safetensors weights.
-
-    Produces distinct deterministic outputs on solid-black inputs so Mode 1
-    weight-selection priority (``best_*`` -> ``latest_ema`` -> ``latest`` ->
-    ``weights_path`` override) is verified strictly via observable output pixels.
-    """
-    import hydra.utils
-    from omegaconf import OmegaConf
-
-    from utils.config import save_resolved_config
-    from utils.misc import save_safetensors
-
-    exp_path = Path(exp_dir)
-    weights_dir = exp_path / "weights"
-    weights_dir.mkdir(parents=True, exist_ok=True)
-
-    arch_dict = get_toy_model_arch_dict(scale=scale)
-    cfg = compose_hydra_cfg("train", overrides=["experiment=vosr2_onestep_text"])
-    cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
-    cfg.scale = scale
-    cfg.exp_name = exp_path.name
-    cfg.output_root = str(exp_path.parent)
-    cfg.work_dir = str(exp_path)
-    cfg.arch = OmegaConf.create(arch_dict)
-    cfg.data.scale = scale
-    cfg.data.gt_size = gt_size
-    cfg.data.degradation = None
-    cfg.metric.primary_dataset = best_val_name
-    cfg.metric.primary_metric = best_metric_name
-    cfg.trainer.mixed_precision = CPU_MIXED_PRECISION
-
-    config_path = exp_path / "config_resolved.yaml"
-    save_resolved_config(cfg, config_path)
-
-    net = hydra.utils.instantiate(cfg.arch)
-    targets = {
-        "best": 0.80,
-        "latest_ema": 0.50,
-        "latest": 0.20,
-        "override": 0.95,
-    }
-    expected_means: dict[str, float] = {}
-    saved_paths: dict[str, Path] = {}
-
-    sd_latest, mean_latest = build_constant_bias_state_dict(net, targets["latest"])
-    saved_paths["latest"] = save_safetensors(sd_latest, weights_dir / "latest.safetensors")
-    expected_means["latest"] = mean_latest
-
-    if include_ema:
-        sd_ema, mean_ema = build_constant_bias_state_dict(net, targets["latest_ema"])
-        saved_paths["latest_ema"] = save_safetensors(sd_ema, weights_dir / "latest_ema.safetensors")
-        expected_means["latest_ema"] = mean_ema
-
-    if include_best:
-        sd_best, mean_best = build_constant_bias_state_dict(net, targets["best"])
-        best_file = weights_dir / f"best_{best_val_name}_{best_metric_name}.safetensors"
-        saved_paths["best"] = save_safetensors(sd_best, best_file)
-        expected_means["best"] = mean_best
-
-    sd_override, mean_override = build_constant_bias_state_dict(net, targets["override"])
-    saved_paths["override"] = save_safetensors(
-        sd_override, exp_path / "override_weights.safetensors"
-    )
-    expected_means["override"] = mean_override
-
-    return {
-        "exp_dir": exp_path,
-        "config_path": config_path,
-        "weights_dir": weights_dir,
-        "paths": saved_paths,
-        "expected_means": expected_means,
-    }
-
-
 def _escape_hydra_key(key: Any) -> str:
     return _HYDRA_KEY_ESC_RE.sub(r"\\\1", str(key))
 
@@ -708,41 +549,20 @@ def fmt_hydra_value(val: Any) -> str:
 _fmt_hydra_value = fmt_hydra_value
 
 
-def build_standalone_infer_arch_overrides(
-    arch_dict: Mapping[str, Any],
-    *,
-    scale: int = CPU_SCALE,
-    config_dir: Path | None = None,
+def vosr_infer_overrides(
+    scale: int, weights_dir: Path, *, vae: str, dit: str, dino: str,
 ) -> list[str]:
-    """Build Hydra CLI overrides replacing ``arch`` cleanly for ``tools/infer.py`` Mode 2.
+    """Run the dummy VOSR architectures with the specified training exports."""
+    from tests.dummy_arch import get_dummy_vosr_arch_dict
 
-    Works across all valid ``configs/infer.yaml`` designs: defaults-group
-    ``arch: toy_x4``, defaults-group ``arch: null``, plain key ``arch: null``,
-    inline dict ``arch: {...}``, or absent ``arch``.
-    """
-    cfg_infer = compose_hydra_cfg("infer", config_dir=config_dir)
-    overrides: list[str] = [f"++scale={scale}"]
-
-    can_delete_arch_group = False
-    if cfg_infer.get("arch") is not None:
-        try:
-            compose_hydra_cfg("infer", overrides=["~arch"], config_dir=config_dir)
-            can_delete_arch_group = True
-        except Exception:
-            can_delete_arch_group = False
-
-    if can_delete_arch_group:
-        overrides.append("~arch")
-        for key, val in arch_dict.items():
-            overrides.append(f"+arch.{key}={fmt_hydra_value(val)}")
-    else:
-        existing_arch = cfg_infer.get("arch")
-        if isinstance(existing_arch, Mapping):
-            for old_key in existing_arch:
-                if old_key not in arch_dict:
-                    overrides.append(f"~arch.{old_key}")
-        overrides.append(f"++arch={fmt_hydra_value(dict(arch_dict))}")
-    return overrides
+    return [
+        "model=vosr",
+        f"scale={scale}",
+        f"++arch={fmt_hydra_value(get_dummy_vosr_arch_dict())}",
+        f"model.pretrain.vae.path={fmt_hydra_value(str(weights_dir / vae))}",
+        f"model.pretrain.dit.path={fmt_hydra_value(str(weights_dir / dit))}",
+        f"model.pretrain.dino.path={fmt_hydra_value(str(weights_dir / dino))}",
+    ]
 
 
 def make_minimal_train_cfg(
@@ -1303,11 +1123,6 @@ def hydra_value_formatter() -> Callable[[Any], str]:
 
 
 @pytest.fixture
-def constant_bias_state_dict_factory() -> Callable[..., tuple[dict[str, Any], float]]:
-    return build_constant_bias_state_dict
-
-
-@pytest.fixture
 def mixed_dataset_factory() -> Callable[..., Any]:
     return build_mixed_dataset
 
@@ -1323,11 +1138,6 @@ def validate_sources_caller() -> Callable[..., Any]:
 
 
 @pytest.fixture
-def bias_tagged_exp_dir_factory() -> Callable[..., dict[str, Any]]:
-    return make_bias_tagged_exp_dir
-
-
-@pytest.fixture
 def minimal_train_cfg_factory() -> Callable[..., Any]:
     return make_minimal_train_cfg
 
@@ -1335,11 +1145,6 @@ def minimal_train_cfg_factory() -> Callable[..., Any]:
 @pytest.fixture
 def minimal_train_overrides_factory() -> Callable[..., list[str]]:
     return make_minimal_train_overrides
-
-
-@pytest.fixture
-def standalone_infer_arch_overrides_factory() -> Callable[..., list[str]]:
-    return build_standalone_infer_arch_overrides
 
 
 @pytest.fixture

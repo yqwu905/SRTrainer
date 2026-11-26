@@ -3,34 +3,35 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import hydra
 import torch
 from torch import nn
 
-from config.schema import TrainConfig
+from config.schema import InferRootConfig, TrainConfig
 
 if TYPE_CHECKING:
     from accelerate import Accelerator
 
-__all__ = ["BaseModel", "build_model"]
+__all__ = ["BaseModel", "build_infer_model", "build_model"]
 
 
 class BaseModel(ABC):
-    """Abstract base class for all training paradigms managed by ``Trainer``.
+    """Shared interface for training and standalone inference setup."""
 
-    Receives an already-validated, strongly-typed ``TrainConfig`` instance from the training
-    entrypoint; subclasses consume typed config fields directly without re-parsing dicts.
-    """
-
-    def __init__(self, cfg: TrainConfig) -> None:
-        if not isinstance(cfg, TrainConfig):
+    def __init__(self, cfg: TrainConfig | InferRootConfig) -> None:
+        if not isinstance(cfg, (TrainConfig, InferRootConfig)):
             raise TypeError(
-                f"BaseModel requires a validated TrainConfig instance, got {type(cfg).__name__}."
+                f"BaseModel requires a validated TrainConfig or InferRootConfig, got {type(cfg).__name__}."
             )
-        self.cfg: TrainConfig = cfg
+        self.cfg = cfg
         self.accelerator: Accelerator | None = None
+
+    def setup_infer(self, device: torch.device | str | None = None) -> nn.Module:
+        """Build an evaluation network with model-configured weights on the requested device."""
+        raise NotImplementedError(f"{type(self).__name__} does not implement standalone inference.")
 
     @abstractmethod
     def setup(self, accelerator: Accelerator) -> None:
@@ -100,3 +101,22 @@ def build_model(cfg: TrainConfig) -> BaseModel:
             f"got {type(model_obj).__name__}."
         )
     return model_obj
+
+
+def build_infer_model(cfg: InferRootConfig, device: torch.device | str | None = None) -> nn.Module:
+    """Build the configured model for standalone inference."""
+    model_cfg = cfg.model
+    target = (
+        model_cfg.get("_target_") if isinstance(model_cfg, Mapping)
+        else getattr(model_cfg, "_target_", None)
+    )
+    if not target:
+        raise ValueError("Standalone inference requires model._target_.")
+    target_obj = hydra.utils.get_object(target)
+    if isinstance(target_obj, type) and issubclass(target_obj, BaseModel):
+        return target_obj(cfg).setup_infer(device=device)
+
+    net = hydra.utils.instantiate(model_cfg)
+    if not isinstance(net, nn.Module):
+        raise TypeError(f"Expected {target} to instantiate an nn.Module, got {type(net).__name__}.")
+    return net.to(device=device).eval()

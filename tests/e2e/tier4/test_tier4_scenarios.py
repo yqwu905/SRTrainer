@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from tests.e2e.conftest import vosr_infer_overrides
 
 _CANONICAL_ITER_LOG_RE = re.compile(
     r"\[Iter\s+\d+/\d+\].*lr[^:]*:\s*[0-9.eE+-]+.*loss/total:\s*[0-9.eE+-]+.*it/s.*mem.*ETA"
@@ -98,7 +99,7 @@ def _collect_dict_keys(obj: Any) -> set[str]:
     return keys
 
 
-def test_t4_scenario1_mixed_blind_paired_train_to_auto_restore_infer(
+def test_t4_scenario1_mixed_blind_paired_train_to_tiled_infer(
     e2e_workdir: dict[str, Path],
     gt_only_train_source_factory: Callable[..., dict[str, Any]],
     paired_train_source_factory: Callable[..., dict[str, Any]],
@@ -109,7 +110,7 @@ def test_t4_scenario1_mixed_blind_paired_train_to_auto_restore_infer(
     infer_cli_runner: Callable[..., Any],
     hydra_value_formatter: Callable[[Any], str],
 ) -> None:
-    """Scenario 1: Mixed blind+paired exp01_toy_mixed_x4 training -> tools/infer.py Mode 1 x4."""
+    """Scenario 1: Mixed blind+paired exp01_toy_mixed_x4 training -> tools/infer.py x4."""
     import hydra.utils
     import torch
     from PIL import Image
@@ -233,12 +234,15 @@ def test_t4_scenario1_mixed_blind_paired_train_to_auto_restore_infer(
     fmt = hydra_value_formatter
     infer_proc = infer_cli_runner(
         [
-            f"infer.exp_dir={fmt(str(exp_dir))}",
-            f"infer.input={fmt(str(infer_img))}",
+            *vosr_infer_overrides(
+                4, exp_dir / "weights", vae="best_set5_psnr_vae.safetensors",
+                dit="best_set5_psnr_dit.safetensors", dino="best_set5_psnr_dino.safetensors",
+            ),
+            f"infer.input={fmt(str(infer_img.parent))}",
             f"infer.output_dir={fmt(str(out_dir))}",
             "infer.mixed_precision='no'",
             "infer.tile.enabled=true",
-            "infer.tile.size=null",
+            "infer.tile.size=[16,16]",
             "infer.tile.overlap=4",
             "infer.tile.blend_mode=cosine",
         ],
@@ -529,141 +533,33 @@ def test_t4_scenario3_text_sr_custom_meta_ocr_and_gtless_suites(
     assert any(not torch.allclose(sd_best[k], sd_iter3[k], atol=1e-6) for k in sd_best)
 
 
-def test_t4_scenario4_standalone_basicsr_pth_infer_recursive_and_json(
-    e2e_workdir: dict[str, Path],
-    constant_bias_state_dict_factory: Callable[..., tuple[dict[str, Any], float]],
-    standalone_infer_arch_overrides_factory: Callable[..., list[str]],
-    synthetic_image_factory: Callable[..., Path],
-    infer_cli_runner: Callable[..., Any],
+def test_t4_scenario4_vosr_nested_checkpoint_and_jpeg_output(
+    tmp_path: Path, synthetic_image_factory: Callable[..., Path], infer_cli_runner: Callable[..., Any],
     hydra_value_formatter: Callable[[Any], str],
 ) -> None:
-    """Scenario 4: Standalone Mode 2 tools/infer.py with BasicSR .pth on recursive dirs & JSON."""
     import torch
     from PIL import Image
-    from tests.dummy_arch import DummySRNet
+    from tests.dummy_arch import DummyVAE, get_dummy_vosr_arch_dict
 
-    from utils.image import load_image
-
-    fmt = hydra_value_formatter
-    net = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
-    sd_ema, ema_mean = constant_bias_state_dict_factory(net, 0.72)
-    sd_params, _ = constant_bias_state_dict_factory(net, 0.15)
-    pth_path = e2e_workdir["work"] / "external_toy_x2.pth"
-    torch.save({"params_ema": sd_ema, "params": sd_params}, pth_path)
-
-    arch_ovs = standalone_infer_arch_overrides_factory(
-        {
-            "_target_": "tests.dummy_arch.DummySRNet",
-            "num_in_ch": 3,
-            "num_out_ch": 3,
-            "num_feat": 8,
-            "num_block": 1,
-            "scale": 2,
-        },
-        scale=2,
-    )
-    common_mode2 = [
-        *arch_ovs,
-        "infer.exp_dir=null",
-        f"infer.weights_path={fmt(str(pth_path))}",
-        "++infer.weights_key=params_ema",
-        "infer.mixed_precision='no'",
-        "infer.tile.enabled=true",
-        "infer.tile.size=[16,16]",
-        "infer.tile.overlap=4",
-    ]
-
-    # Run (a): Recursive nested directory preserving subdirs, suffix=_x2, save_format=jpg
-    rec_dir = e2e_workdir["data"] / "s4_rec"
-    synthetic_image_factory(
-        rec_dir / "group_a/shared.png", width=20, height=16, pattern="solid", color=(0, 0, 0)
-    )
-    synthetic_image_factory(
-        rec_dir / "group_b/nested/shared.png", width=24, height=20, pattern="gradient", seed=42
-    )
-    synthetic_image_factory(
-        rec_dir / "top.webp", width=18, height=22, pattern="checkerboard", seed=43
-    )
-
-    out_rec = e2e_workdir["outputs"] / "s4_rec_out"
-    infer_cli_runner(
-        [
-            *common_mode2,
-            f"infer.input={fmt(str(rec_dir))}",
-            f"infer.output_dir={fmt(str(out_rec))}",
-            "infer.recursive=true",
-            "infer.suffix=_x2",
-            "infer.save_format=jpg",
-        ],
-        check=True,
-    )
-
-    expected_jpegs = {
-        "group_a/shared_x2.jpg": (40, 32),
-        "group_b/nested/shared_x2.jpg": (48, 40),
-        "top_x2.jpg": (36, 44),
-    }
-    actual_rel = sorted(p.relative_to(out_rec).as_posix() for p in out_rec.rglob("*") if p.is_file())
-    assert actual_rel == sorted(expected_jpegs.keys())
-    for rel_path, expected_wh in expected_jpegs.items():
-        with Image.open(out_rec / rel_path) as im:
-            assert im.format == "JPEG"
-            assert im.size == expected_wh
-    assert load_image(out_rec / "group_a/shared_x2.jpg").mean().item() == pytest.approx(
-        ema_mean, abs=0.05
-    )
-
-    # Run (b): JSON manifest mixing lq and gt-fallback entries with input_root
-    json_root = e2e_workdir["data"] / "s4_json"
-    synthetic_image_factory(
-        json_root / "lr/paired.png", width=18, height=16, pattern="solid", color=(0, 0, 0)
-    )
-    synthetic_image_factory(
-        json_root / "hr/unused_36x32.png", width=36, height=32, pattern="solid", color=(255, 255, 255)
-    )
-    synthetic_image_factory(
-        json_root / "hr/gt_only.png", width=22, height=18, pattern="solid", color=(0, 0, 0)
-    )
-    synthetic_image_factory(
-        json_root / "hr/gt_null_lq.png", width=20, height=24, pattern="solid", color=(0, 0, 0)
-    )
-    manifest = json_root / "infer_manifest.json"
-    manifest.write_text(
-        json.dumps(
-            [
-                {"lq": "lr/paired.png", "gt": "hr/unused_36x32.png"},
-                {"gt": "hr/gt_only.png"},
-                {"lq": None, "gt": "hr/gt_null_lq.png"},
-            ],
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-    out_json = e2e_workdir["outputs"] / "s4_json_out"
-    infer_cli_runner(
-        [
-            *common_mode2,
-            f"infer.input={fmt(str(manifest))}",
-            f"infer.input_root={fmt(str(json_root))}",
-            f"infer.output_dir={fmt(str(out_json))}",
-            "infer.save_format=png",
-        ],
-        check=True,
-    )
-
-    out_png_paths = list(out_json.rglob("*.png"))
-    assert sorted(p.name for p in out_png_paths) == ["gt_null_lq.png", "gt_only.png", "paired.png"]
-    by_name = {p.name: p for p in out_png_paths}
-
-    t_paired = load_image(by_name["paired.png"])
-    t_gt_only = load_image(by_name["gt_only.png"])
-    t_gt_null = load_image(by_name["gt_null_lq.png"])
-    assert t_paired.shape == (3, 32, 36)
-    assert t_gt_only.shape == (3, 36, 44)
-    assert t_gt_null.shape == (3, 48, 40)
-    assert t_paired.mean().item() == pytest.approx(ema_mean, abs=0.05)
-    assert t_gt_only.mean().item() == pytest.approx(ema_mean, abs=0.05)
+    # A nested BasicSR checkpoint gives two distinguishable decoded pixel values.
+    vae = DummyVAE()
+    weights = {key: torch.zeros_like(t) for key, t in vae.state_dict().items()}
+    ema = {**weights, "dec_conv.bias": torch.full_like(weights["dec_conv.bias"], 0.5)}
+    path = tmp_path / "vae.pth"
+    torch.save({"params": weights, "params_ema": ema}, path)
+    inputs = tmp_path / "images"
+    synthetic_image_factory(inputs / "odd.png", width=23, height=17)
+    out = tmp_path / "out"
+    infer_cli_runner([
+        "model=vosr", "scale=2",
+        f"++arch={hydra_value_formatter(get_dummy_vosr_arch_dict(with_dino=False))}",
+        f"model.pretrain.vae.path={path}", "model.pretrain.vae.key=params_ema",
+        f"infer.input={inputs}", f"infer.output_dir={out}", "infer.save_format=jpg",
+        "infer.tile.size=[16,16]", "infer.tile.overlap=4", "infer.mixed_precision=no",
+    ], check=True)
+    with Image.open(out / "odd.jpg") as image:
+        assert image.format == "JPEG" and image.size == (46, 34)
+        assert image.getextrema() == ((191, 191),) * 3
 
 
 def test_t4_scenario5_distributed_2proc_train_val_and_offline_infer(
@@ -675,9 +571,9 @@ def test_t4_scenario5_distributed_2proc_train_val_and_offline_infer(
     synthetic_image_factory: Callable[..., Path],
     minimal_train_overrides_factory: Callable[..., list[str]],
     torchrun_cpu_runner: Callable[..., Any],
-    hydra_value_formatter: Callable[[Any], str],
+    infer_cli_runner: Callable[..., Any],
 ) -> None:
-    """Scenario 5: 2-proc CPU torchrun training + odd 5-image val + 2-proc offline tools/infer.py."""
+    """Scenario 5: 2-proc CPU torchrun training + odd 5-image val + single-device offline inference."""
     from utils.image import load_image
 
     # Step 1: 2-process CPU distributed training with mixed sources & odd 5-image stateless PSNR val
@@ -763,39 +659,21 @@ def test_t4_scenario5_distributed_2proc_train_val_and_offline_infer(
         vis_files = list(vis_dir.glob("*.png"))
         assert len(vis_files) <= 5
 
-    # Step 2: 2-process CPU distributed tools/infer.py Mode 1 over a 5-image JSON manifest
+    # Infer on the five images with the components exported by distributed training.
     infer_root = e2e_workdir["data"] / "s5_infer_root"
     infer_sizes = [(20, 24), (24, 20), (18, 26), (22, 22), (26, 18)]
-    manifest_entries: list[dict[str, str]] = []
     for idx, (lq_h, lq_w) in enumerate(infer_sizes):
-        if idx < 3:
-            rel = f"lr/m{idx}.png"
-            synthetic_image_factory(infer_root / rel, width=lq_w, height=lq_h, seed=500 + idx)
-            manifest_entries.append({"lq": rel})
-        else:
-            rel = f"hr/m{idx}.png"
-            synthetic_image_factory(infer_root / rel, width=lq_w, height=lq_h, seed=500 + idx)
-            manifest_entries.append({"gt": rel})
-    infer_manifest = infer_root / "infer_5.json"
-    infer_manifest.write_text(json.dumps(manifest_entries, indent=2), encoding="utf-8")
+        synthetic_image_factory(infer_root / f"m{idx}.png", width=lq_w, height=lq_h, seed=500 + idx)
 
-    out_dir = e2e_workdir["outputs"] / "s5_dist_infer_out"
-    fmt = hydra_value_formatter
-    infer_proc = torchrun_cpu_runner(
-        repo_root / "tools" / "infer.py",
-        [
-            f"infer.exp_dir={fmt(str(work_dir))}",
-            f"infer.input={fmt(str(infer_manifest))}",
-            f"infer.input_root={fmt(str(infer_root))}",
-            f"infer.output_dir={fmt(str(out_dir))}",
-            "infer.mixed_precision='no'",
-            "infer.tile.enabled=true",
-            "infer.tile.size=null",
-            "infer.tile.overlap=4",
-        ],
-        nproc_per_node=2,
-        check=True,
-    )
+    out_dir = e2e_workdir["outputs"] / "s5_infer_out"
+    infer_proc = infer_cli_runner([
+        *vosr_infer_overrides(
+            2, work_dir / "weights", vae="best_odd5_psnr_vae.safetensors",
+            dit="best_odd5_psnr_dit.safetensors", dino="best_odd5_psnr_dino.safetensors",
+        ),
+        f"infer.input={infer_root}", f"infer.output_dir={out_dir}",
+        "infer.mixed_precision=no", "infer.tile.size=[16,16]", "infer.tile.overlap=4",
+    ], check=True)
 
     out_pngs = list(out_dir.rglob("*.png"))
     assert sorted(p.name for p in out_pngs) == [f"m{i}.png" for i in range(5)]
@@ -807,7 +685,7 @@ def test_t4_scenario5_distributed_2proc_train_val_and_offline_infer(
 
     combined = f"{infer_proc.stdout}\n{infer_proc.stderr}"
     assert "img/s" in combined and re.search(r"(?<!\d)5(?!\d)", combined), (
-        f"Expected Rank-0 distributed inference summary with '5' and 'img/s':\n{combined}"
+        f"Expected inference summary with '5' and 'img/s':\n{combined}"
     )
 
 
@@ -944,7 +822,7 @@ def test_t4_scenario6_two_stage_l1_to_l1_lpips_finetune_trackers_and_infer(
     tfevents = sorted((stage2_dir / "trackers").rglob("events.out.tfevents.*"))
     assert len(tfevents) >= 1 and all(p.stat().st_size > 0 for p in tfevents)
 
-    # Stage 3: tools/infer.py Mode 1 on heterogeneous large / strip / tiny edge images
+    # Stage 3: tools/infer.py on heterogeneous large / strip / tiny edge images
     edge_dir = e2e_workdir["data"] / "s6_edge_imgs"
     synthetic_image_factory(edge_dir / "large_48x52.png", width=52, height=48, seed=601)
     synthetic_image_factory(edge_dir / "strip_9x37.png", width=37, height=9, seed=602)
@@ -953,12 +831,15 @@ def test_t4_scenario6_two_stage_l1_to_l1_lpips_finetune_trackers_and_infer(
     out_edge = e2e_workdir["outputs"] / "s6_edge_out"
     infer_cli_runner(
         [
-            f"infer.exp_dir={fmt(str(stage2_dir))}",
+            *vosr_infer_overrides(
+                2, stage2_dir / "weights", vae="best_set5_psnr_vae.safetensors",
+                dit="best_set5_psnr_dit.safetensors", dino="best_set5_psnr_dino.safetensors",
+            ),
             f"infer.input={fmt(str(edge_dir))}",
             f"infer.output_dir={fmt(str(out_edge))}",
             "infer.mixed_precision='no'",
             "infer.tile.enabled=true",
-            "infer.tile.size=null",
+            "infer.tile.size=[32,32]",
             "infer.tile.overlap=4",
         ],
         check=True,

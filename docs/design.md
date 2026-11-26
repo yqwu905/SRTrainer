@@ -1,8 +1,8 @@
 # SRTrainer 架构设计文档
 
 > **定位**：面向图像超分与底层视觉复原（SR / 去噪 / 去模糊 / 图像增强等），基于 **PyTorch + Hugging Face Accelerate + Hydra** 的模块化、可扩展训练与推理框架。
-> **设计哲学**：保持 BasicSR 在底层视觉领域的优秀分层直觉，同时全面拥抱 **Accelerate 工程基础设施** 与 **Hydra 原生 `_target_` 组合继承体系**，以最少样板代码实现「训练—验证—续训—分布式推理」全链路 100% 一致。
-> **实现范围聚焦（Framework-First）**：当前阶段专注把 SRTrainer 框架主干做扎实（Hydra 分级继承配置、Accelerate `Trainer`、`BaseModel`/`SRModel`/`ModelEMA`、统一 JSON 混合数据集与 GPU 掩码 Real-ESRGAN 退化、`metric` 验证套件与 `meta` 透传、PSNR/SSIM/LPIPS 指标、双轨 Checkpoint、共享 `TiledInferencer` 与 `tools/infer.py` 分布式推理）。网络与损失函数保持最小克制：`src/archs/` 仅提供轻量占位网络 **`ToyModel`**（`src/archs/toy_model.py`，对应 `configs/arch/toy_x4.yaml`），`src/losses/` 仅内置 **`L1Loss`** 与 **`LPIPSLoss`**，用户可随时通过 Hydra `_target_` 自由接入自定义网络与损失函数。
+> **设计哲学**：保持 BasicSR 在底层视觉领域的优秀分层直觉，同时全面拥抱 **Accelerate 工程基础设施** 与 **Hydra 原生 `_target_` 组合继承体系**，以最少样板代码实现「训练—验证—续训—离线推理」全链路 100% 一致。
+> **实现范围聚焦（Framework-First）**：当前阶段专注把 SRTrainer 框架主干做扎实（Hydra 分级继承配置、Accelerate `Trainer`、`BaseModel`/`SRModel`/`ModelEMA`、统一 JSON 混合数据集与 GPU 掩码 Real-ESRGAN 退化、`metric` 验证套件与 `meta` 透传、PSNR/SSIM/LPIPS 指标、双轨 Checkpoint、共享 `TiledInferencer` 与 `tools/infer.py` 单设备推理）。网络与损失函数保持最小克制：`src/archs/` 仅提供轻量占位网络 **`ToyModel`**（`src/archs/toy_model.py`，对应 `configs/arch/toy_x4.yaml`），`src/losses/` 仅内置 **`L1Loss`** 与 **`LPIPSLoss`**，用户可随时通过 Hydra `_target_` 自由接入自定义网络与损失函数。
 
 ---
 
@@ -20,7 +20,7 @@
 | **验证与指标** | 验证集统一在 `metric` 配置组中按套件管理（支持不同验证集绑定各自指标与 JSON 附加字段透传，如 OCR-A 的 `label`）；Accelerate 分布式精确评估（`gather_for_metrics` 去重）；内置 **PSNR / SSIM / LPIPS**，支持 `BaseMetric` 扩展 | 适配需要额外标注输入的多样化评测指标；验证与推理共享同一底层 `TiledInferencer` |
 | **Checkpoint** | **双轨保存**：滚动 `accelerator.save_state()`（精确续训）+ 轻量 `safetensors` 纯模型权重（含 `net_g`/`net_g_ema` 与 `best`）+ 持久化 `config_resolved.yaml` | 同时满足精确断点续训、轻量推理部署与二阶段微调加载 |
 | **日志追踪** | 统一走 Accelerate `log_with` / `init_trackers`（支持 YAML 切换或多 tracker 并行）+ Rank 0 本地终端/文件日志 | 不绑定单一实验看板，TensorBoard / WandB / SwanLab / MLflow 即插即用 |
-| **推理架构** | 仅通过 `tools/infer.py` 提供推理入口（支持**实验目录自动还原 + 独立 `infer.yaml` 双配置模式**）；支持 **Accelerate 多卡分布式离线推理**；支持 **按训练输入尺寸自动推导 `tile_size` + 可配置 `overlap` 无缝融合** | 杜绝训练/推理配置漂移，接口克制聚焦，解决大模型大图推理 OOM 与感受野偏移 |
+| **推理架构** | `tools/infer.py` 按 `model._target_` 构建模型，在单设备上处理图像目录 | 训练验证与离线推理共用 `TiledInferencer` 的补边、切块与融合实现 |
 
 ---
 
@@ -67,7 +67,7 @@ flowchart TD
     end
 
     J -- "达到 total_iters" --> S["最终验证与权重保存 -> accelerator.end_training"]
-    S -. "exp_dir + weights/*.safetensors" .-> T["独立 / 多卡分布式 Tiled 推理"]
+    S -. "model.pretrain.*.path" .-> T["单设备分块推理"]
 ```
 
 ### 2.2 单步训练与分布式验证交互时序
@@ -155,7 +155,7 @@ SRTrainer/
 │   │   └── text_ocr.yaml
 │   ├── trainer/                         # Trainer / Accelerate / 日志 / 保存配置
 │   │   └── default.yaml
-│   ├── infer/                           # 推理切块与分布式配置
+│   ├── infer/                           # 推理设备与分块配置
 │   │   └── default.yaml
 │   └── experiment/                      # 实验配置层（支持多级继承与局部微调）
 │       └── vosr2_onestep_text.yaml
@@ -208,7 +208,7 @@ SRTrainer/
 │       └── misc.py                      # 权重加载（strict/ema/key 映射）、pad_to_multiple 等
 ├── tools/
 │   ├── train.py                         # 训练入口脚本
-│   └── infer.py                         # 单卡/多卡推理入口脚本
+│   └── infer.py                         # 单设备目录推理入口脚本
 └── tests/                               # 单元测试与端到端冒烟测试
     ├── test_hydra_configs.py
     ├── test_mixed_dataset.py
@@ -704,7 +704,7 @@ val_suites:
 
 ```text
 experiments/exp01_toy_l1_lpips_x4/
-├── config_resolved.yaml                 # Rank 0 保存的完全解析后配置（供推理自动还原）
+├── config_resolved.yaml                 # Rank 0 保存的完全解析后配置（记录训练使用的参数）
 ├── train.log                            # Rank 0 结构化文本日志
 ├── trackers/                            # Accelerate trackers 日志目录（TensorBoard 等）
 ├── checkpoints/                         # 【轨道 1】完整续训快照（滚动保留最近 N 份）
@@ -730,7 +730,7 @@ experiments/exp01_toy_l1_lpips_x4/
 
 ### 8.2 权重格式与加载策略
 
-- **按架构分文件导出（`safetensors`）**：默认采用 `safetensors`（零反序列化安全风险、mmap 极速加载）。`VOSRModel.export_weights()` 按组件键（`vae`、`dit`、`dit_ema`、`dino` 等）返回干净的无前缀 `state_dict`；验证刷新主指标时，`VOSRModel.export_infer_weights()` + `Checkpointer.save_best_weights()` 同步写出一致的 `best_<val>_<metric>_<arch>.safetensors`，`tools/infer.py` Mode 1 自动按统一前缀与 EMA 策略恢复全部子架构权重。
+- **按架构分文件导出（`safetensors`）**：默认采用 `safetensors`（零反序列化安全风险、mmap 极速加载）。`VOSRModel.export_weights()` 按组件键（`vae`、`dit`、`dit_ema`、`dino` 等）返回干净的无前缀 `state_dict`；验证刷新主指标时，`VOSRModel.export_infer_weights()` + `Checkpointer.save_best_weights()` 同步写出一致的 `best_<val>_<metric>_<arch>.safetensors`。离线推理可在 `model.pretrain.<组件>.path` 中显式指定导出的文件。
 - **Pretrain 初始化 vs Resume 续训**：
   - `model.pretrain.{vae,dit,dino}.{path,strict,key}`: 为每个子架构分别加载纯模型权重（`.safetensors` 或兼容读取外部 `.pth`），从 `global_step = 0` 开始新训练；
   - `trainer.resume`: 设为 `"auto"` 时自动检索 `checkpoints/state_iter_*` 中步数最大的目录，或指定具体状态目录路径，通过 `accelerator.load_state()` 精确恢复全部训练状态。
@@ -785,53 +785,21 @@ val_use_ema: true
 
 ---
 
-## 10. 工程化推理架构（自动 Tile + 重叠融合 + 多卡分布式）
+## 10. 单设备离线推理
 
-### 10.1 双配置模式（仅通过 `tools/infer.py` 调用）
+### 10.1 模型与输入
 
-推理仅提供命令行脚本入口 `tools/infer.py`（底层复用 `TiledInferencer`，不再单独封装 Python SDK `SRPredictor`），支持两种配置模式：
+`tools/infer.py` 从 `infer.yaml` 读取 `scale`、模型和通用推理设置。普通 PyTorch 模型（类或工厂函数）由 Hydra 直接实例化。对于 `BaseModel` 子类，`setup_infer(device)` 返回处于评估模式的网络。VOSR 在该方法中构建 VAE、DiT 和可选的 DINO：各组件的基础权重通过架构自带预训练参数或 `model.pretrain.<组件>.{path,strict,key}` 在初始化时加载，若启用了 DiT LoRA 则在挂载后通过 `model.lora.checkpoint` 加载适配器/完整 LoRA 权重。
 
-1. **实验目录自动还原模式（推荐，零配置漂移）**：
-   - 仅需提供 `infer.exp_dir=experiments/vosr2_onestep_text`（可选通过 `infer.weights_path.{vae,dit,dino}` 覆盖单个组件权重）；
-   - 自动加载 `${exp_dir}/config_resolved.yaml` 中的 `arch.{vae,dit,dino}`、`scale` 与 `data.gt_size`，为全部活跃组件按统一优先级还原权重（未显式指定时优先同一套 `best_*_{arch}` → `latest_{arch}_ema` → `latest_{arch}` → 冻结组件 `model.pretrain.{arch}.path` 或架构内置预训练权重）。
-2. **独立推理配置模式**：
-   - 通过 `infer.yaml` 显式指定 `arch/vae`、`arch/dit`（及可选 `arch/dino`）、`scale`、组件级 `infer.weights_path` 映射与 `tile` 参数，脱离训练实验目录即可独立组合并推理任意子架构权重。
+`infer.input` 指向一个图像目录。入口按文件名排序处理目录顶层的 `.png` 和 `.jpg` 文件，忽略扩展名大小写。每张图的输出路径为 `output_dir/<stem><suffix>.<save_format>`。同目录下同主名的文件会写入同一输出路径。
 
-### 10.2 按训练输入尺寸自动 Tile 切块与 Overlap 无缝融合
+`infer.device` 可显式指定单个设备。默认使用可用的 CUDA 或 CPU。`infer.mixed_precision` 控制前向精度。具体权重与设备配置示例见 [README 快速开始](../README.md#2-推理toolsinferpy)。
 
-为保证大分辨率图像（2K/4K/8K）既不 OOM 又保持与训练时一致的有效感受野，验证与 `tools/infer.py` 共用同一个 `TiledInferencer`：
+### 10.2 分块与重叠融合
 
-```yaml
-# configs/infer/default.yaml
-exp_dir: null                  # 非空时自动还原 exp_dir/config_resolved.yaml 与权重
-weights_path: null             # 可覆盖自动选中的权重路径
-use_ema: true                  # 当 weights_path 未指定时优先选 EMA 权重
+训练验证和独立推理共用 `TiledInferencer.infer_tensor`。该方法完成补边、按批次调用模型、融合输出及最终裁剪。
 
-input: null                    # 支持单图路径 / 图片目录 / JSON 清单（读取 lq 或 gt 字段）
-input_root: null               # 当 input 为相对路径 JSON 清单时指定图片根目录
-output_dir: outputs/infer
-recursive: false               # 目录模式下是否递归扫描子目录
-suffix: ""                     # 输出文件名后缀，例如 "_x4"
-save_format: png               # png | jpg
-
-# 精度与加速
-mixed_precision: bf16          # no | fp16 | bf16
-
-# Tile 推理策略
-tile:
-  enabled: true
-  size: auto                   # auto -> 自动推导为 train_cfg.data.gt_size // scale；也可填具体整数如 64 或 [64, 64]
-  overlap: 16                  # LQ 空间重叠像素（必须 < tile_size // 2），0 表示硬拼接
-  batch_size: 4                # 单次并行前向的 tile 数量，提升 GPU 利用率
-  blend_mode: cosine           # cosine | linear | mean（重叠区羽化融合权重策略）
-  pad_multiple: 8              # 当整图小于 tile 或关闭 tile 时，自动 reflect pad 到该倍数再裁回
-```
-
-#### 自动 Tile 切块与羽化融合算法细节
-
-1. **`tile_size` 自动推导**：
-   - 当 `tile.size == "auto"` 时，自动计算 `tile_h = tile_w = train_cfg.data.gt_size // scale`（例如训练 `gt_size=256, scale=4` → 自动 `tile_size = 64`，与训练网络见过的 LQ patch 尺寸完全一致！）；
-   - 若独立模式无 `data.gt_size`，则提示用户显式指定 `tile.size` 或退回整图模式（并自动执行 `pad_multiple`）。
+1. **分块尺寸**。独立推理通过 `infer.tile.size=[H,W]` 显式配置 LQ 块高和块宽，默认的 `null` 会整图前向。训练验证有 `data.gt_size`，可按 `gt_size // scale` 自动推导尺寸。
 2. **小图 / 边界保护**：
    - 若输入图 `H < tile_h` 或 `W < tile_w`，先用 `reflect` 模式（超边时降级 `replicate`）向右下方 padding 至至少 `(tile_h, tile_w)`，推理完毕后按 `(orig_H * scale, orig_W * scale)` 精确裁回。
 3. **滑动窗口坐标生成**：
@@ -841,31 +809,6 @@ tile:
    - 在 HR 空间构造形状为 `[1, 1, tile_h * scale, tile_w * scale]` 的 2D 平滑权重窗（内部为 `1.0`，边缘 `overlap * scale` 宽的过渡带按余弦或线性平滑衰减到 $\epsilon = 10^{-3}$）；
    - 按 `tile.batch_size` 打包多个 tile 批量前向，将结果乘以权重窗累加到 `output_acc` 与 `weight_acc`（FP32 累加防溢出）；
    - 最终 `output = (output_acc / weight_acc).clamp(0.0, 1.0)`，彻底消除 tile 接缝伪影！
-
-### 10.3 多卡分布式离线推理
-
-通过 `accelerate launch tools/infer.py` 启动多卡批量推理：
-- 收集待处理图片列表后按字典序排序（确保各进程视角一致），利用 `accelerator.split_between_processes(image_items)` 将图片均匀切分给各 GPU 进程；
-- 每个进程独立加载本地模型并执行 `TiledInferencer` + 直接写盘，无需跨卡汇总大分辨率图像张量，显存和通信开销极低；
-- 最后通过 `accelerator.wait_for_everyone()` 同步，并在 Rank 0 打印总耗时、吞吐率（`img/s`）与输出路径汇总。
-
-```bash
-# 单卡：直接从训练实验目录推理单图或目录（自动按训练尺寸切 tile）
-python tools/infer.py \
-  infer.exp_dir=experiments/exp01_toy_l1_lpips_x4 \
-  infer.input=/data/test_imgs \
-  infer.tile.overlap=16
-
-# 4 卡分布式批量推理整个 JSON 测试清单
-accelerate launch --num_processes 4 tools/infer.py \
-  infer.exp_dir=experiments/exp01_toy_l1_lpips_x4 \
-  infer.input=/data/manifests/large_test.json \
-  infer.input_root=/data/large_test \
-  infer.output_dir=outputs/exp01_large_test \
-  infer.tile.size=auto \
-  infer.tile.overlap=16 \
-  infer.tile.batch_size=8
-```
 
 ---
 
@@ -883,6 +826,6 @@ accelerate launch --num_processes 4 tools/infer.py \
    - `BaseModel` / `SRModel` / `ModelEMA`、`TrainState`、`Checkpointer`（`save_state` + `safetensors` + `best`）；
    - `ValImageDataset`（含 `val_collate_fn` 与 `meta` 透传）、`BaseMetric` / `PSNRMetric` / `SSIMMetric` / `LPIPSMetric` 与 `Trainer` 主循环；
    - 端到端冒烟测试（含单卡/多卡训练、验证、中断后 `resume=auto` 续训一致性校验）。
-4. **Milestone 4：共享 `TiledInferencer` 与多卡分布式推理脚本**
+4. **Milestone 4：共享 `TiledInferencer` 与单设备推理脚本**
    - 实现自动 `tile_size` 推导、羽化融合与 pad/unpad；
-   - 打通 `tools/infer.py` 的实验目录自动还原、独立配置与 `accelerate launch` 多卡离线推理。
+   - 通过 `tools/infer.py` 在单设备上运行模型，读取目录图像并保存分块融合结果。

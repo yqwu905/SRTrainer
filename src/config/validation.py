@@ -498,22 +498,7 @@ def validate_infer_config(cfg: InferRootConfig) -> InferRootConfig:
         raise ConfigValidationError(f"scale must be >= 1, got {cfg.scale!r}.")
     inf: InferSettingsConfig = cfg.infer
     _require_non_empty_str(inf.output_dir, "infer.output_dir")
-    _require_optional_non_empty_str(inf.exp_dir, "infer.exp_dir")
-    _require_optional_non_empty_str(inf.weights_path, "infer.weights_path")
-    _require_optional_non_empty_str(inf.input_root, "infer.input_root")
-    for comp in VOSR_COMPONENTS:
-        _require_optional_non_empty_str(
-            inf.component_weights.get(comp), f"infer.component_weights.{comp}"
-        )
-    if inf.weights_path is not None and inf.component_weights.any_set():
-        raise ConfigValidationError(
-            "Cannot set both infer.weights_path and infer.component_weights simultaneously."
-        )
-    if inf.weights_key is not None and inf.component_weights_key.any_set():
-        raise ConfigValidationError(
-            "Cannot set both infer.weights_key and infer.component_weights_key simultaneously."
-        )
-
+    _require_optional_non_empty_str(inf.device, "infer.device")
     forbidden = {"/", "\\", os.sep, "\x00"}
     if os.altsep:
         forbidden.add(os.altsep)
@@ -521,13 +506,7 @@ def validate_infer_config(cfg: InferRootConfig) -> InferRootConfig:
         raise ConfigValidationError(
             f"infer.suffix={inf.suffix!r} contains forbidden path separator or traversal characters."
         )
-
     validate_tile_config(inf.tile, field_prefix="infer.tile")
-    if cfg.model is not None:
-        if cfg.model.scale < 1:
-            raise ConfigValidationError(f"model.scale must be >= 1, got {cfg.model.scale!r}.")
-        _validate_ema_config(cfg.model.ema)
-        _validate_lora_config(cfg.model.lora)
     return cfg
 
 

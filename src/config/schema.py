@@ -42,7 +42,6 @@ __all__ = [
     "MetricConfig",
     "TrainerConfig",
     "TrainConfig",
-    "ComponentWeightsConfig",
     "InferSettingsConfig",
     "InferRootConfig",
 ]
@@ -401,45 +400,15 @@ class TrainConfig:
 
 
 @dataclass
-class ComponentWeightsConfig:
-    """Per-component paths or checkpoint dict keys for multi-arch VOSR inference."""
-
-    vae: Optional[str] = None
-    dit: Optional[str] = None
-    dino: Optional[str] = None
-
-    def get(self, component: str) -> Optional[str]:
-        if component not in VOSR_COMPONENTS:
-            raise KeyError(
-                f"Unknown VOSR component {component!r}; expected one of {VOSR_COMPONENTS}."
-            )
-        return getattr(self, component)
-
-    def as_dict(self) -> dict[str, Optional[str]]:
-        return {"vae": self.vae, "dit": self.dit, "dino": self.dino}
-
-    def any_set(self) -> bool:
-        return any(getattr(self, c) is not None for c in VOSR_COMPONENTS)
-
-
-@dataclass
 class InferSettingsConfig:
     """Structured inference settings for ``tools/infer.py``."""
 
-    exp_dir: Optional[str] = None
-    weights_path: Optional[str] = None
-    weights_key: Optional[str] = None
-    component_weights: ComponentWeightsConfig = field(default_factory=ComponentWeightsConfig)
-    component_weights_key: ComponentWeightsConfig = field(default_factory=ComponentWeightsConfig)
-    use_ema: bool = True
-
     input: Optional[str] = None
-    input_root: Optional[str] = None
     output_dir: str = "outputs/infer"
-    recursive: bool = False
     suffix: str = ""
     save_format: SaveFormat = SaveFormat.png
     mixed_precision: MixedPrecision = MixedPrecision.bf16
+    device: Optional[str] = None
     tile: TileConfig = field(default_factory=TileConfig)
 
 
@@ -449,5 +418,5 @@ class InferRootConfig:
 
     scale: int = 1
     arch: Any = None
-    model: Optional[VOSRModelConfig] = None
+    model: Any = None
     infer: InferSettingsConfig = field(default_factory=InferSettingsConfig)
