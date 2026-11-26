@@ -8,9 +8,9 @@ defaults:
   - infer: default
   - override hydra/job_logging: disabled
 
-# Mode 1 (recommended): infer.exp_dir=experiments/vosr2_onestep_text infer.input=/path/to/imgs
-# Mode 2 (standalone): model=vosr arch/vae=qwen_vae2d arch/dit=vosr2_dit arch/dino=dinov2_vitl14 scale=1
-#   infer.component_weights.vae=/path/vae.safetensors infer.component_weights.dit=/path/dit.safetensors
+# Select a model and its architectures, then point infer.input to an image directory.
+# Example: model=vosr arch/vae=qwen_vae2d arch/dit=vosr2_dit arch/dino=dinov2_vitl14
+# Component checkpoints can be supplied via model.pretrain.<component>.path.
 hydra:
   job:
     chdir: false

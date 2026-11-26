@@ -222,13 +222,12 @@ def test_atomic_config_group_switches_and_disable_degradation_and_dino() -> None
     assert cfg_del_deg.data.get("degradation") is None
 
 
-def test_infer_yaml_dual_modes(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Mode 1: exp_dir auto-restore defaults
+def test_infer_yaml_defaults_and_vosr_composition(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg_default = _compose("infer", return_hydra_config=True)
     assert cfg_default.get("arch") is None
     assert cfg_default.scale == 1
-    assert cfg_default.infer.exp_dir is None
-    assert cfg_default.infer.use_ema is True
+    assert cfg_default.model is None
+    assert cfg_default.infer.device is None
     assert cfg_default.infer.tile.enabled is True
     assert cfg_default.infer.tile.size is None
     assert cfg_default.infer.tile.overlap == 16
@@ -238,7 +237,7 @@ def test_infer_yaml_dual_modes(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cfg_default.hydra.run.dir == "outputs/infer"
     assert cfg_default.hydra.job_logging.disable_existing_loggers is True
 
-    # Mode 2: standalone multi-arch VOSR composition + instantiation
+    # Standalone multi-arch VOSR composition + instantiation
     from tests.helpers.fake_backends import patch_vosr2_backends
 
     patch_vosr2_backends(monkeypatch, z_dim=4, dino_dim=16)

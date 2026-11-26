@@ -19,7 +19,7 @@
   - `RealESRGANDegrader` 在 GPU FP32 下仅对 `gt_only` 子集执行二阶模糊/缩放/噪声/DiffJPEG/Sinc 退化，与真实 `paired` 样本在同 Batch 平滑混合。
 - **验证集内聚于 `metric` 配置组**：每个验证套件在 `configs/metric/` 中独立绑定数据集与所需指标，并将 JSON 附加字段（如 `label` / `text_lines` / `annotation_size`）完整透传到 `BaseMetric.compute(pred, target, meta)` 与 `BaseMetric.compute_stats(pred, target, meta)`；内置 BasicSR/MATLAB BT.601 对齐的 `PSNRMetric`、`SSIMMetric`、`LPIPSMetric`，以及基于 RapidOCR 的文本识别指标 `OCRAccuracyMetric`（OCR-A）、`CERMetric`（CER）与 `OneMinusNEDMetric`（1-NED）。
 - **双轨 Checkpoint（按架构独立保存）**：滚动保存完整续训状态（`checkpoints/state_iter_XXXXXX/`，支持 `resume=auto`）+ 按架构原子导出纯推理权重（`weights/iter_XXXXXX_{vae,dit,dino}.safetensors`、可训练组件 `*_ema.safetensors`、`latest_{arch}[_ema].safetensors`、`best_<val>_<metric>_{arch}.safetensors`）并持久化 `config_resolved.yaml`。
-- **共享 `TiledInferencer` + `tools/infer.py` 分布式推理**：支持实验目录自动还原与独立 `infer.yaml` 两种模式；支持按训练输入尺寸自动推导 `tile_size`（`gt_size // scale`）与可配置 `overlap` 羽化无缝融合；支持单卡与 Accelerate 多卡分布式离线推理。
+- **单设备离线推理**使用模型自身配置加载权重，与训练验证共用 `TiledInferencer` 的切块和重叠融合实现。
 
 ## 安装
 
@@ -114,38 +114,21 @@ uv run accelerate launch tools/train.py \
 
 ### 2. 推理（`tools/infer.py`）
 
+将待处理的 `.png` 和 `.jpg` 放在同一目录的顶层。推理按文件名排序，扩展名大小写均可。以下命令在一台设备上使用 VOSR 模型，对每张图按 512 × 512 像素分块，融合后保存到指定目录。
+
 ```bash
-# 实验目录自动还原模式（自动加载 config_resolved.yaml、按组件还原最优/EMA 权重与训练输入尺寸 tile_size）
 uv run python tools/infer.py \
-  infer.exp_dir=experiments/vosr2_onestep_text \
-  infer.input=/data/test_imgs \
-  infer.output_dir=outputs/vosr2_test \
-  infer.tile.size=null \
-  infer.tile.overlap=64
-
-# 多卡分布式离线推理 JSON 清单
-uv run accelerate launch --num_processes 4 tools/infer.py \
-  infer.exp_dir=experiments/vosr2_onestep_text \
-  infer.input=/data/manifests/large_test.json \
-  infer.input_root=/data/large_test \
-  infer.output_dir=outputs/vosr2_large_test \
-  infer.tile.size=null \
-  infer.tile.overlap=64 \
-  infer.tile.batch_size=1
-
-# 独立配置模式（按组件组合 arch/vae、arch/dit、arch/dino 与各组件权重）
-uv run python tools/infer.py \
-  arch/vae=qwen_vae2d \
-  arch/dit=vosr2_dit \
-  arch/dino=dinov2_vitl14 \
+  model=vosr \
+  arch/vae=qwen_vae2d arch/dit=vosr2_dit arch/dino=dinov2_vitl14 \
   scale=1 \
-  infer.component_weights.vae=/path/to/vae.safetensors \
-  infer.component_weights.dit=/path/to/dit.safetensors \
-  infer.component_weights.dino=/path/to/dino.safetensors \
-  infer.input=/data/test.png \
-  'infer.tile.size=[512,512]' \
-  infer.tile.overlap=64
+  model.pretrain.vae.path=/path/to/vae.safetensors \
+  model.pretrain.dit.path=/path/to/dit.safetensors \
+  model.pretrain.dino.path=/path/to/dino.safetensors \
+  infer.input=/data/test_imgs infer.output_dir=outputs/vosr2_test \
+  'infer.tile.size=[512,512]' infer.tile.overlap=64
 ```
+
+将权重路径替换为对应组件的训练导出文件。使用架构自带的预训练权重时，可省略相应的 `model.pretrain` 参数；若 DiT 启用了 LoRA（`model.lora.enable=true`），基础权重由 `arch.dit.pretrained_path` / `model.pretrain.dit.path` 在挂载前加载，含 LoRA 适配器的权重通过 `model.lora.checkpoint` 在挂载后加载。默认设备为可用的 CUDA 或 CPU，也可用 `infer.device=cpu` 等参数显式指定。独立推理时，默认的 `infer.tile.size=null` 会整图前向。
 
 ### 3. TextVerifier Stage-3 资产准备与迁移说明（`GlyphLoss`）
 

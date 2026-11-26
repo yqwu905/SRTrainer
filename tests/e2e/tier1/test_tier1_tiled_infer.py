@@ -1,4 +1,4 @@
-"""Tier 1 E2E tests — Area F: Shared Tiled Inference & Multi-Process Distributed CLI.
+"""Tier 1 E2E tests — Area F: Shared Tiled Inference & Single-Device CLI.
 
 Covers features F35-F40 and User Requirement #4 (NO SRPredictor).
 Imports ``from engine.inferencer import TiledInferencer`` inside test
@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import ast
 import inspect
-import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -293,252 +292,24 @@ def test_t1_tiled_inferencer_untiled_pad_multiple_exact_crop() -> None:
     assert torch.allclose(out, expected, atol=1e-5)
 
 
-def test_t1_tools_infer_mode1_exp_dir_restore_and_weight_priority(
-    e2e_workdir: dict[str, Path],
-    bias_tagged_exp_dir_factory: Callable[..., dict[str, Any]],
-    synthetic_image_factory: Callable[..., Path],
-    infer_cli_runner: Callable[..., Any],
-    hydra_value_formatter: Callable[[Any], str],
+def test_t1_directory_cli_writes_jpeg(
+    tmp_path: Path, synthetic_image_factory: Callable[..., Path], infer_cli_runner: Callable[..., Any],
 ) -> None:
-    """F37: tools/infer.py Mode 1 auto-restores exp_dir and honors best -> latest_ema -> latest -> override."""
-    from utils.image import load_image
-
-    exp_info = bias_tagged_exp_dir_factory(
-        e2e_workdir["work"] / "exp_mode1",
-        scale=2,
-        gt_size=32,
-        include_best=True,
-        include_ema=True,
-    )
-    exp_dir: Path = exp_info["exp_dir"]
-    exp_means: dict[str, float] = exp_info["expected_means"]
-
-    # Solid black 20x24 image (> gt_size//scale == 16 so auto tiling activates;
-    # zero input ensures any skip connection contributes 0 and output matches expected_means).
-    input_img = synthetic_image_factory(
-        e2e_workdir["data"] / "probe.png",
-        width=24,
-        height=20,
-        pattern="solid",
-        color=(0, 0, 0),
-    )
-
-    def _run_and_measure(tag: str, extra: list[str] | None = None) -> float:
-        out_dir = e2e_workdir["outputs"] / tag
-        overrides = [
-            f"infer.exp_dir={hydra_value_formatter(str(exp_dir))}",
-            f"infer.input={hydra_value_formatter(str(input_img))}",
-            f"infer.output_dir={hydra_value_formatter(str(out_dir))}",
-            "infer.mixed_precision='no'",
-            "infer.tile.enabled=true",
-            "infer.tile.size=null",
-            "infer.tile.overlap=4",
-            *(extra or []),
-        ]
-        proc = infer_cli_runner(overrides, check=True)
-        assert proc.returncode == 0
-        out_png = out_dir / "probe.png"
-        assert out_png.is_file()
-        tensor = load_image(out_png)
-        assert tensor.shape == (3, 40, 48)
-        return float(tensor.mean().item())
-
-    # 1. best_* present -> highest priority.
-    m_best = _run_and_measure("prio_best")
-    assert m_best == pytest.approx(exp_means["best"], abs=0.02)
-
-    # 2. Remove best_* -> falls back to latest_ema (use_ema=true).
-    exp_info["paths"]["best"].unlink()
-    m_ema = _run_and_measure("prio_ema", ["infer.use_ema=true"])
-    assert m_ema == pytest.approx(exp_means["latest_ema"], abs=0.02)
-
-    # 3. use_ema=false -> selects latest.safetensors.
-    m_latest = _run_and_measure("prio_latest", ["infer.use_ema=false"])
-    assert m_latest == pytest.approx(exp_means["latest"], abs=0.02)
-
-    # 4. Explicit weights_path overrides auto-selection.
-    m_override = _run_and_measure(
-        "prio_override",
-        [f"infer.weights_path={hydra_value_formatter(str(exp_info['paths']['override']))}"],
-    )
-    assert m_override == pytest.approx(exp_means["override"], abs=0.02)
-
-    # Confirm all 4 observed pixel means are decisively distinct.
-    distinct = [m_best, m_ema, m_latest, m_override]
-    for i in range(len(distinct)):
-        for j in range(i + 1, len(distinct)):
-            assert abs(distinct[i] - distinct[j]) > 0.1
-
-
-def test_t1_tools_infer_mode2_standalone_inputs_recursive_json_and_jpg(
-    e2e_workdir: dict[str, Path],
-    synthetic_image_factory: Callable[..., Path],
-    constant_bias_state_dict_factory: Callable[..., tuple[dict[str, Any], float]],
-    standalone_infer_arch_overrides_factory: Callable[..., list[str]],
-    infer_cli_runner: Callable[..., Any],
-    hydra_value_formatter: Callable[[Any], str],
-) -> None:
-    """F37, F38: tools/infer.py Mode 2 standalone ToyModel .pth (params_ema) on single/recursive/JSON."""
-    import torch
     from PIL import Image
-    from tests.dummy_arch import DummySRNet
 
-    from utils.image import load_image
-
-    # Build BasicSR-style .pth with distinct non-zero params_ema vs zeroed params.
-    net = DummySRNet(num_in_ch=3, num_out_ch=3, num_feat=8, num_block=1, scale=2)
-    sd_ema, expected_mean = constant_bias_state_dict_factory(net, 0.65)
-    assert expected_mean > 0.4, f"Expected non-trivial bias-tagged output mean, got {expected_mean}"
-    sd_zero = {
-        k: torch.zeros_like(v) if torch.is_floating_point(v) else v.clone()
-        for k, v in net.state_dict().items()
-    }
-    pth_path = e2e_workdir["work"] / "toy_basicsr.pth"
-    torch.save({"params_ema": sd_ema, "params": sd_zero}, pth_path)
-
-    arch_overrides = standalone_infer_arch_overrides_factory(
-        {
-            "_target_": "tests.dummy_arch.DummySRNet",
-            "num_in_ch": 3,
-            "num_out_ch": 3,
-            "num_feat": 8,
-            "num_block": 1,
-            "scale": 2,
-        },
-        scale=2,
-    )
-    common = [
-        *arch_overrides,
-        "infer.exp_dir=null",
-        f"infer.weights_path={hydra_value_formatter(str(pth_path))}",
-        "++infer.weights_key=params_ema",
-        "infer.mixed_precision='no'",
-        "infer.tile.enabled=true",
-        "infer.tile.size=[16,16]",
-        "infer.tile.overlap=4",
-    ]
-
-    # (a) Single image with suffix="_x2" and save_format="jpg".
-    single_in = synthetic_image_factory(
-        e2e_workdir["data"] / "single.png", width=20, height=16, pattern="solid", color=(0, 0, 0)
-    )
-    out_single_dir = e2e_workdir["outputs"] / "mode2_single"
-    infer_cli_runner(
-        [
-            *common,
-            f"infer.input={hydra_value_formatter(str(single_in))}",
-            f"infer.output_dir={hydra_value_formatter(str(out_single_dir))}",
-            "infer.suffix=_x2",
-            "infer.save_format=jpg",
-        ],
-        check=True,
-    )
-    jpg_out = out_single_dir / "single_x2.jpg"
-    assert jpg_out.is_file()
-    with Image.open(jpg_out) as im:
-        assert im.format == "JPEG"
-        assert im.size == (40, 32)
-    # Confirms params_ema was loaded rather than zeroed params.
-    assert load_image(jpg_out).mean().item() == pytest.approx(expected_mean, abs=0.05)
-
-    # (b) Recursive directory preserving nested subdirs with identical basenames.
-    rec_root = e2e_workdir["data"] / "rec_dir"
-    synthetic_image_factory(rec_root / "sub1" / "a.png", width=16, height=16, seed=1)
-    synthetic_image_factory(rec_root / "sub2" / "a.png", width=20, height=18, seed=2)
-    out_rec_dir = e2e_workdir["outputs"] / "mode2_recursive"
-    infer_cli_runner(
-        [
-            *common,
-            f"infer.input={hydra_value_formatter(str(rec_root))}",
-            f"infer.output_dir={hydra_value_formatter(str(out_rec_dir))}",
-            "infer.recursive=true",
-            "infer.save_format=png",
-        ],
-        check=True,
-    )
-    out_sub1 = out_rec_dir / "sub1" / "a.png"
-    out_sub2 = out_rec_dir / "sub2" / "a.png"
-    assert out_sub1.is_file() and out_sub2.is_file()
-    assert load_image(out_sub1).shape == (3, 32, 32)
-    assert load_image(out_sub2).shape == (3, 36, 40)
-
-    # (c) JSON manifest mixing `lq` and `gt`-only fallback with input_root.
-    json_root = e2e_workdir["data"] / "json_infer"
-    synthetic_image_factory(json_root / "lr" / "img_lq.png", width=18, height=16, seed=3)
-    synthetic_image_factory(json_root / "hr" / "img_gt_fallback.png", width=22, height=18, seed=4)
-    manifest = json_root / "infer_list.json"
-    manifest.write_text(
-        json.dumps(
-            [
-                {"lq": "lr/img_lq.png", "gt": "hr/unused.png"},
-                {"gt": "hr/img_gt_fallback.png"},
-            ],
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    out_json_dir = e2e_workdir["outputs"] / "mode2_json"
-    infer_cli_runner(
-        [
-            *common,
-            f"infer.input={hydra_value_formatter(str(manifest))}",
-            f"infer.input_root={hydra_value_formatter(str(json_root))}",
-            f"infer.output_dir={hydra_value_formatter(str(out_json_dir))}",
-            "infer.save_format=png",
-        ],
-        check=True,
-    )
-    json_outputs = sorted(out_json_dir.rglob("*.png"))
-    assert len(json_outputs) == 2
-    by_name = {p.name: load_image(p).shape for p in json_outputs}
-    assert by_name["img_lq.png"] == (3, 32, 36)
-    assert by_name["img_gt_fallback.png"] == (3, 36, 44)
-
-
-def test_t1_tools_infer_2proc_cpu_distributed_odd_image_count(
-    repo_root: Path,
-    e2e_workdir: dict[str, Path],
-    bias_tagged_exp_dir_factory: Callable[..., dict[str, Any]],
-    synthetic_image_factory: Callable[..., Path],
-    torchrun_cpu_runner: Callable[..., Any],
-    hydra_value_formatter: Callable[[Any], str],
-) -> None:
-    """F39, F40: 2-process CPU torchrun tools/infer.py on 5 images writes 5 unique PNGs & summary."""
-    from utils.image import load_image
-
-    exp_info = bias_tagged_exp_dir_factory(
-        e2e_workdir["work"] / "exp_dist_infer",
-        scale=2,
-        gt_size=32,
-        include_best=True,
-        include_ema=True,
-    )
-
-    in_dir = e2e_workdir["data"] / "odd5"
-    for idx in range(5):
-        synthetic_image_factory(in_dir / f"img_{idx}.png", width=24, height=20, seed=idx + 10)
-
-    out_dir = e2e_workdir["outputs"] / "dist_odd5"
-    proc = torchrun_cpu_runner(
-        repo_root / "tools" / "infer.py",
-        [
-            f"infer.exp_dir={hydra_value_formatter(str(exp_info['exp_dir']))}",
-            f"infer.input={hydra_value_formatter(str(in_dir))}",
-            f"infer.output_dir={hydra_value_formatter(str(out_dir))}",
-            "infer.mixed_precision='no'",
-            "infer.tile.enabled=true",
-            "infer.tile.size=null",
-            "infer.tile.overlap=4",
-        ],
-        nproc_per_node=2,
-        check=True,
-    )
-    assert proc.returncode == 0
-
-    out_pngs = sorted(out_dir.glob("*.png"))
-    assert [p.name for p in out_pngs] == [f"img_{i}.png" for i in range(5)]
-    for png in out_pngs:
-        assert load_image(png).shape == (3, 40, 48)
-
-    combined_output = f"{proc.stdout}\n{proc.stderr}"
-    assert "5" in combined_output and "img/s" in combined_output
+    inputs = tmp_path / "images"
+    synthetic_image_factory(inputs / "sample.PNG", width=23, height=19)
+    synthetic_image_factory(inputs / "other.jpg", width=17, height=21)
+    synthetic_image_factory(inputs / "subdir" / "ignored.png", width=8, height=8)
+    output = tmp_path / "out"
+    proc = infer_cli_runner([
+        "++model._target_=tests.dummy_arch.DummySRNet",
+        "++model.scale=2", "scale=2", "infer.device=cpu", "infer.save_format=jpg",
+        "infer.suffix=_sr", "infer.tile.size=[16,16]", "infer.tile.overlap=4",
+        f"infer.input={inputs}", f"infer.output_dir={output}",
+    ], check=True)
+    assert "2 images" in proc.stdout
+    assert sorted(p.name for p in output.glob("*.jpg")) == ["other_sr.jpg", "sample_sr.jpg"]
+    for name, size in (("other_sr.jpg", (34, 42)), ("sample_sr.jpg", (46, 38))):
+        with Image.open(output / name) as image:
+            assert image.format == "JPEG" and image.size == size

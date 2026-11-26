@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from dataclasses import is_dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -15,6 +16,8 @@ from omegaconf import DictConfig, OmegaConf
 from torch import nn
 
 from config.schema import (
+    ArchGroupConfig,
+    InferRootConfig,
     LoRAConfig,
     NoiseInput,
     PretrainEntryConfig,
@@ -23,9 +26,10 @@ from config.schema import (
     VOSRPretrainConfig,
     VOSRTrainableConfig,
 )
-from models.lora import initialize_dit_ffn_big_lora
+from config.validation import load_model_config, load_structured_config
 from models.base_model import BaseModel
 from models.ema import ModelEMA, unwrap_model_for_ema
+from models.lora import initialize_dit_ffn_big_lora
 from utils.misc import load_weights, pad_to_multiple, strip_state_dict_prefix, unpad_tensor
 
 if TYPE_CHECKING:
@@ -80,13 +84,13 @@ def _load_component_weights(
 
 
 def _build_arch(
-    config: dict[str, Any], pretrain: PretrainEntryConfig, accelerator: Accelerator,
+    config: dict[str, Any], pretrain: PretrainEntryConfig, accelerator: Accelerator | None = None,
 ) -> nn.Module:
     if pretrain.path is not None and pretrain.strict:
         init_config = _clone_arch_cfg_skip_pretrained(config)
     else:
         init_config = config
-    with accelerator.main_process_first():
+    with accelerator.main_process_first() if accelerator is not None else nullcontext():
         module = hydra.utils.instantiate(init_config)
     if not isinstance(module, nn.Module):
         raise TypeError(f"Expected architecture to instantiate an nn.Module, got {type(module).__name__}.")
@@ -94,7 +98,7 @@ def _build_arch(
         missing, unexpected = _load_component_weights(
             module, Path(pretrain.path), strict=pretrain.strict, key=pretrain.key,
         )
-        if accelerator.is_main_process:
+        if accelerator is None or accelerator.is_main_process:
             logger = logging.getLogger("srtrainer")
             logger.info("[Model] Loaded %s from %s.", type(module).__name__, pretrain.path)
             if missing or unexpected:
@@ -311,9 +315,9 @@ class VOSRPipeline(nn.Module):
 class VOSRModel(BaseModel):
     """Train a VAE and DiT with optional DINO conditioning."""
 
-    def __init__(self, cfg: TrainConfig) -> None:
+    def __init__(self, cfg: TrainConfig | InferRootConfig) -> None:
         super().__init__(cfg)
-        m: VOSRModelConfig = cfg.model
+        m = cfg.model if isinstance(cfg.model, VOSRModelConfig) else load_model_config(cfg.model)
 
         self.model_cfg: VOSRModelConfig = m
         self.scale: int = m.scale
@@ -399,6 +403,32 @@ class VOSRModel(BaseModel):
         }
         self._clear_train_visuals()
         return visuals
+
+    def setup_infer(self, device: torch.device | str | None = None) -> nn.Module:
+        if self.scale != self.cfg.scale:
+            raise ValueError(
+                f"model.scale ({self.scale}) must match scale ({self.cfg.scale})."
+            )
+        arch = load_structured_config(ArchGroupConfig, self.cfg.arch, context="VOSR arch")
+        if not arch.vae or not arch.dit:
+            raise ValueError("VOSR inference requires arch.vae and arch.dit.")
+        if arch.dino is None and self.pretrain.dino.path is not None:
+            raise ValueError("Cannot set model.pretrain.dino.path when arch.dino is null.")
+        vae = _build_arch(arch.vae, self.pretrain.vae)
+        dit = _build_arch(arch.dit, self.pretrain.dit)
+        dino = _build_arch(arch.dino, self.pretrain.dino) if arch.dino is not None else None
+
+        if self.dit_lora_enabled:
+            dit, _ = initialize_dit_ffn_big_lora(dit, self.lora.lora_rank, self.lora.lora_alpha)
+            if self.lora.checkpoint is not None:
+                load_weights(dit, Path(self.lora.checkpoint), strict=False)
+
+        pipeline = VOSRPipeline.from_model_config(
+            vae=vae, dit=dit, dino=dino, model_cfg=self.model_cfg, scale=self.scale, trainable=None,
+        ).to(device=device).eval()
+        self.vae, self.dit, self.dino = vae, dit, dino
+        self.pipeline = pipeline
+        return pipeline
 
     def setup(self, accelerator: Accelerator) -> None:
         """Execute strict VOSR model setup lifecycle on ``accelerator``."""

@@ -506,7 +506,7 @@ def test_engine_and_models_exports_and_trainer_failfast_validation(
     _block_network_downloads(monkeypatch)
 
     assert engine_pkg.__all__ == ["Trainer", "TrainState", "Checkpointer", "TiledInferencer"]
-    assert models_pkg.__all__ == ["BaseModel", "VOSRModel", "VOSRPipeline", "ModelEMA"]
+    assert models_pkg.__all__ == ["BaseModel", "VOSRModel", "VOSRPipeline", "ModelEMA", "build_infer_model"]
     assert issubclass(VOSRModel, BaseModel)
     with pytest.raises(TypeError):
         BaseModel({})  # type: ignore[abstract]
@@ -1369,11 +1369,11 @@ def test_trainer_interrupt_and_resume_auto_bit_exact_consistency(
 
 
 # ---------------------------------------------------------------------------
-# Test 8: Train -> tools/infer.py exp_dir Auto-Restore Integration
+# Test 8: Train -> tools/infer.py with exported component weights
 # ---------------------------------------------------------------------------
 
 
-def test_train_to_tools_infer_exp_dir_integration(
+def test_train_to_tools_infer_with_exported_weights(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _block_network_downloads(monkeypatch)
@@ -1405,7 +1405,10 @@ def test_train_to_tools_infer_exp_dir_integration(
     best_dino = work_dir / "weights" / "best_val_ref_psnr_dino.safetensors"
     assert best_vae.is_file() and best_dit.is_file() and best_dino.is_file()
 
-    # Invoke tools/infer.py in Mode 1 (infer.exp_dir ONLY — no arch/scale/weights_path!)
+    # Odd dimensions exercise overlapping tiles and the final crop.
+    input_dir = tmp_path / "infer_inputs"
+    input_path = input_dir / "odd.png"
+    _write_rgb_png(input_path, 25, 29, seed=403)
     infer_out = tmp_path / "infer_outputs"
     env = os.environ.copy()
     env["OMP_NUM_THREADS"] = "1"
@@ -1416,9 +1419,14 @@ def test_train_to_tools_infer_exp_dir_integration(
         [
             sys.executable,
             str(TOOLS_INFER),
-            f"infer.exp_dir={work_dir}",
-            f"infer.input={ds['val_ref_json']}",
-            f"infer.input_root={ds['data_root']}",
+            "model=vosr",
+            "scale=2",
+            f"++arch={_to_hydra_val(get_dummy_vosr_arch_dict())}",
+            f"model.pretrain.vae.path={best_vae}",
+            f"model.pretrain.dit.path={best_dit}",
+            f"model.pretrain.dino.path={best_dino}",
+            f"infer.input={input_dir}",
+            "infer.tile.size=[16,16]",
             f"infer.output_dir={infer_out}",
             "infer.mixed_precision=no",
             "infer.tile.overlap=4",
@@ -1433,8 +1441,8 @@ def test_train_to_tools_infer_exp_dir_integration(
     )
     assert proc.returncode == 0, f"tools/infer.py failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
 
-    out_unique = infer_out / "val_ref" / "unique_img.png"
-    assert out_unique.is_file()
+    output_path = infer_out / input_path.name
+    assert output_path.is_file()
 
     # Reference output using TiledInferencer directly with best_*_{vae,dit,dino}.safetensors & tile_size=16 (32//2)
     ref_vae = DummyVAE(z_dim=4, spatial_compression_ratio=2)
@@ -1458,12 +1466,11 @@ def test_train_to_tools_infer_exp_dir_integration(
         device="cpu",
     )
     assert ref_inf.tile_size == (16, 16)
-    lq_tensor = load_image(ds["data_root"] / "val_ref" / "unique_img.png")
+    lq_tensor = load_image(input_path)
     expected_sr = ref_inf.infer_tensor(lq_tensor)
-    actual_sr = load_image(out_unique)
+    actual_sr = load_image(output_path)
     assert actual_sr.shape == expected_sr.shape
-    max_diff = (actual_sr - expected_sr).abs().max().item()
-    assert max_diff <= (1.0 / 255.0 + 1e-5), f"Mismatch between tools/infer.py and TiledInferencer: {max_diff}"
+    assert torch.equal((actual_sr * 255).round(), (expected_sr * 255).round())
 
 
 # ---------------------------------------------------------------------------

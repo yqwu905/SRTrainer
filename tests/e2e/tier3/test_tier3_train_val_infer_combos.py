@@ -3,7 +3,7 @@
 Covers 6 cross-feature pairwise seam integrations across Trainer validation,
 multi-suite GT/GT-less metrics & visuals, 2-process CPU distributed exact
 validation gather parity, distributed timestamp broadcast + LR exactness,
-exp_dir auto-restore odd tiled inference, and TensorBoard resume/pruning.
+explicit checkpoint inference on odd images, and TensorBoard resume/pruning.
 All non-stdlib imports (besides ``pytest``) are strictly deferred inside test functions.
 """
 
@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from tests.e2e.conftest import vosr_infer_overrides
 
 
 def _extract_iter_lines(log_text: str, step: int, total_iters: int) -> list[str]:
@@ -111,12 +112,14 @@ def test_t3_trainer_validation_and_tools_infer_tiled_output_parity(
     fmt = hydra_value_formatter
     infer_cli_runner(
         [
-            f"infer.exp_dir={fmt(str(work_dir))}",
-            f"infer.input={fmt(str(probe_img))}",
+            *vosr_infer_overrides(
+                2, work_dir / "weights", vae=best_vae.name, dit=best_dit.name, dino=best_dino.name,
+            ),
+            f"infer.input={fmt(str(probe_img.parent))}",
             f"infer.output_dir={fmt(str(out_dir))}",
             "infer.mixed_precision='no'",
             "infer.tile.enabled=true",
-            "infer.tile.size=null",
+            "infer.tile.size=[16,16]",
             "infer.tile.overlap=4",
             "infer.tile.blend_mode=cosine",
         ],
@@ -598,7 +601,7 @@ def test_t3_2proc_distributed_timestamp_broadcast_and_lr_schedule_exactness(
     assert logged_lr > 2.5 * buggy_lr_8
 
 
-def test_t3_toymodel_exp_dir_auto_restore_on_non_square_odd_tiled_image(
+def test_t3_vosr_checkpoint_on_non_square_odd_tiled_image(
     e2e_workdir: dict[str, Path],
     paired_train_source_factory: Callable[..., dict[str, Any]],
     minimal_train_cfg_factory: Callable[..., Any],
@@ -606,7 +609,7 @@ def test_t3_toymodel_exp_dir_auto_restore_on_non_square_odd_tiled_image(
     infer_cli_runner: Callable[..., Any],
     hydra_value_formatter: Callable[[Any], str],
 ) -> None:
-    """Seam B x F (F13, F36-F38, F40): ToyModel exp_dir auto-restore on prime-odd 29x41 tiled image."""
+    """Seam B x F (F13, F36-F38, F40): Exported VOSR components on prime-odd 29x41 tiled image."""
     import torch
 
     from engine import Trainer
@@ -641,12 +644,15 @@ def test_t3_toymodel_exp_dir_auto_restore_on_non_square_odd_tiled_image(
     fmt = hydra_value_formatter
     proc = infer_cli_runner(
         [
-            f"infer.exp_dir={fmt(str(exp_dir))}",
-            f"infer.input={fmt(str(odd_img))}",
+            *vosr_infer_overrides(
+                2, exp_dir / "weights", vae="latest_vae.safetensors",
+                dit="latest_dit_ema.safetensors", dino="latest_dino.safetensors",
+            ),
+            f"infer.input={fmt(str(odd_img.parent))}",
             f"infer.output_dir={fmt(str(out_dir))}",
             "infer.mixed_precision='no'",
             "infer.tile.enabled=true",
-            "infer.tile.size=null",
+            "infer.tile.size=[16,16]",
             "infer.tile.overlap=4",
             "infer.tile.blend_mode=linear",
         ],
