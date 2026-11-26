@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import is_dataclass
 from pathlib import Path
 from typing import Any, TypeVar
@@ -32,6 +32,7 @@ from config.schema import (
     TrainerConfig,
     VOSRModelConfig,
 )
+from utils.misc import resolve_2d_size
 
 __all__ = [
     "ConfigValidationError",
@@ -133,7 +134,7 @@ def validate_tile_config(
     *,
     field_prefix: str = "tile",
     scale: int | None = None,
-    gt_size: int | None = None,
+    gt_size: int | Sequence[int] | None = None,
 ) -> None:
     """Validate business ranges and cross-field constraints on ``TileConfig``."""
     if tile.overlap < 0:
@@ -163,13 +164,18 @@ def validate_tile_config(
                     f"for size={tile.size}."
                 )
     elif tile.enabled and tile.overlap > 0 and scale is not None and gt_size is not None:
-        if scale >= 1 and gt_size >= 1 and gt_size % scale == 0:
-            auto_dim = gt_size // scale
-            if tile.overlap >= auto_dim // 2:
+        try:
+            gt_h, gt_w = resolve_2d_size(gt_size, "gt_size")
+        except ValueError:
+            # Malformed gt_size is reported by the owning data-config validation.
+            return
+        if scale >= 1 and gt_h % scale == 0 and gt_w % scale == 0:
+            auto_h, auto_w = gt_h // scale, gt_w // scale
+            if tile.overlap >= min(auto_h, auto_w) // 2:
                 raise ConfigValidationError(
                     f"{field_prefix}.overlap={tile.overlap} must satisfy "
-                    f"0 <= overlap < (gt_size // scale) // 2 ({auto_dim // 2}) "
-                    f"for auto tile size ({auto_dim}, {auto_dim})."
+                    f"0 <= overlap < min(gt_h, gt_w) // scale // 2 "
+                    f"({min(auto_h, auto_w) // 2}) for auto tile size ({auto_h}, {auto_w})."
                 )
 
 
@@ -275,11 +281,19 @@ def _validate_data(data: DataConfig, global_scale: int) -> None:
         raise ConfigValidationError(
             f"data.scale ({data.scale}) must match scale ({global_scale})."
         )
-    if data.gt_size < 1:
-        raise ConfigValidationError(f"data.gt_size must be >= 1, got {data.gt_size!r}.")
-    if data.gt_size % global_scale != 0:
+    try:
+        gt_h, gt_w = resolve_2d_size(data.gt_size, "data.gt_size")
+    except ValueError as exc:
+        raise ConfigValidationError(str(exc)) from exc
+    if gt_h % global_scale != 0 or gt_w % global_scale != 0:
         raise ConfigValidationError(
-            f"data.gt_size ({data.gt_size}) must be evenly divisible by scale ({global_scale})."
+            f"data.gt_size ({(gt_h, gt_w)}) must be evenly divisible by scale ({global_scale})."
+        )
+    if data.augment.rot90 and gt_h != gt_w:
+        raise ConfigValidationError(
+            f"data.augment.rot90 must be false when data.gt_size is rectangular "
+            f"(gt_size=({gt_h}, {gt_w})): 90-degree rotations would mix (gt_h, gt_w) and "
+            f"(gt_w, gt_h) crops in the same batch."
         )
     if data.batch_size_per_gpu < 1:
         raise ConfigValidationError(
@@ -375,7 +389,7 @@ def _validate_trainer(
     trainer: TrainerConfig,
     *,
     scale: int,
-    gt_size: int,
+    gt_size: int | Sequence[int],
     has_val_suites: bool,
 ) -> None:
     if trainer.total_iters < 1:

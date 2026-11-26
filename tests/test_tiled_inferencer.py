@@ -671,3 +671,41 @@ def test_no_srpredictor_anywhere() -> None:
         if "SRPredictor" in path.read_text(encoding="utf-8")
     ]
     assert offenders == [], f"Forbidden symbol 'SRPredictor' found in: {offenders}"
+
+
+def test_tiled_inferencer_rectangular_gt_size_auto_tile() -> None:
+    model = NearestUpsampler(scale=4)
+
+    # Auto tile derived per axis: (gt_h // scale, gt_w // scale)
+    inf_rect = TiledInferencer(
+        model=model, scale=4, tile_size=None, tile_overlap=2, gt_size=[64, 32]
+    )
+    assert inf_rect.tile_enabled is True
+    assert inf_rect.gt_size == (64, 32)
+    assert inf_rect.tile_size == (16, 8)
+    assert tuple(inf_rect.weight_window.shape) == (1, 1, 64, 32)
+
+    # OmegaConf ListConfig input behaves identically
+    inf_lc = TiledInferencer(
+        model=model,
+        scale=4,
+        tile_size=None,
+        tile_overlap=2,
+        gt_size=ListConfig([64, 32]),
+    )
+    assert inf_lc.tile_size == (16, 8)
+
+    # Explicit rectangular tile size still wins over gt_size
+    inf_explicit = TiledInferencer(
+        model=model, scale=4, tile_size=[24, 16], tile_overlap=2, gt_size=[64, 32]
+    )
+    assert inf_explicit.tile_size == (24, 16)
+
+    # Per-axis divisibility and malformed sequences are rejected
+    with pytest.raises(ValueError, match="divisible"):
+        TiledInferencer(model=model, scale=4, tile_size=None, tile_overlap=0, gt_size=[64, 30])
+    for bad_gt in ([64], [64, 0], [True, 32], "64x32", 32.0):
+        with pytest.raises(ValueError):
+            TiledInferencer(
+                model=model, scale=4, tile_size=16, tile_overlap=0, gt_size=bad_gt  # type: ignore[arg-type]
+            )

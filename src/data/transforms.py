@@ -9,9 +9,10 @@ from typing import Any
 
 import torch
 
-from utils.misc import pad_to_min_size
+from utils.misc import pad_to_min_size, resolve_2d_size
 
 __all__ = [
+    "resolve_gt_size",
     "paired_random_crop",
     "paired_random_crop_with_coords",
     "random_crop",
@@ -27,15 +28,34 @@ def _validate_positive_int(value: Any, name: str) -> int:
     return int(value)
 
 
+def resolve_gt_size(gt_size: Any, scale: Any) -> tuple[int, int]:
+    """Normalize ``gt_size`` (square ``int`` or ``[gt_h, gt_w]``) and validate ``scale`` alignment.
+
+    Returns the HT patch size as ``(gt_h, gt_w)``. Both dimensions must be evenly divisible by
+    ``scale`` so that the paired LQ crop stays integral.
+    """
+    scale_i = _validate_positive_int(scale, "scale")
+    gt_h, gt_w = resolve_2d_size(gt_size, "gt_size")
+    if gt_h % scale_i != 0 or gt_w % scale_i != 0:
+        raise ValueError(
+            f"gt_size ({(gt_h, gt_w)}) must be divisible by scale ({scale_i})."
+        )
+    return gt_h, gt_w
+
+
 def paired_random_crop_with_coords(
     gt: torch.Tensor,
     lq: torch.Tensor,
-    gt_size: int,
+    gt_size: int | Sequence[int],
     scale: int,
     *,
     focus_center: tuple[float, float] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int, int, int, int]:
-    """Crop aligned ``(gt, lq)`` patches and return ``(gt_crop, lq_crop, gt_top, gt_left, orig_h, orig_w)``."""
+    """Crop aligned ``(gt, lq)`` patches and return ``(gt_crop, lq_crop, gt_top, gt_left, orig_h, orig_w)``.
+
+    ``gt_size`` may be a square ``int`` or a rectangular ``[gt_h, gt_w]`` sequence; the LQ crop
+    size is derived per axis as ``(gt_h // scale, gt_w // scale)``.
+    """
     if not isinstance(gt, torch.Tensor):
         raise TypeError(f"Expected gt to be a torch.Tensor, got {type(gt).__name__}.")
     if not isinstance(lq, torch.Tensor):
@@ -46,9 +66,7 @@ def paired_random_crop_with_coords(
         raise ValueError(f"Expected 3D [C, H, W] lq tensor, got shape {tuple(lq.shape)}.")
 
     scale_i = _validate_positive_int(scale, "scale")
-    gt_size_i = _validate_positive_int(gt_size, "gt_size")
-    if gt_size_i % scale_i != 0:
-        raise ValueError(f"gt_size ({gt_size_i}) must be divisible by scale ({scale_i}).")
+    gt_h_size, gt_w_size = resolve_gt_size(gt_size, scale_i)
 
     gt_h, gt_w = int(gt.shape[1]), int(gt.shape[2])
     lq_h, lq_w = int(lq.shape[1]), int(lq.shape[2])
@@ -64,36 +82,39 @@ def paired_random_crop_with_coords(
             f"expected gt=({lq_h * scale_i}, {lq_w * scale_i})."
         )
 
-    lq_size = gt_size_i // scale_i
-    if lq_h < lq_size or lq_w < lq_size:
+    lq_h_size = gt_h_size // scale_i
+    lq_w_size = gt_w_size // scale_i
+    if lq_h < lq_h_size or lq_w < lq_w_size:
         raise ValueError(
-            f"Paired image smaller than crop size: lq=({lq_h}, {lq_w}) < lq_size={lq_size} "
-            f"(gt=({gt_h}, {gt_w}) < gt_size={gt_size_i}, scale={scale_i})."
+            f"Paired image smaller than crop size: lq=({lq_h}, {lq_w}) < "
+            f"lq_size=({lq_h_size}, {lq_w_size}) "
+            f"(gt=({gt_h}, {gt_w}) < gt_size=({gt_h_size}, {gt_w_size}), scale={scale_i})."
         )
 
     if focus_center is not None:
         cx, cy = focus_center
-        jitter = gt_size_i * 0.25
-        gt_left_f = cx - gt_size_i * 0.5 + random.uniform(-jitter, jitter)
-        gt_top_f = cy - gt_size_i * 0.5 + random.uniform(-jitter, jitter)
-        lq_left = max(0, min(lq_w - lq_size, round(gt_left_f / scale_i)))
-        lq_top = max(0, min(lq_h - lq_size, round(gt_top_f / scale_i)))
+        jitter_w = gt_w_size * 0.25
+        jitter_h = gt_h_size * 0.25
+        gt_left_f = cx - gt_w_size * 0.5 + random.uniform(-jitter_w, jitter_w)
+        gt_top_f = cy - gt_h_size * 0.5 + random.uniform(-jitter_h, jitter_h)
+        lq_left = max(0, min(lq_w - lq_w_size, round(gt_left_f / scale_i)))
+        lq_top = max(0, min(lq_h - lq_h_size, round(gt_top_f / scale_i)))
     else:
-        lq_top = random.randint(0, lq_h - lq_size)
-        lq_left = random.randint(0, lq_w - lq_size)
+        lq_top = random.randint(0, lq_h - lq_h_size)
+        lq_left = random.randint(0, lq_w - lq_w_size)
 
     gt_top = lq_top * scale_i
     gt_left = lq_left * scale_i
 
-    gt_crop = gt[:, gt_top : gt_top + gt_size_i, gt_left : gt_left + gt_size_i].contiguous()
-    lq_crop = lq[:, lq_top : lq_top + lq_size, lq_left : lq_left + lq_size].contiguous()
+    gt_crop = gt[:, gt_top : gt_top + gt_h_size, gt_left : gt_left + gt_w_size].contiguous()
+    lq_crop = lq[:, lq_top : lq_top + lq_h_size, lq_left : lq_left + lq_w_size].contiguous()
     return gt_crop, lq_crop, gt_top, gt_left, gt_h, gt_w
 
 
 def paired_random_crop(
     gt: torch.Tensor,
     lq: torch.Tensor,
-    gt_size: int,
+    gt_size: int | Sequence[int],
     scale: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Randomly crop aligned ``(gt, lq)`` patches with strict ``gt_size == lq_size * scale`` check."""
@@ -105,51 +126,58 @@ def paired_random_crop(
 
 def random_crop_with_coords(
     gt: torch.Tensor,
-    gt_size: int,
+    gt_size: int | Sequence[int],
     pad_if_smaller: bool = True,
     *,
     focus_center: tuple[float, float] | None = None,
 ) -> tuple[torch.Tensor, int, int, int, int]:
-    """Crop ``[C, gt_size, gt_size]`` from ``gt`` and return ``(crop, top, left, orig_h, orig_w)``."""
+    """Crop ``[C, gt_h, gt_w]`` from ``gt`` and return ``(crop, top, left, orig_h, orig_w)``."""
     if not isinstance(gt, torch.Tensor):
         raise TypeError(f"Expected gt to be a torch.Tensor, got {type(gt).__name__}.")
     if gt.ndim != 3:
         raise ValueError(f"Expected 3D [C, H, W] gt tensor, got shape {tuple(gt.shape)}.")
 
-    gt_size_i = _validate_positive_int(gt_size, "gt_size")
+    gt_h_size, gt_w_size = resolve_2d_size(gt_size, "gt_size")
     orig_h, orig_w = int(gt.shape[1]), int(gt.shape[2])
     h, w = orig_h, orig_w
     if h <= 0 or w <= 0:
         raise ValueError(f"Image spatial dimensions must be positive, got {(h, w)}.")
 
-    if h < gt_size_i or w < gt_size_i:
+    if h < gt_h_size or w < gt_w_size:
         if pad_if_smaller:
-            gt, _ = pad_to_min_size(gt, gt_size_i, gt_size_i, mode="reflect")
+            gt, _ = pad_to_min_size(gt, gt_h_size, gt_w_size, mode="reflect")
             h, w = int(gt.shape[1]), int(gt.shape[2])
         else:
             raise ValueError(
-                f"GT image size {(h, w)} is smaller than gt_size={gt_size_i} "
+                f"GT image size {(h, w)} is smaller than gt_size=({gt_h_size}, {gt_w_size}) "
                 "with pad_if_smaller=False."
             )
 
     if focus_center is not None:
         cx, cy = focus_center
-        jitter = gt_size_i * 0.25
-        left = max(0, min(w - gt_size_i, int(round(cx - gt_size_i * 0.5 + random.uniform(-jitter, jitter)))))
-        top = max(0, min(h - gt_size_i, int(round(cy - gt_size_i * 0.5 + random.uniform(-jitter, jitter)))))
+        jitter_w = gt_w_size * 0.25
+        jitter_h = gt_h_size * 0.25
+        left = max(
+            0,
+            min(w - gt_w_size, int(round(cx - gt_w_size * 0.5 + random.uniform(-jitter_w, jitter_w)))),
+        )
+        top = max(
+            0,
+            min(h - gt_h_size, int(round(cy - gt_h_size * 0.5 + random.uniform(-jitter_h, jitter_h)))),
+        )
     else:
-        top = random.randint(0, h - gt_size_i)
-        left = random.randint(0, w - gt_size_i)
-    crop = gt[:, top : top + gt_size_i, left : left + gt_size_i].contiguous()
+        top = random.randint(0, h - gt_h_size)
+        left = random.randint(0, w - gt_w_size)
+    crop = gt[:, top : top + gt_h_size, left : left + gt_w_size].contiguous()
     return crop, top, left, orig_h, orig_w
 
 
 def random_crop(
     gt: torch.Tensor,
-    gt_size: int,
+    gt_size: int | Sequence[int],
     pad_if_smaller: bool = True,
 ) -> torch.Tensor:
-    """Randomly crop a ``[C, gt_size, gt_size]`` patch from ``gt``, optionally padding small images."""
+    """Randomly crop a ``[C, gt_h, gt_w]`` patch from ``gt``, optionally padding small images."""
     crop, _, _, _, _ = random_crop_with_coords(gt, gt_size=gt_size, pad_if_smaller=pad_if_smaller)
     return crop
 

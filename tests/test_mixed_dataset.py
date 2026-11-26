@@ -912,3 +912,115 @@ def test_val_dataset_and_collate_meta_passthrough(tmp_path: Path) -> None:
     rel_json = _write_json(rel_dir / "manifest.json", [{"lq": "img_lq.png"}])
     ds_rel = ValImageDataset(root_dir=None, json_path=rel_json)
     assert ds_rel[0]["lq"].shape == (3, 8, 8)
+
+
+# ---------------------------------------------------------------------------
+# Rectangular gt_size support (gt_h != gt_w via [gt_h, gt_w] input)
+# ---------------------------------------------------------------------------
+
+
+def test_paired_random_crop_rectangular_gt_size_alignment_and_validation() -> None:
+    scale = 4
+    lq = torch.rand(3, 16, 16)
+    gt = lq.repeat_interleave(scale, dim=1).repeat_interleave(scale, dim=2).contiguous()
+
+    # List, tuple, and OmegaConf ListConfig forms all resolve to (gt_h, gt_w)
+    for gt_size in ([48, 32], (48, 32), OmegaConf.create([48, 32])):
+        for _ in range(10):
+            gt_c, lq_c = paired_random_crop(gt, lq, gt_size=gt_size, scale=scale)
+            assert gt_c.shape == (3, 48, 32)
+            assert lq_c.shape == (3, 12, 8)
+            assert gt_c.is_contiguous() and lq_c.is_contiguous()
+            expected = lq_c.repeat_interleave(scale, dim=1).repeat_interleave(scale, dim=2)
+            assert torch.equal(gt_c, expected)
+
+    # Transposed rectangle stays per-axis aligned
+    gt_c, lq_c = paired_random_crop(gt, lq, gt_size=[32, 48], scale=scale)
+    assert gt_c.shape == (3, 32, 48) and lq_c.shape == (3, 8, 12)
+
+    # Square int remains supported
+    gt_c, lq_c = paired_random_crop(gt, lq, gt_size=32, scale=scale)
+    assert gt_c.shape == (3, 32, 32) and lq_c.shape == (3, 8, 8)
+
+    # Per-axis divisibility, malformed sequences, and size guards
+    with pytest.raises(ValueError, match="divisible"):
+        paired_random_crop(gt, lq, gt_size=[32, 30], scale=scale)
+    for bad_size in ([32], [32, 0], [0, 32], [True, 32], "32x32", 32.0):
+        with pytest.raises(ValueError):
+            paired_random_crop(gt, lq, gt_size=bad_size, scale=scale)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="smaller"):
+        paired_random_crop(torch.zeros(3, 32, 32), torch.zeros(3, 8, 8), gt_size=[48, 32], scale=4)
+
+
+def test_random_crop_rectangular_gt_size_padding() -> None:
+    out = random_crop(torch.rand(3, 64, 80), gt_size=[24, 40])
+    assert out.shape == (3, 24, 40) and out.is_contiguous()
+
+    # Small images pad per axis (reflect, then replicate fallback for tiny images)
+    for shape in ((3, 10, 12), (3, 4, 4), (3, 1, 3)):
+        cropped = random_crop(torch.rand(shape), gt_size=[24, 40], pad_if_smaller=True)
+        assert cropped.shape == (3, 24, 40)
+
+    with pytest.raises(ValueError, match="smaller"):
+        random_crop(torch.rand(3, 10, 12), gt_size=[24, 40], pad_if_smaller=False)
+
+
+def test_mixed_dataset_rectangular_gt_size_and_rot90_guard(tmp_path: Path) -> None:
+    sources_map = _build_synthetic_sources(tmp_path, scale=4)
+    sources_cfg = OmegaConf.create([sources_map["paired"], sources_map["gt_only"]])
+    no_aug = {"hflip": False, "vflip": False, "rot90": False}
+
+    ds = MixedSRDataset(
+        sources=sources_cfg,
+        gt_size=[24, 32],
+        scale=4,
+        augment=no_aug,
+        has_degradation=True,
+        kernel_cfg={"kernel_size": 7, "kernel_range": [7]},
+        is_main_process=False,
+    )
+    assert ds.gt_size == (24, 32)
+    assert ds.lq_size == (6, 8)
+
+    # Paired source without degradation: cropped gt/lq keep the rectangular aspect ratio
+    ds_paired = MixedSRDataset(
+        sources=OmegaConf.create([sources_map["paired"]]),
+        gt_size=[24, 32],
+        scale=4,
+        augment=no_aug,
+        has_degradation=False,
+        is_main_process=False,
+    )
+    item = ds_paired[(0, 0)]
+    assert item["gt"].shape == (3, 24, 32)
+    assert item["lq"].shape == (3, 6, 8)
+    assert item["need_degradation"].item() is False
+
+    # gt_only sample emits a rectangular zero-filled LQ placeholder
+    gt_item = ds[(1, 0)]
+    assert gt_item["need_degradation"].item() is True
+    assert gt_item["gt"].shape == (3, 24, 32)
+    assert gt_item["lq"].shape == (3, 6, 8)
+
+    # rot90 would swap (gt_h, gt_w) per sample and break collation -> rejected up front
+    paired_only = OmegaConf.create([sources_map["paired"]])
+    with pytest.raises(ValueError, match="rot90"):
+        MixedSRDataset(
+            sources=paired_only,
+            gt_size=[24, 32],
+            scale=4,
+            augment={"hflip": True, "vflip": True, "rot90": True},
+            has_degradation=False,
+            is_main_process=False,
+        )
+
+    # Square gt_size keeps rot90 usable
+    ds_square = MixedSRDataset(
+        sources=paired_only,
+        gt_size=32,
+        scale=4,
+        augment={"hflip": False, "vflip": False, "rot90": True},
+        has_degradation=False,
+        is_main_process=False,
+    )
+    assert ds_square.gt_size == (32, 32)

@@ -25,6 +25,7 @@ from data.transforms import (
     augment_tensors_with_flags,
     paired_random_crop_with_coords,
     random_crop_with_coords,
+    resolve_gt_size,
 )
 from utils.image import load_image
 from utils.text_geometry import canonical_quad
@@ -147,15 +148,16 @@ def _crop_text_lines(
     *,
     crop_left: int,
     crop_top: int,
-    crop_size: int,
+    crop_h: int,
+    crop_w: int,
     orig_h: int,
     orig_w: int,
 ) -> list[dict[str, Any]]:
     """Translate HR line quads and glyph quads to crop-relative coordinates."""
     if not text_lines:
         return []
-    max_x = float(min(crop_size, orig_w - crop_left))
-    max_y = float(min(crop_size, orig_h - crop_top))
+    max_x = float(min(crop_w, orig_w - crop_left))
+    max_y = float(min(crop_h, orig_h - crop_top))
     if max_x <= 0.0 or max_y <= 0.0:
         return []
 
@@ -202,6 +204,11 @@ def train_collate_fn(items: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 class MixedSRDataset(Dataset[dict[str, Any]]):
     """Multi-source mixed super-resolution training dataset with per-sample auto-detection.
 
+    ``gt_size`` accepts either a positive int (square crops) or a 2-element ``[gt_h, gt_w]``
+    sequence (rectangular crops, ``gt_h != gt_w`` allowed); the paired LQ crop is derived per
+    axis as ``(gt_h // scale, gt_w // scale)``. Rectangular crops require ``augment.rot90`` to
+    be disabled, since 90-degree rotations would swap the patch dimensions.
+
     Supports both ``(source_id, sample_idx)`` tuple indexing (used by
     ``DistributedWeightedInfiniteSampler``) and flat integer indexing. Emits uniform tensor
     dictionaries with zero placeholders so ``gt_only`` and ``paired`` samples collate seamlessly
@@ -213,7 +220,7 @@ class MixedSRDataset(Dataset[dict[str, Any]]):
     def __init__(
         self,
         sources: Sequence[DataSourceConfig | Mapping[str, Any]],
-        gt_size: int,
+        gt_size: int | Sequence[int],
         scale: int = 1,
         augment: AugmentConfig | Mapping[str, Any] | None = None,
         has_degradation: bool = True,
@@ -222,13 +229,12 @@ class MixedSRDataset(Dataset[dict[str, Any]]):
         logger: Any = None,
         text_crop_prob: float = 0.0,
     ) -> None:
-        self.gt_size: int = _validate_positive_int(gt_size, "gt_size")
         self.scale: int = _validate_positive_int(scale, "scale")
-        if self.gt_size % self.scale != 0:
-            raise ValueError(
-                f"gt_size ({self.gt_size}) must be divisible by scale ({self.scale})."
-            )
-        self.lq_size: int = self.gt_size // self.scale
+        self.gt_size: tuple[int, int] = resolve_gt_size(gt_size, self.scale)
+        self.lq_size: tuple[int, int] = (
+            self.gt_size[0] // self.scale,
+            self.gt_size[1] // self.scale,
+        )
         self.text_crop_prob: float = _validate_prob(text_crop_prob, "text_crop_prob")
 
         if not isinstance(has_degradation, bool):
@@ -262,6 +268,13 @@ class MixedSRDataset(Dataset[dict[str, Any]]):
         self._hflip = aug_cfg.hflip
         self._vflip = aug_cfg.vflip
         self._rot90 = aug_cfg.rot90
+
+        if self._rot90 and self.gt_size[0] != self.gt_size[1]:
+            raise ValueError(
+                f"augment.rot90=True is incompatible with rectangular gt_size={self.gt_size}: "
+                "90-degree rotations would emit (gt_h, gt_w) and (gt_w, gt_h) crops in the same "
+                "batch. Disable augment.rot90 (or use a square gt_size)."
+            )
 
         # Intentionally do NOT store `logger` on `self` to keep dataset picklable for num_workers>0.
         samples_per_source, source_stats = validate_sources_config(
@@ -426,7 +439,8 @@ class MixedSRDataset(Dataset[dict[str, Any]]):
                         sample.text_lines,
                         crop_left=gt_left,
                         crop_top=gt_top,
-                        crop_size=self.gt_size,
+                        crop_h=self.gt_size[0],
+                        crop_w=self.gt_size[1],
                         orig_h=orig_h,
                         orig_w=orig_w,
                     )
@@ -450,7 +464,7 @@ class MixedSRDataset(Dataset[dict[str, Any]]):
                 rot90=self._rot90,
             )
 
-        lq = torch.zeros((3, self.lq_size, self.lq_size), dtype=torch.float32)
+        lq = torch.zeros((3, self.lq_size[0], self.lq_size[1]), dtype=torch.float32)
         kernel1, kernel2, sinc_kernel = self.kernel_generator.sample()
         out_item: dict[str, Any] = {
             "gt": gt.contiguous(),
@@ -469,7 +483,8 @@ class MixedSRDataset(Dataset[dict[str, Any]]):
                     sample.text_lines,
                     crop_left=gt_left,
                     crop_top=gt_top,
-                    crop_size=self.gt_size,
+                    crop_h=self.gt_size[0],
+                    crop_w=self.gt_size[1],
                     orig_h=orig_h,
                     orig_w=orig_w,
                 )

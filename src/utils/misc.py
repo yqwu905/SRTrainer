@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import numbers
 import os
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,45 @@ _TORCH_WEIGHT_EXTENSIONS = {".pth", ".pt", ".bin", ".ckpt"}
 
 def _is_positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def resolve_2d_size(value: Any, name: str = "size") -> tuple[int, int]:
+    """Normalize a square-or-rectangular spatial size into a positive ``(h, w)`` tuple.
+
+    Accepted inputs are a positive integer (interpreted as square ``(value, value)``) or a
+    2-element ``[h, w]`` sequence (``list``/``tuple``/OmegaConf ``ListConfig``). Bools, floats,
+    strings, and sequences of any other length raise ``ValueError``.
+    """
+    if isinstance(value, bool):
+        raise ValueError(
+            f"{name} must be a positive integer or a 2-element [h, w] sequence, got {value!r}."
+        )
+
+    if isinstance(value, numbers.Integral):
+        dim = int(value)
+        if dim < 1:
+            raise ValueError(
+                f"{name} must be a positive integer or a 2-element [h, w] sequence, "
+                f"got {value!r}."
+            )
+        return dim, dim
+
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        if len(value) != 2:
+            raise ValueError(f"{name} sequence must have length 2 ([h, w]), got {value!r}.")
+        dims: list[int] = []
+        for axis, raw in enumerate(value):
+            if isinstance(raw, bool) or not isinstance(raw, numbers.Integral) or int(raw) < 1:
+                raise ValueError(
+                    f"{name}[{axis}] must be a positive integer, got {raw!r} "
+                    f"(full value {value!r})."
+                )
+            dims.append(int(raw))
+        return dims[0], dims[1]
+
+    raise ValueError(
+        f"{name} must be a positive integer or a 2-element [h, w] sequence, got {value!r}."
+    )
 
 
 def strip_state_dict_prefix(

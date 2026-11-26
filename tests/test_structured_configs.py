@@ -394,3 +394,53 @@ def test_centralized_validation_returns_typed_dataclasses_and_roundtrips(tmp_pat
     assert reloaded.exp_name == typed.exp_name
     assert reloaded.trainer.mixed_precision is MixedPrecision.no
     assert reloaded.trainer.val_tile.size is None
+
+
+def test_rectangular_gt_size_config_validation(tmp_path: Path) -> None:
+    # Rectangular gt_size list accepted when both dims divide scale and rot90 is off
+    raw = _minimal_train_dict(tmp_path)
+    raw["data"]["gt_size"] = [32, 48]
+    raw["data"]["augment"] = {"hflip": True, "vflip": True, "rot90": False}
+    cfg = load_train_config(raw)
+    assert list(cfg.data.gt_size) == [32, 48]
+
+    # rot90 with rectangular gt_size is a cross-field conflict
+    raw = _minimal_train_dict(tmp_path)
+    raw["data"]["gt_size"] = [32, 48]
+    raw["data"]["augment"] = {"hflip": True, "vflip": True, "rot90": True}
+    with pytest.raises(ConfigValidationError, match="rot90"):
+        load_train_config(raw)
+
+    # Per-axis divisibility by scale
+    raw = _minimal_train_dict(tmp_path)
+    raw["data"]["gt_size"] = [32, 47]
+    raw["data"]["augment"] = {"hflip": True, "vflip": True, "rot90": False}
+    with pytest.raises(ConfigValidationError, match="divisible"):
+        load_train_config(raw)
+
+    # Malformed sequences rejected
+    for bad in ([32], [32, 0], [True, 32], "48x32", 32.5):
+        raw = _minimal_train_dict(tmp_path)
+        raw["data"]["gt_size"] = bad
+        with pytest.raises(ConfigValidationError):
+            load_train_config(raw)
+
+    # Auto val tile derives per-axis dims from rectangular gt_size
+    from config.validation import validate_tile_config
+
+    rectangular_tile = TileConfig(enabled=True, size=None, overlap=8)
+    # auto tile = (16, 24) -> min // 2 = 8, so overlap=8 is invalid for a rectangle
+    with pytest.raises(ConfigValidationError, match="overlap"):
+        validate_tile_config(
+            rectangular_tile,
+            field_prefix="trainer.val_tile",
+            scale=2,
+            gt_size=[32, 48],
+        )
+    # ... while the equivalent square auto tile (24, 24) accepts the same overlap
+    validate_tile_config(
+        TileConfig(enabled=True, size=None, overlap=8),
+        field_prefix="trainer.val_tile",
+        scale=2,
+        gt_size=48,
+    )

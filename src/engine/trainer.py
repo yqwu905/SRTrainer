@@ -47,6 +47,7 @@ from utils.logging import (
     log_images_to_trackers,
     setup_logger,
 )
+from utils.misc import resolve_2d_size
 
 __all__ = ["Trainer"]
 
@@ -148,7 +149,7 @@ class Trainer:
 
         self.seed: int = config.seed
         self.scale: int = config.scale
-        self.gt_size: int = d_cfg.gt_size
+        self.gt_size: tuple[int, int] = resolve_2d_size(d_cfg.gt_size, "data.gt_size")
         self.primary_dataset: str | None = m_cfg.primary_dataset
         self.primary_metric: str | None = m_cfg.primary_metric
 

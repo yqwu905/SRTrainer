@@ -300,9 +300,14 @@ class RealESRGANDegraderConfig:
 
 @dataclass
 class DataConfig:
-    """Training data pipeline configuration (validation suites belong strictly in ``MetricConfig``)."""
+    """Training data pipeline configuration (validation suites belong strictly in ``MetricConfig``).
 
-    gt_size: int = 512
+    ``gt_size`` is either a positive ``int`` (square ``[gt_size, gt_size]`` crops) or a 2-element
+    ``[gt_h, gt_w]`` list (rectangular crops, both dims divisible by ``scale``). Rectangular
+    ``gt_size`` requires ``augment.rot90: false``.
+    """
+
+    gt_size: Any = 512
     scale: int = 1
     batch_size_per_gpu: int = 1
     num_workers: int = 8

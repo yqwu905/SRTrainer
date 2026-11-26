@@ -861,7 +861,8 @@ def test_mixed_dataset_preserves_line_quads_without_glyphs_and_clips_boundary_li
         ),
         crop_left=0,
         crop_top=0,
-        crop_size=64,
+        crop_h=64,
+        crop_w=64,
         orig_h=128,
         orig_w=128,
     )

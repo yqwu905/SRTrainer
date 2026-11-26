@@ -499,6 +499,7 @@ class TrainState:
 
 ```yaml
 gt_size: 256                  # 训练 GT 裁剪尺寸；LQ 输入尺寸自动为 gt_size // scale (= 64)
+# gt_size: [256, 512]         # 矩形裁剪：[gt_h, gt_w]（两维均需被 scale 整除，且需关闭 augment.rot90）
 scale: ${scale}
 batch_size_per_gpu: 8
 num_workers: 8
@@ -799,7 +800,7 @@ val_use_ema: true
 
 训练验证和独立推理共用 `TiledInferencer.infer_tensor`。该方法完成补边、按批次调用模型、融合输出及最终裁剪。
 
-1. **分块尺寸**。独立推理通过 `infer.tile.size=[H,W]` 显式配置 LQ 块高和块宽，默认的 `null` 会整图前向。训练验证有 `data.gt_size`，可按 `gt_size // scale` 自动推导尺寸。
+1. **分块尺寸**。独立推理通过 `infer.tile.size=[H,W]` 显式配置 LQ 块高和块宽，默认的 `null` 会整图前向。训练验证有 `data.gt_size`（方形 `int` 或矩形 `[gt_h, gt_w]`），按轴自动推导 `(gt_h // scale, gt_w // scale)`。
 2. **小图 / 边界保护**：
    - 若输入图 `H < tile_h` 或 `W < tile_w`，先用 `reflect` 模式（超边时降级 `replicate`）向右下方 padding 至至少 `(tile_h, tile_w)`，推理完毕后按 `(orig_H * scale, orig_W * scale)` 精确裁回。
 3. **滑动窗口坐标生成**：
