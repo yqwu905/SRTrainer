@@ -23,6 +23,7 @@ from config.schema import (
     VOSRPretrainConfig,
     VOSRTrainableConfig,
 )
+from models.lora import initialize_dit_ffn_big_lora
 from models.base_model import BaseModel
 from models.ema import ModelEMA, unwrap_model_for_ema
 from utils.misc import load_weights, pad_to_multiple, strip_state_dict_prefix, unpad_tensor
@@ -134,39 +135,6 @@ def attach_dit_lora(
 def should_attach_dit_lora(model_cfg: VOSRModelConfig) -> bool:
     """Return ``True`` iff DiT is trainable and ``model.lora.enable`` is ``True``."""
     return bool(model_cfg.trainable.dit and model_cfg.lora.enable)
-
-
-def _apply_dit_lora(dit: nn.Module, lora_cfg: LoRAConfig) -> nn.Module:
-    """Invoke ``attach_dit_lora`` and validate/normalize its return value."""
-    attached = attach_dit_lora(dit, lora_cfg)
-    if attached is None:
-        return dit
-    if not isinstance(attached, nn.Module):
-        raise TypeError(
-            f"attach_dit_lora() must return an nn.Module or None, got {type(attached).__name__}."
-        )
-    return attached
-
-
-def _set_dit_lora_trainable_params(
-    dit: nn.Module,
-    base_param_ids: set[int],
-) -> list[nn.Parameter]:
-    """Freeze all non-LoRA parameters on ``dit`` and unfreeze only LoRA parameters."""
-    named_params = list(dit.named_parameters())
-    has_named_lora = any("lora" in name.lower() for name, _ in named_params)
-
-    trainable_params: list[nn.Parameter] = []
-    for name, param in named_params:
-        is_lora_param = (
-            ("lora" in name.lower())
-            if has_named_lora
-            else (id(param) not in base_param_ids)
-        )
-        param.requires_grad_(is_lora_param)
-        if is_lora_param:
-            trainable_params.append(param)
-    return trainable_params
 
 
 class VOSRPipeline(nn.Module):
@@ -489,9 +457,25 @@ class VOSRModel(BaseModel):
             _set_trainable(dino, trainable.dino)
 
         if self.dit_lora_enabled:
-            dit_base_param_ids = {id(p) for p in dit.parameters()}
             dit.requires_grad_(False)
-            dit = _apply_dit_lora(dit, self.lora)
+            dit, lora_dit_modules = initialize_dit_ffn_big_lora(dit, self.lora.lora_rank, self.lora.lora_alpha)
+            for n, _p in dit.named_parameters():
+                if "lora" in n and "default_dit" in n: # Lora layer
+                    _p.requires_grad_(True)
+                if any(
+                    x in n
+                    for x in (
+                        "time_embed",
+                        "context_embedder",
+                        "r_embedder",
+                        "x_embedder",
+                        "norm_out",
+                        "proj_out",
+                        "norm1.linear",
+                        "norm1_context.linear",
+                    )
+                ):  # Pre/Post processing
+                    _p.requires_grad_(self.lora.train_pre_post)
             if self.lora.checkpoint is not None:
                 missing_keys, unexpected_keys = load_weights(
                     dit,
@@ -513,12 +497,6 @@ class VOSRModel(BaseModel):
                             len(unexpected_keys),
                             unexpected_keys,
                         )
-
-            if not _set_dit_lora_trainable_params(dit, dit_base_param_ids):
-                raise ValueError(
-                    "No trainable LoRA parameters were found after attach_dit_lora(). "
-                    "Implement attach_dit_lora() to inject LoRA parameters into DiT."
-                )
         else:
             _set_trainable(dit, trainable.dit)
 

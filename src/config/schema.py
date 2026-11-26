@@ -164,6 +164,7 @@ class LoRAConfig:
     enable: bool = False
     lora_rank: int = 32
     lora_alpha: float = 32.0
+    train_pre_post: bool = True
     checkpoint: Optional[str] = None
 
 

@@ -34,11 +34,11 @@ from config.validation import _validate_lora_config
 from engine.inferencer import TiledInferencer
 from models.vosr_model import (
     VOSRPipeline,
-    _apply_dit_lora,
     _clone_arch_cfg_skip_pretrained,
     _load_component_weights,
     should_attach_dit_lora,
 )
+from models.lora import initialize_dit_ffn_big_lora
 from utils.config import load_resolved_config
 from utils.image import IMAGE_EXTENSIONS, load_image, save_image
 from utils.logging import setup_logger
@@ -873,7 +873,7 @@ def _build_infer_model(
                     f"Instantiated arch.{comp} must be torch.nn.Module, got {type(comp_mod).__name__}."
                 )
             if comp == "dit" and dit_lora_active:
-                comp_mod = _apply_dit_lora(comp_mod, model_cfg.lora)
+                comp_mod, lora_dit_modules = initialize_dit_ffn_big_lora(comp_mod, model_cfg.lora.lora_rank, model.cfg.lora.lora_alpha)
             if weight_path is not None:
                 if comp == "dit" and dit_lora_active:
                     load_weights(
