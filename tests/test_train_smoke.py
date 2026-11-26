@@ -859,8 +859,9 @@ def test_vosr_model_7step_setup_losses_pretrain_and_scheduler_gating(
         model.setup(acc)
 
     # Verify pretrain loaded BEFORE EMA clone so DiT EMA inherits exact 0.125 weights
-    assert set(model.emas.keys()) == {"dit"}
-    dit_ema = model.emas["dit"]
+    assert model.vae_ema is None and model.dino_ema is None
+    assert model.dit_ema is not None
+    dit_ema = model.dit_ema
     assert all(torch.allclose(p, torch.full_like(p, 0.125)) for p in dit_ema.module.parameters())
     assert "zero_skip" not in model.losses
     assert set(model.losses.keys()) == {"l1", "lpips"}
@@ -937,7 +938,7 @@ def test_vosr_model_7step_setup_losses_pretrain_and_scheduler_gating(
     model2.setup(acc2)
     infer_pipe = model2.get_infer_network(use_ema=True)
     assert isinstance(infer_pipe, VOSRPipeline)
-    assert infer_pipe.dit is model2.emas["dit"].module
+    assert infer_pipe.dit is model2.dit_ema.module
     acc2.end_training()
     _reset_accelerate_and_loggers()
 
