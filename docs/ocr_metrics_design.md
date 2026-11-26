@@ -47,9 +47,10 @@ Trainer 对每个样本每项指标构造 `[1, 2]` 统计量张量，再调用 `
 - 重用已有几何验证能力，但不能直接用现有 PyTorch 双线性 ROI 替代参考 OpenCV 三次插值而声称像素一致。退化/交叉/非有限框明确拒绝。
 - 后端使用 RapidOCR 的批量识别接口和 PyTorch 引擎（`EngineType.TORCH`），默认模型 `PP-OCRv5_server_rec`，默认 batch_size=1。可选 `ch_ppocr_mobile_v2.0_cls` 做 0/180 度判断。识别直接接收标注裁剪，并检查输出条数与输入框数一致。
 - `ocr_device` 默认 CPU，独立于训练设备，支持 `cpu`、`gpu[:ID]`/`cuda[:ID]`、`npu[:ID]`（需 `torch_npu`）和 `mps`。`.to(torch_device)` 保留 OCR 设备设置。`ocr_model_dir` 和 `ocr_cls_model_dir` 支持本地 RapidOCR PyTorch `.pth` 文件或目录（识别模型同目录可提供 `dict.txt` / `ppocrv5_dict.txt`）。
+- 模型路径不使用 RapidOCR 默认位置：det / rec / cls 权重与字典统一落在工程内 `experiments/weights/rapidocr/`（权重根目录可用环境变量 `SRTRAINER_WEIGHTS_DIR` 覆盖）；默认模型名在上述目录中已有 `.pth` 时直接以显式 `model_path` 加载，缺失时才下载到同一目录。
 - RapidOCR 和 OpenCV 作为可选 OCR 依赖，延迟导入和初始化。缺包时提示 `uv sync --extra ocr`。
 - 同进程、同配置的三项指标共享模型，并复用同一样本的一次识别结果；缓存只能有界保留最后一个样本，必须检查图像/标注/配置变化，不允许下一次验证错误复用上次预测。不依赖 inference-mode tensor 不具备的 `_version`；不能保留 GPU tensor/计算图。测试用 monkeypatch 或替代测试后端，生产接口不添加 fake/pretrained=false 模式。
-- 首次验证时自动下载模型权重与字典。同一缓存目录中的进程通过文件锁串行预下载，离线运行可配置本地 PyTorch `.pth` 权重。
+- 首次验证时自动下载模型权重与字典到工程内 `experiments/weights/rapidocr/`。同一目录中的进程通过文件锁串行预下载，离线运行可直接复用该目录内已有的权重。
 
 ## 交付范围与所有权
 

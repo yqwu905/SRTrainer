@@ -21,6 +21,13 @@ Examples:
         --root-dir /data \\
         --devices npu:0,npu:1,npu:2,npu:3,npu:4,npu:5,npu:6,npu:7
 
+    # Use a non-default weights directory for the det / rec PyTorch weights
+    uv run python tools/detect_text_lines.py \\
+        --input-json /data/train.json \\
+        --output-json /data/train_with_lines.json \\
+        --root-dir /data \\
+        --weights-dir /mnt/nfs/srtrainer_weights
+
     # Force fresh run ignoring any previous sidecar checkpoint
     uv run python tools/detect_text_lines.py \\
         --input-json /data/train.json \\
@@ -64,6 +71,7 @@ from utils.rapidocr import (  # noqa: E402
     DEFAULT_REC_MODEL,
     DET_MODELS,
     REC_MODELS,
+    WEIGHTS_DIR_ENV_VAR,
     create_rapidocr_engine,
     ensure_rapidocr_models_ready,
     get_rapidocr_model_root,
@@ -322,7 +330,12 @@ def build_rapidocr_params(
     device: str,
     rapidocr: Any,
 ) -> tuple[dict[str, Any], tuple[str, ...], Path]:
-    """Build RapidOCR 3.x PyTorch ``params`` dict, auto-download model keys, and cache root."""
+    """Build RapidOCR 3.x PyTorch ``params`` dict, auto-download model keys, and cache root.
+
+    Local ``.pth`` weights are resolved from the project weights directory
+    (``experiments/weights/rapidocr`` by default, or ``SRTRAINER_WEIGHTS_DIR``) and only fall
+    back to ``Global.model_root_dir`` downloads into that same directory.
+    """
     if cfg.intra_threads is not None and (
         isinstance(cfg.intra_threads, bool) or int(cfg.intra_threads) < 1
     ):
@@ -1210,10 +1223,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help=f"RapidOCR detection model name (default: {DEFAULT_DET_MODEL}).",
     )
     parser.add_argument(
+        "--weights-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional weights root directory holding the RapidOCR PyTorch det/rec/cls .pth files "
+            "(default: <repo>/experiments/weights, i.e. <repo>/experiments/weights/rapidocr "
+            f"for RapidOCR; also settable via ${WEIGHTS_DIR_ENV_VAR})."
+        ),
+    )
+    parser.add_argument(
         "--det-model-dir",
         type=str,
         default=None,
-        help="Optional local detection PyTorch .pth file or directory containing it.",
+        help=(
+            "Optional local detection PyTorch .pth file or directory containing it "
+            "(default: experiments/weights/rapidocr/ch_PP-OCRv5_det_server.pth when present)."
+        ),
     )
     parser.add_argument(
         "--rec-model",
@@ -1225,7 +1251,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--rec-model-dir",
         type=str,
         default=None,
-        help="Optional local recognition PyTorch .pth file or directory containing it (with dict.txt/ppocrv5_dict.txt).",
+        help=(
+            "Optional local recognition PyTorch .pth file or directory containing it (with "
+            "dict.txt/ppocrv5_dict.txt). Default: "
+            "experiments/weights/rapidocr/ch_PP-OCRv5_rec_server.pth when present."
+        ),
     )
     parser.add_argument(
         "--cls-model",
@@ -1237,7 +1267,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--cls-model-dir",
         type=str,
         default=None,
-        help="Optional local orientation PyTorch .pth file or directory containing it.",
+        help=(
+            "Optional local orientation PyTorch .pth file or directory containing it "
+            "(default: experiments/weights/rapidocr/ch_ppocr_mobile_v2.0_cls_mobile.pth when "
+            "present)."
+        ),
     )
     parser.add_argument(
         "--rec-batch-size",
@@ -1310,6 +1344,8 @@ def main(argv: Sequence[str] | None = None) -> DetectSummary:
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
     args = _build_arg_parser().parse_args(argv)
+    if args.weights_dir is not None:
+        os.environ[WEIGHTS_DIR_ENV_VAR] = str(Path(args.weights_dir).expanduser())
     cfg = DetectConfig(
         det_model=args.det_model,
         det_model_dir=args.det_model_dir,

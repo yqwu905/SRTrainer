@@ -1,4 +1,10 @@
-"""Shared RapidOCR 3.x / PyTorch helpers for metrics and offline text detection."""
+"""Shared RapidOCR 3.x / PyTorch helpers for metrics and offline text detection.
+
+All RapidOCR PyTorch weights (det / rec / cls) and character dictionaries live in the
+project-local ``experiments/weights/rapidocr`` directory instead of RapidOCR's default
+``site-packages/rapidocr/models`` location. Override the weights root with the
+``SRTRAINER_WEIGHTS_DIR`` environment variable when the project tree is read-only.
+"""
 
 from __future__ import annotations
 
@@ -18,8 +24,13 @@ __all__ = [
     "DET_MODELS",
     "REC_MODELS",
     "CLS_MODELS",
+    "WEIGHTS_DIR_ENV_VAR",
+    "RAPIDOCR_WEIGHTS_DIRNAME",
     "import_rapidocr",
+    "get_project_root",
+    "get_weights_dir",
     "get_rapidocr_model_root",
+    "default_torch_model_path",
     "resolve_torch_model",
     "resolve_rec_dict_path",
     "torch_device_params",
@@ -93,10 +104,52 @@ def import_rapidocr(context: str = "OCR features") -> Any:
     return rapidocr
 
 
+WEIGHTS_DIR_ENV_VAR: str = "SRTRAINER_WEIGHTS_DIR"
+#: Environment variable overriding the project-local ``experiments/weights`` directory.
+
+RAPIDOCR_WEIGHTS_DIRNAME: str = "rapidocr"
+#: Sub-directory of ``experiments/weights`` holding the RapidOCR PyTorch det / rec / cls weights.
+
+#: Project-local weights root, relative to the repository root.
+WEIGHTS_DIR_RELPATH: tuple[str, ...] = ("experiments", "weights")
+
+
+def get_project_root() -> Path:
+    """Return the SRTrainer repository root (the closest parent holding ``pyproject.toml``)."""
+    source_file = Path(__file__).resolve()
+    for parent in source_file.parents:
+        if (parent / "pyproject.toml").is_file():
+            return parent
+    return source_file.parents[2]
+
+
+def get_weights_dir() -> Path:
+    """Return the project weights root ``experiments/weights`` (override via the env var)."""
+    override = os.environ.get(WEIGHTS_DIR_ENV_VAR)
+    if override is not None and override.strip():
+        return Path(override).expanduser()
+    return get_project_root().joinpath(*WEIGHTS_DIR_RELPATH)
+
+
 def get_rapidocr_model_root() -> Path:
-    """Return the shared RapidOCR model cache directory under XDG cache home."""
-    cache_root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
-    return cache_root / "srtrainer" / "rapidocr"
+    """Return the project-local RapidOCR model directory ``experiments/weights/rapidocr``.
+
+    Both explicitly loaded ``.pth`` files and any auto-downloaded weights or character
+    dictionaries are kept here, never in RapidOCR's default ``site-packages/rapidocr/models``
+    nor in a user cache directory.
+    """
+    return get_weights_dir() / RAPIDOCR_WEIGHTS_DIRNAME
+
+
+def default_torch_model_path(
+    model_name: str,
+    *,
+    model_root: str | Path | None = None,
+) -> Path:
+    """Return the project-local ``experiments/weights/rapidocr/<canonical_stem>.pth`` path."""
+    stem = _CANONICAL_TORCH_STEMS.get(model_name, model_name)
+    root = get_rapidocr_model_root() if model_root is None else Path(model_root).expanduser()
+    return root / f"{stem}.pth"
 
 
 def resolve_torch_model(
@@ -105,7 +158,12 @@ def resolve_torch_model(
     role_label: str,
     known_models: Mapping[str, tuple[str, str]],
 ) -> tuple[str, str, Path | None]:
-    """Resolve a built-in RapidOCR PyTorch model name or local ``.pth`` file/directory."""
+    """Resolve a built-in RapidOCR PyTorch model name or local ``.pth`` file/directory.
+
+    With ``model_dir=None`` the project-local weights copy
+    (``experiments/weights/rapidocr/<canonical_stem>.pth``) is preferred; when that file is
+    still absent RapidOCR downloads the weights into the same directory.
+    """
     if model_dir is None:
         if model_name not in known_models:
             raise ValueError(
@@ -114,6 +172,9 @@ def resolve_torch_model(
                 "To use other weights, supply a RapidOCR PyTorch .pth model file."
             )
         version, model_type = known_models[model_name]
+        weights_path = default_torch_model_path(model_name)
+        if weights_path.is_file():
+            return version, model_type, weights_path
         return version, model_type, None
 
     path = Path(model_dir).expanduser()
@@ -151,7 +212,8 @@ def resolve_torch_model(
         raise FileNotFoundError(
             f"OCR {role_label} PyTorch model not found at {path}. Supply a .pth file (named to "
             "match RapidOCR's arch_config.yaml, e.g. ch_PP-OCRv5_rec_server.pth) or a directory "
-            "containing it."
+            f"containing it, or place it in the project weights directory "
+            f"{get_rapidocr_model_root()}."
         )
     default_meta = ("PP-OCRv4", "mobile") if role_label == "orientation" else ("PP-OCRv5", "server")
     version, model_type = known_models.get(model_name, default_meta)

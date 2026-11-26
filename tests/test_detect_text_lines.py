@@ -141,8 +141,13 @@ def test_shared_rapidocr_engine_caches_download_and_avoids_serialized_gpu_init(
     assert init_calls[2]["EngineConfig.torch.cuda_ep_cfg.device_id"] == 1
 
 
-def test_parse_devices_and_rapidocr_params(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_parse_devices_and_rapidocr_params(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     mod = _load_detect_module()
+    # Point the project weights dir at an empty temporary tree so no local .pth is picked up.
+    monkeypatch.setenv("SRTRAINER_WEIGHTS_DIR", str(tmp_path / "weights"))
 
     assert mod.parse_devices("cuda:0,cuda:2", workers_per_device=1) == ["cuda:0", "cuda:2"]
     assert mod.parse_devices("gpu:1,gpu:3", workers_per_device=2) == [
@@ -209,6 +214,65 @@ def test_parse_devices_and_rapidocr_params(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(mod, "create_rapidocr_engine", lambda *a, **kw: "fake_engine")
     assert mod._create_rapidocr_engine(cfg, "cpu", skip_download_lock=True) == "fake_engine"
     assert thread_calls == [2]
+
+
+def test_rapidocr_default_det_rec_paths_use_project_weights_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Det/rec weights default to <weights>/rapidocr instead of RapidOCR's default paths."""
+    from utils import rapidocr as rapidocr_utils
+
+    weights_dir = tmp_path / "weights"
+    model_root = weights_dir / rapidocr_utils.RAPIDOCR_WEIGHTS_DIRNAME
+    model_root.mkdir(parents=True)
+    monkeypatch.setenv(rapidocr_utils.WEIGHTS_DIR_ENV_VAR, str(weights_dir))
+
+    assert rapidocr_utils.get_weights_dir() == weights_dir
+    assert rapidocr_utils.get_rapidocr_model_root() == model_root
+    assert (
+        rapidocr_utils.default_torch_model_path(rapidocr_utils.DEFAULT_DET_MODEL)
+        == model_root / "ch_PP-OCRv5_det_server.pth"
+    )
+    assert (
+        rapidocr_utils.default_torch_model_path(rapidocr_utils.DEFAULT_REC_MODEL)
+        == model_root / "ch_PP-OCRv5_rec_server.pth"
+    )
+
+    det_path = model_root / "ch_PP-OCRv5_det_server.pth"
+    rec_path = model_root / "ch_PP-OCRv5_rec_server.pth"
+    det_path.write_bytes(b"stub-det")
+    rec_path.write_bytes(b"stub-rec")
+    dict_path = model_root / "ppocrv5_dict.txt"
+    dict_path.write_text("a\nb\n", encoding="utf-8")
+
+    fake_rapidocr = types.SimpleNamespace(
+        EngineType=types.SimpleNamespace(TORCH="torch"),
+        OCRVersion=lambda v: f"ver:{v}",
+        ModelType=lambda m: f"type:{m}",
+        LangDet=lambda lang: f"lang:{lang}",
+    )
+    mod = _load_detect_module()
+    params, download_keys, resolved_root = mod.build_rapidocr_params(
+        mod.DetectConfig(), "cpu", fake_rapidocr
+    )
+    assert resolved_root == model_root
+    assert params["Global.model_root_dir"] == str(model_root)
+    assert params["Det.model_path"] == str(det_path)
+    assert params["Rec.model_path"] == str(rec_path)
+    assert params["Rec.rec_keys_path"] == str(dict_path)
+    # Local project weights are complete: nothing needs to be downloaded.
+    assert download_keys == ()
+
+    # RapidOCR's own default (site-packages/rapidocr/models) is never used as a fallback.
+    assert "site-packages" not in str(model_root)
+
+    # Without the override the project-local <repo>/experiments/weights directory wins.
+    monkeypatch.delenv(rapidocr_utils.WEIGHTS_DIR_ENV_VAR)
+    assert (
+        rapidocr_utils.get_weights_dir()
+        == rapidocr_utils.get_project_root() / "experiments" / "weights"
+    )
 
 
 def test_extract_valid_text_lines_clamps_and_drops_degenerate_boxes() -> None:
@@ -521,6 +585,7 @@ class RapidOCR:
     base_env["PYTHONPATH"] = os.pathsep.join(
         p for p in [str(stub_dir), str(REPO_ROOT / "src"), existing_pp] if p
     )
+    base_env["SRTRAINER_WEIGHTS_DIR"] = str(tmp_path / "weights")
     cmd = [
         sys.executable,
         str(SCRIPT_PATH),

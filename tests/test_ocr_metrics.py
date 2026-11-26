@@ -763,6 +763,8 @@ def test_rapidocr_text_recognizer_cls_180_rotation_local_paths_and_count_errors(
 ) -> None:
     rec_dir = tmp_path / "rec_model"
     rec_dir.mkdir()
+    # Keep the default RapidOCR weights lookup isolated from any real project weights tree.
+    monkeypatch.setenv("SRTRAINER_WEIGHTS_DIR", str(tmp_path / "weights"))
     rec_path = rec_dir / "ch_PP-OCRv5_rec_server.pth"
     rec_path.touch()
     # Extra unrelated .pth verifies canonical stem disambiguation inside a shared directory.

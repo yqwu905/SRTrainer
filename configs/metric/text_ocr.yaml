@@ -1,3 +1,6 @@
+# OCR models live in the project weights dir: experiments/weights/rapidocr/ (override the
+# weights root with SRTRAINER_WEIGHTS_DIR). ocr_model_dir/ocr_cls_model_dir: null means
+# "use that project-local copy", never RapidOCR's default site-packages/rapidocr/models.
 defaults:
   - base_metric
   - _self_
