@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import is_dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -16,9 +15,9 @@ from omegaconf import DictConfig, OmegaConf
 from torch import nn
 
 from config.schema import (
-    VOSR_COMPONENTS,
     LoRAConfig,
     NoiseInput,
+    PretrainEntryConfig,
     TrainConfig,
     VOSRModelConfig,
     VOSRPretrainConfig,
@@ -46,17 +45,6 @@ def _move_to_device(obj: Any, device: torch.device, non_blocking: bool = True) -
     if isinstance(obj, tuple):
         return tuple(_move_to_device(v, device, non_blocking=non_blocking) for v in obj)
     return obj
-
-
-def _module_accepts_kwarg(module: nn.Module, kwarg_name: str) -> bool:
-    try:
-        sig = inspect.signature(module.forward)
-    except (TypeError, ValueError):
-        return True
-    for param in sig.parameters.values():
-        if param.kind == inspect.Parameter.VAR_KEYWORD or param.name == kwarg_name:
-            return True
-    return False
 
 
 def _clone_arch_cfg_skip_pretrained(arch_cfg: DictConfig | Mapping[str, Any]) -> DictConfig:
@@ -88,6 +76,41 @@ def _load_component_weights(
     if callable(loader):
         return loader(path, strict=strict, key=key)
     return load_weights(module, path, strict=strict, key=key)
+
+
+def _build_arch(
+    config: dict[str, Any], pretrain: PretrainEntryConfig, accelerator: Accelerator,
+) -> nn.Module:
+    if pretrain.path is not None and pretrain.strict:
+        init_config = _clone_arch_cfg_skip_pretrained(config)
+    else:
+        init_config = config
+    with accelerator.main_process_first():
+        module = hydra.utils.instantiate(init_config)
+    if not isinstance(module, nn.Module):
+        raise TypeError(f"Expected architecture to instantiate an nn.Module, got {type(module).__name__}.")
+    if pretrain.path is not None:
+        missing, unexpected = _load_component_weights(
+            module, Path(pretrain.path), strict=pretrain.strict, key=pretrain.key,
+        )
+        if accelerator.is_main_process:
+            logger = logging.getLogger("srtrainer")
+            logger.info("[Model] Loaded %s from %s.", type(module).__name__, pretrain.path)
+            if missing or unexpected:
+                logger.warning("[Model] Pretrain missing=%s, unexpected=%s.", missing, unexpected)
+    return module
+
+
+def _set_trainable(module: nn.Module, trainable: bool) -> None:
+    module.requires_grad_(trainable)
+    if not trainable:
+        module.eval()
+        return
+    freeze_unused = getattr(module, "freeze_unused_parameters", None)
+    if callable(freeze_unused):
+        freeze_unused()
+    if not any(p.requires_grad for p in module.parameters()):
+        raise ValueError(f"{type(module).__name__} is marked trainable but has no trainable parameters.")
 
 
 def attach_dit_lora(
@@ -147,12 +170,7 @@ def _set_dit_lora_trainable_params(
 
 
 class VOSRPipeline(nn.Module):
-    """Composable end-to-end VOSR pipeline wiring independent ``vae``, ``dit``, and optional ``dino``.
-
-    Exposes standard ``nn.Module`` RGB ``[0, 1] -> [0, 1]`` ``forward(lq)`` semantics for
-    ``TiledInferencer`` validation/inference and single-pass DDP training across any subset of
-    trainable components.
-    """
+    """RGB-to-RGB VOSR forward pass shared by distributed training and tiled inference."""
 
     def __init__(
         self,
@@ -165,7 +183,7 @@ class VOSRPipeline(nn.Module):
         posterior_mode: bool = True,
         clamp_decode_in_train: bool = True,
         eval_seed: int | None = 42,
-        trainable: VOSRTrainableConfig | Mapping[str, bool] | None = None,
+        trainable: VOSRTrainableConfig | None = None,
     ) -> None:
         super().__init__()
         if not isinstance(vae, nn.Module):
@@ -183,50 +201,39 @@ class VOSRPipeline(nn.Module):
         self.clamp_decode_in_train: bool = bool(clamp_decode_in_train)
         self.eval_seed: int | None = eval_seed
 
-        raw_vae = unwrap_model_for_ema(vae)
-        raw_dit = unwrap_model_for_ema(dit)
-        raw_dino = unwrap_model_for_ema(dino) if dino is not None else None
+        vae_z_dim = vae.z_dim
+        dit_out_ch = dit.out_channels
+        dit_in_ch = dit.in_channels
+        dit_z_dims = dit.z_dims
 
-        vae_z_dim = getattr(raw_vae, "z_dim", getattr(raw_vae, "latent_channels", None))
-        dit_out_ch = getattr(raw_dit, "out_channels", None)
-        dit_in_ch = getattr(raw_dit, "in_channels", None)
-        dit_z_dims = getattr(raw_dit, "z_dims", None)
-
-        if isinstance(dit_in_ch, int) and isinstance(dit_out_ch, int) and dit_in_ch != 2 * dit_out_ch:
+        if dit_in_ch != 2 * dit_out_ch:
             raise ValueError(
                 f"VOSR requires dit.in_channels == 2 * dit.out_channels "
                 f"(lq_latent + noise), got in_channels={dit_in_ch}, out_channels={dit_out_ch}."
             )
-        if isinstance(vae_z_dim, int) and isinstance(dit_out_ch, int) and vae_z_dim != dit_out_ch:
+        if vae_z_dim != dit_out_ch:
             raise ValueError(
                 f"VAE latent channels ({vae_z_dim}) does not match DiT out_channels ({dit_out_ch})."
             )
-        if dit_z_dims is not None and raw_dino is None:
+        if dit_z_dims is not None and dino is None:
             raise ValueError(
                 f"DiT expects conditioning features (z_dims={dit_z_dims}), but arch.dino is None."
             )
 
-        vae_factor = int(getattr(raw_vae, "spatial_compression_ratio", 1))
-        dit_patch = int(getattr(raw_dit, "patch_size", 1))
+        vae_factor = vae.spatial_compression_ratio
+        dit_patch = dit.patch_size
         if vae_factor < 1 or dit_patch < 1:
             raise ValueError(
                 f"vae.spatial_compression_ratio ({vae_factor}) and dit.patch_size ({dit_patch}) must be >= 1."
             )
         self._spatial_quantum: int = vae_factor * dit_patch
-        self._dit_accepts_z: bool = _module_accepts_kwarg(raw_dit, "z")
-        self._dit_uses_z: bool = raw_dino is not None and (
-            dit_z_dims is not None or not hasattr(raw_dit, "z_dims")
-        )
 
         self.vae: nn.Module = vae
         self.dit: nn.Module = dit
         self.dino: nn.Module | None = dino
-        if isinstance(trainable, VOSRTrainableConfig):
-            self.trainable: dict[str, bool] = trainable.as_dict()
-        elif trainable is not None:
-            self.trainable = {name: bool(trainable.get(name, False)) for name in VOSR_COMPONENTS}
-        else:
-            self.trainable = {name: False for name in VOSR_COMPONENTS}
+        self.train_vae: bool = trainable.vae if trainable is not None else False
+        self.train_dit: bool = trainable.dit if trainable is not None else False
+        self.train_dino: bool = trainable.dino if trainable is not None else False
 
     @classmethod
     def from_model_config(
@@ -252,63 +259,16 @@ class VOSRPipeline(nn.Module):
             trainable=trainable,
         )
 
-    def iter_components(self) -> Iterator[tuple[str, nn.Module]]:
-        """Yield ``(name, module)`` for active components in canonical order ``(vae, dit, dino)``."""
-        for name in VOSR_COMPONENTS:
-            mod = getattr(self, name)
-            if mod is not None:
-                yield name, mod
-
-    def get_component(self, name: str) -> nn.Module | None:
-        if name not in VOSR_COMPONENTS:
-            raise KeyError(f"Unknown VOSR component {name!r}; expected one of {VOSR_COMPONENTS}.")
-        return getattr(self, name)
-
     def train(self, mode: bool = True) -> VOSRPipeline:
         super().train(mode)
         if mode:
-            for name, mod in self.iter_components():
-                if not self.trainable.get(name, False):
-                    mod.eval()
+            if not self.train_vae:
+                self.vae.eval()
+            if not self.train_dit:
+                self.dit.eval()
+            if self.dino is not None and not self.train_dino:
+                self.dino.eval()
         return self
-
-    def _call_vae_encode(self, lq_m11: torch.Tensor) -> torch.Tensor:
-        enc_fn = getattr(self.vae, "encode_normalized", None)
-        if callable(enc_fn):
-            return enc_fn(lq_m11, posterior_mode=self.posterior_mode)
-        enc_alt = getattr(self.vae, "encode", None)
-        if callable(enc_alt):
-            return enc_alt(lq_m11)
-        raise TypeError(
-            f"VAE arch {type(self.vae).__name__} must implement 'encode_normalized' or 'encode'."
-        )
-
-    def _call_vae_decode(self, sr_latent: torch.Tensor, clamp_output: bool) -> torch.Tensor:
-        dec_fn = getattr(self.vae, "decode_normalized", None)
-        if callable(dec_fn):
-            return dec_fn(sr_latent, clamp_output=clamp_output)
-        dec_alt = getattr(self.vae, "decode", None)
-        if callable(dec_alt):
-            out = dec_alt(sr_latent)
-            return out.clamp(-1.0, 1.0) if clamp_output else out
-        raise TypeError(
-            f"VAE arch {type(self.vae).__name__} must implement 'decode_normalized' or 'decode'."
-        )
-
-    def _encode_lq(self, lq_m11: torch.Tensor) -> torch.Tensor:
-        if self.training and self.trainable.get("vae", False):
-            return self._call_vae_encode(lq_m11)
-        with torch.no_grad():
-            with torch.amp.autocast(device_type=lq_m11.device.type, enabled=False):
-                return self._call_vae_encode(lq_m11.float())
-
-    def _extract_dino(self, lq_pad: torch.Tensor) -> torch.Tensor | None:
-        if self.dino is None or not self._dit_uses_z:
-            return None
-        if self.training and self.trainable.get("dino", False):
-            return self.dino(lq_pad)
-        with torch.no_grad():
-            return self.dino(lq_pad)
 
     def _sample_noise(self, lq_latent: torch.Tensor) -> torch.Tensor:
         if self.noise_input == "zero":
@@ -355,21 +315,25 @@ class VOSRPipeline(nn.Module):
         lq_pad, (orig_h, orig_w) = pad_to_multiple(lq_up, self._spatial_quantum, mode="reflect")
         lq_m11 = lq_pad * 2.0 - 1.0
 
-        lq_latent = self._encode_lq(lq_m11)
-        z_fea = self._extract_dino(lq_pad)
+        if self.training and self.train_vae:
+            lq_latent = self.vae.encode_normalized(lq_m11, posterior_mode=self.posterior_mode)
+        else:
+            with torch.no_grad(), torch.amp.autocast(device_type=lq_m11.device.type, enabled=False):
+                lq_latent = self.vae.encode_normalized(lq_m11.float(), posterior_mode=self.posterior_mode)
+
+        z_fea = None
+        if self.dino is not None and self.dit.z_dims is not None:
+            with torch.set_grad_enabled(torch.is_grad_enabled() and self.training and self.train_dino):
+                z_fea = self.dino(lq_pad)
 
         noise = self._sample_noise(lq_latent)
         dit_inp = torch.cat((lq_latent, noise), dim=1)
         t = torch.ones((b,), device=lq_latent.device, dtype=lq_latent.dtype)
 
-        if self._dit_accepts_z:
-            velocity = self.dit(dit_inp, t, z=z_fea)
-        else:
-            velocity = self.dit(dit_inp, t)
-
+        velocity = self.dit(dit_inp, t, z=z_fea)
         sr_latent = noise - velocity.float()
         clamp_decode = (not self.training) or self.clamp_decode_in_train
-        sr_m11 = self._call_vae_decode(sr_latent, clamp_output=clamp_decode)
+        sr_m11 = self.vae.decode_normalized(sr_latent, clamp_output=clamp_decode)
         sr_01 = (sr_m11 + 1.0) * 0.5
         if sr_01.shape[-2] != orig_h or sr_01.shape[-1] != orig_w:
             sr_01 = unpad_tensor(sr_01, orig_h, orig_w, scale=1)
@@ -377,7 +341,7 @@ class VOSRPipeline(nn.Module):
 
 
 class VOSRModel(BaseModel):
-    """Composable multi-arch VOSR training paradigm receiving typed ``TrainConfig`` directly."""
+    """Train a VAE and DiT with optional DINO conditioning."""
 
     def __init__(self, cfg: TrainConfig) -> None:
         super().__init__(cfg)
@@ -385,12 +349,7 @@ class VOSRModel(BaseModel):
 
         self.model_cfg: VOSRModelConfig = m
         self.scale: int = m.scale
-        self.trainable: dict[str, bool] = m.trainable.as_dict()
         self.lora: LoRAConfig = m.lora
-        self.noise_input: str = m.noise_input.value
-        self.posterior_mode: bool = m.posterior_mode
-        self.clamp_decode_in_train: bool = m.clamp_decode_in_train
-        self.eval_seed: int | None = m.eval_seed
         self.ema_enabled: bool = m.ema.enabled
         self.ema_decay: float = m.ema.decay
         self.ema_warmup_steps: int = m.ema.warmup_steps
@@ -398,13 +357,17 @@ class VOSRModel(BaseModel):
         self.pretrain: VOSRPretrainConfig = m.pretrain
 
         self.pipeline: nn.Module | None = None
-        self.emas: dict[str, ModelEMA] = {}
+        self.vae: nn.Module | None = None
+        self.dit: nn.Module | None = None
+        self.dino: nn.Module | None = None
+        self.vae_ema: ModelEMA | None = None
+        self.dit_ema: ModelEMA | None = None
+        self.dino_ema: ModelEMA | None = None
         self.losses: dict[str, tuple[float, Callable[..., torch.Tensor]]] = {}
         self.degrader: nn.Module | Callable[[dict[str, Any]], dict[str, Any]] | None = None
         self.optimizer: torch.optim.Optimizer | None = None
         self.lr_scheduler: Any | None = None
         self.grad_clip_norm: float | None = None
-        self._active_components: tuple[str, ...] = ()
 
         self._is_setup: bool = False
         self._accum_steps: int = 0
@@ -427,45 +390,8 @@ class VOSRModel(BaseModel):
         return self.accelerator
 
     @property
-    def active_components(self) -> tuple[str, ...]:
-        return self._active_components
-
-    @property
-    def trainable_components(self) -> tuple[str, ...]:
-        return tuple(name for name in self._active_components if self.trainable.get(name, False))
-
-    @property
     def dit_lora_enabled(self) -> bool:
         return should_attach_dit_lora(self.model_cfg)
-
-    def get_component(self, name: str, *, use_ema: bool = False) -> nn.Module | None:
-        """Return an unwrapped component arch (``vae`` / ``dit`` / ``dino``), optionally EMA."""
-        self._require_setup()
-        assert self.pipeline is not None
-        if name not in VOSR_COMPONENTS:
-            raise KeyError(f"Unknown VOSR component {name!r}; expected one of {VOSR_COMPONENTS}.")
-        if use_ema and name in self.emas:
-            return self.emas[name].module
-        raw_pipe = unwrap_model_for_ema(self.pipeline)
-        assert isinstance(raw_pipe, VOSRPipeline)
-        comp = raw_pipe.get_component(name)
-        return unwrap_model_for_ema(comp) if comp is not None else None
-
-    @property
-    def vae(self) -> nn.Module:
-        comp = self.get_component("vae", use_ema=False)
-        assert comp is not None
-        return comp
-
-    @property
-    def dit(self) -> nn.Module:
-        comp = self.get_component("dit", use_ema=False)
-        assert comp is not None
-        return comp
-
-    @property
-    def dino(self) -> nn.Module | None:
-        return self.get_component("dino", use_ema=False)
 
     def _reset_loss_accumulators(self) -> None:
         self._accum_steps = 0
@@ -515,28 +441,11 @@ class VOSRModel(BaseModel):
         use_compile = self.cfg.trainer.compile
         logger = logging.getLogger("srtrainer")
 
-        # Step 1: Instantiate independent arch components (vae, dit, optional dino).
-        raw_components: dict[str, nn.Module] = {}
-        for comp_name in VOSR_COMPONENTS:
-            comp_cfg = self.cfg.arch.get(comp_name)
-            if comp_cfg is None:
-                continue
-            spec = self.pretrain.get(comp_name)
-            inst_cfg = (
-                _clone_arch_cfg_skip_pretrained(comp_cfg)
-                if (spec.path is not None and spec.strict)
-                else comp_cfg
-            )
-            with accelerator.main_process_first():
-                comp_mod = hydra.utils.instantiate(inst_cfg)
-            if not isinstance(comp_mod, nn.Module):
-                raise TypeError(
-                    f"Instantiated cfg.arch.{comp_name} must be an nn.Module, "
-                    f"got {type(comp_mod).__name__}."
-                )
-            raw_components[comp_name] = comp_mod
-
-        active_components = tuple(name for name in VOSR_COMPONENTS if name in raw_components)
+        arch = self.cfg.arch
+        assert arch.vae is not None and arch.dit is not None
+        vae = _build_arch(arch.vae, self.pretrain.vae, accelerator)
+        dit = _build_arch(arch.dit, self.pretrain.dit, accelerator)
+        dino = _build_arch(arch.dino, self.pretrain.dino, accelerator) if arch.dino is not None else None
 
         # Instantiate active losses and optional degrader.
         active_losses: dict[str, tuple[float, Callable[..., torch.Tensor]]] = {}
@@ -574,47 +483,18 @@ class VOSRModel(BaseModel):
                 degrader = degrader.to(accelerator.device)
                 degrader.eval()
 
-        # Step 2: Optional per-arch pretrain loading onto raw modules BEFORE EMA / compile / DDP.
-        for comp_name in active_components:
-            spec = self.pretrain.get(comp_name)
-            if spec.path is None:
-                continue
-            missing_keys, unexpected_keys = _load_component_weights(
-                raw_components[comp_name],
-                Path(spec.path),
-                strict=spec.strict,
-                key=spec.key,
-            )
-            if accelerator.is_main_process:
-                logger.info(
-                    "[Model] Loaded pretrained %s weights from %s (strict=%s, key=%r).",
-                    comp_name,
-                    spec.path,
-                    spec.strict,
-                    spec.key,
-                )
-                if not spec.strict and (missing_keys or unexpected_keys):
-                    logger.warning(
-                        "[Model] Pretrain %s strict=False load summary: missing=%d %s, unexpected=%d %s.",
-                        comp_name,
-                        len(missing_keys),
-                        missing_keys,
-                        len(unexpected_keys),
-                        unexpected_keys,
-                    )
+        trainable = self.model_cfg.trainable
+        _set_trainable(vae, trainable.vae)
+        if dino is not None:
+            _set_trainable(dino, trainable.dino)
 
-        # Step 2.5: Optional DiT LoRA attachment & checkpoint loading (only when dit is trainable).
-        dit_lora_active = should_attach_dit_lora(self.model_cfg)
-        dit_base_param_ids: set[int] = set()
-        if dit_lora_active:
-            dit_mod = raw_components["dit"]
-            dit_base_param_ids = {id(p) for p in dit_mod.parameters()}
-            dit_mod.requires_grad_(False)
-            dit_mod = _apply_dit_lora(dit_mod, self.lora)
-            raw_components["dit"] = dit_mod
+        if self.dit_lora_enabled:
+            dit_base_param_ids = {id(p) for p in dit.parameters()}
+            dit.requires_grad_(False)
+            dit = _apply_dit_lora(dit, self.lora)
             if self.lora.checkpoint is not None:
                 missing_keys, unexpected_keys = load_weights(
-                    dit_mod,
+                    dit,
                     Path(self.lora.checkpoint),
                     strict=False,
                 )
@@ -634,63 +514,35 @@ class VOSRModel(BaseModel):
                             unexpected_keys,
                         )
 
-        # Step 3: Apply per-arch trainability switches BEFORE EMA / compile / DDP.
-        trainable_names: list[str] = []
-        trainable_params: list[nn.Parameter] = []
-        for comp_name in active_components:
-            comp_mod = raw_components[comp_name]
-            if self.trainable[comp_name]:
-                if comp_name == "dit" and dit_lora_active:
-                    comp_params = _set_dit_lora_trainable_params(comp_mod, dit_base_param_ids)
-                    if not comp_params:
-                        raise ValueError(
-                            "Component 'dit' has trainable=True and model.lora.enable=True, "
-                            "but no trainable LoRA parameters were found after attach_dit_lora(). "
-                            "Implement attach_dit_lora() to inject LoRA parameters into DiT."
-                        )
-                else:
-                    comp_mod.requires_grad_(True)
-                    freeze_unused = getattr(comp_mod, "freeze_unused_parameters", None)
-                    if callable(freeze_unused):
-                        freeze_unused()
-                    comp_params = [p for p in comp_mod.parameters() if p.requires_grad]
-                    if not comp_params:
-                        raise ValueError(
-                            f"Component {comp_name!r} is marked trainable=True but has no parameters "
-                            "with requires_grad=True."
-                        )
-                trainable_names.append(comp_name)
-                trainable_params.extend(comp_params)
-            else:
-                comp_mod.requires_grad_(False)
-                comp_mod.eval()
-
-        # Step 4: Clone FP32 EMA shadow ONLY for trainable components BEFORE compile and prepare().
-        emas: dict[str, ModelEMA] = {}
-        if self.ema_enabled:
-            for comp_name in trainable_names:
-                emas[comp_name] = ModelEMA(
-                    raw_components[comp_name],
-                    decay=self.ema_decay,
-                    warmup_steps=self.ema_warmup_steps,
-                    device=accelerator.device,
+            if not _set_dit_lora_trainable_params(dit, dit_base_param_ids):
+                raise ValueError(
+                    "No trainable LoRA parameters were found after attach_dit_lora(). "
+                    "Implement attach_dit_lora() to inject LoRA parameters into DiT."
                 )
+        else:
+            _set_trainable(dit, trainable.dit)
 
-        # Step 5: Optional torch.compile on trainable components.
-        if use_compile:
-            for comp_name in trainable_names:
-                raw_components[comp_name] = torch.compile(raw_components[comp_name])
+        def make_ema(module: nn.Module) -> ModelEMA:
+            return ModelEMA(
+                module,
+                decay=self.ema_decay,
+                warmup_steps=self.ema_warmup_steps,
+                device=accelerator.device,
+            )
 
-        # Assemble composable pipeline (validates cross-component channel / conditioning contracts).
+        vae_ema = make_ema(vae) if self.ema_enabled and trainable.vae else None
+        dit_ema = make_ema(dit) if self.ema_enabled and trainable.dit else None
+        dino_ema = make_ema(dino) if self.ema_enabled and trainable.dino and dino is not None else None
+
         raw_pipeline = VOSRPipeline.from_model_config(
-            vae=raw_components["vae"],
-            dit=raw_components["dit"],
-            dino=raw_components.get("dino"),
+            vae=torch.compile(vae) if use_compile and trainable.vae else vae,
+            dit=torch.compile(dit) if use_compile and trainable.dit else dit,
+            dino=torch.compile(dino) if use_compile and trainable.dino and dino is not None else dino,
             model_cfg=self.model_cfg,
-            trainable=self.model_cfg.trainable,
+            trainable=trainable,
         )
 
-        # Step 6: Instantiate partial optimizer and optional partial lr_scheduler over trainable params.
+        # Build the optimizer from the parameters used by the training pipeline.
         opt_params = [p for p in raw_pipeline.parameters() if p.requires_grad]
         opt_factory = hydra.utils.instantiate(self.cfg.optim.optimizer, _convert_="all")
         optimizer = opt_factory(opt_params) if callable(opt_factory) else opt_factory
@@ -711,37 +563,34 @@ class VOSRModel(BaseModel):
                         f"Instantiated cfg.optim.scheduler must expose callable {required_attr!r}."
                     )
 
-        # Step 7: Prepare ONLY (pipeline, optimizer) — NEVER pass lr_scheduler to prepare().
+        # The scheduler advances only on successful optimizer updates.
         prepared_pipeline, prepared_optimizer = accelerator.prepare(raw_pipeline, optimizer)
         prepared_pipeline.train()
 
         # Deterministic registration for Accelerate checkpointing (lr_scheduler -> per-arch EMAs).
         if lr_scheduler is not None:
             accelerator.register_for_checkpointing(lr_scheduler)
-        for comp_name in VOSR_COMPONENTS:
-            if comp_name in emas:
-                accelerator.register_for_checkpointing(emas[comp_name])
+        if vae_ema is not None:
+            accelerator.register_for_checkpointing(vae_ema)
+        if dit_ema is not None:
+            accelerator.register_for_checkpointing(dit_ema)
+        if dino_ema is not None:
+            accelerator.register_for_checkpointing(dino_ema)
 
-        if accelerator.is_main_process:
-            frozen_names = [n for n in active_components if n not in trainable_names]
-            logger.info(
-                "[Model] VOSRModel ready | active=%s | trainable=%s | frozen=%s | ema=%s | dit_lora=%s",
-                list(active_components),
-                trainable_names,
-                frozen_names,
-                list(emas.keys()),
-                dit_lora_active,
-            )
-
+        prepared = unwrap_model_for_ema(prepared_pipeline)
+        self.vae = unwrap_model_for_ema(prepared.vae)
+        self.dit = unwrap_model_for_ema(prepared.dit)
+        self.dino = unwrap_model_for_ema(prepared.dino) if prepared.dino is not None else None
+        self.vae_ema = vae_ema
+        self.dit_ema = dit_ema
+        self.dino_ema = dino_ema
         self.accelerator = accelerator
         self.grad_clip_norm = grad_clip_norm
         self.losses = active_losses
         self.degrader = degrader
         self.pipeline = prepared_pipeline
-        self.emas = emas
         self.optimizer = prepared_optimizer
         self.lr_scheduler = lr_scheduler
-        self._active_components = active_components
         self._reset_loss_accumulators()
         self._clear_train_visuals()
         self._is_setup = True
@@ -872,13 +721,15 @@ class VOSRModel(BaseModel):
                 if not accelerator.optimizer_step_was_skipped:
                     if self.lr_scheduler is not None:
                         self.lr_scheduler.step()
-                    if self.emas:
-                        raw_pipe = unwrap_model_for_ema(self.pipeline)
-                        assert isinstance(raw_pipe, VOSRPipeline)
-                        for comp_name, ema_obj in self.emas.items():
-                            comp = raw_pipe.get_component(comp_name)
-                            assert comp is not None
-                            ema_obj.update(comp)
+                    if self.vae_ema is not None:
+                        assert self.vae is not None
+                        self.vae_ema.update(self.vae)
+                    if self.dit_ema is not None:
+                        assert self.dit is not None
+                        self.dit_ema.update(self.dit)
+                    if self.dino_ema is not None:
+                        assert self.dino is not None
+                        self.dino_ema.update(self.dino)
 
                 denom = max(1, self._accum_steps)
                 scalars: dict[str, float] = {"loss/total": self._accum_total / denom}
@@ -898,102 +749,56 @@ class VOSRModel(BaseModel):
         """Return an unwrapped ``VOSRPipeline`` using EMA shadows for trainable archs when requested."""
         self._require_setup()
         assert self.pipeline is not None
-        raw_pipe = unwrap_model_for_ema(self.pipeline)
-        assert isinstance(raw_pipe, VOSRPipeline)
+        if not use_ema or (self.vae_ema is None and self.dit_ema is None and self.dino_ema is None):
+            return unwrap_model_for_ema(self.pipeline)
 
-        if not use_ema or not self.emas:
-            return raw_pipe
-
-        vae_mod = self.emas["vae"].module if "vae" in self.emas else unwrap_model_for_ema(raw_pipe.vae)
-        dit_mod = self.emas["dit"].module if "dit" in self.emas else unwrap_model_for_ema(raw_pipe.dit)
-        dino_mod = (
-            self.emas["dino"].module
-            if "dino" in self.emas
-            else (unwrap_model_for_ema(raw_pipe.dino) if raw_pipe.dino is not None else None)
-        )
-        infer_pipe = VOSRPipeline.from_model_config(
-            vae=vae_mod,
-            dit=dit_mod,
-            dino=dino_mod,
+        assert self.vae is not None and self.dit is not None
+        return VOSRPipeline.from_model_config(
+            vae=self.vae_ema.module if self.vae_ema else self.vae,
+            dit=self.dit_ema.module if self.dit_ema else self.dit,
+            dino=self.dino_ema.module if self.dino_ema else self.dino,
             model_cfg=self.model_cfg,
-            trainable=None,
-        )
-        infer_pipe.eval()
-        return infer_pipe
+        ).eval()
 
-    def _split_pipeline_state_dicts(
-        self,
-        accelerator: Accelerator,
+    def _export_weights(
+        self, accelerator: Accelerator, *, inference: bool, use_ema: bool,
     ) -> dict[str, dict[str, torch.Tensor]]:
-        assert self.pipeline is not None
-        raw_full = strip_state_dict_prefix(accelerator.get_state_dict(self.pipeline, unwrap=True))
-        per_comp: dict[str, dict[str, torch.Tensor]] = {name: {} for name in self._active_components}
-        for key, tensor in raw_full.items():
-            for comp_name in self._active_components:
-                prefix = f"{comp_name}."
-                if key.startswith(prefix):
-                    per_comp[comp_name][key[len(prefix) :]] = tensor
-                    break
-
-        cleaned: dict[str, dict[str, torch.Tensor]] = {}
-        for comp_name, raw_sd in per_comp.items():
-            cleaned[comp_name] = {
-                k: v.detach().cpu().contiguous().clone()
-                for k, v in strip_state_dict_prefix(raw_sd).items()
-            }
-        return cleaned
-
-    def export_weights(
-        self,
-        accelerator: Accelerator,
-    ) -> dict[str, dict[str, torch.Tensor]]:
-        """Export separate, prefix-free CPU weight snapshots for each arch (and ``<arch>_ema``)."""
         self._require_setup()
-        live_sds = self._split_pipeline_state_dicts(accelerator)
+        assert self.pipeline is not None
+        full = strip_state_dict_prefix(accelerator.get_state_dict(self.pipeline, unwrap=True))
         exported: dict[str, dict[str, torch.Tensor]] = {}
 
-        for comp_name in self._active_components:
-            if self.trainable[comp_name] or self.save_frozen_weights:
-                if live_sds[comp_name]:
-                    exported[comp_name] = live_sds[comp_name]
-            if comp_name in self.emas:
-                ema_sd = {
+        def snapshot(key: str, state: dict[str, torch.Tensor]) -> None:
+            if state:
+                exported[key] = {
                     k: v.detach().cpu().contiguous().clone()
-                    for k, v in strip_state_dict_prefix(
-                        self.emas[comp_name].module.state_dict()
-                    ).items()
+                    for k, v in strip_state_dict_prefix(state).items()
                 }
-                if ema_sd:
-                    exported[f"{comp_name}_ema"] = ema_sd
 
+        def export(name: str, ema: ModelEMA | None) -> None:
+            if not inference or not use_ema or ema is None:
+                prefix = name + "."
+                live = {k.removeprefix(prefix): v for k, v in full.items() if k.startswith(prefix)}
+                snapshot(name, live)
+            if ema is not None and use_ema:
+                snapshot(name if inference else name + "_ema", ema.module.state_dict())
+
+        trainable = self.model_cfg.trainable
+        if trainable.vae or self.save_frozen_weights:
+            export("vae", self.vae_ema)
+        if trainable.dit or self.save_frozen_weights:
+            export("dit", self.dit_ema)
+        if self.dino is not None and (trainable.dino or self.save_frozen_weights):
+            export("dino", self.dino_ema)
         return exported
+
+    def export_weights(self, accelerator: Accelerator) -> dict[str, dict[str, torch.Tensor]]:
+        return self._export_weights(accelerator, inference=False, use_ema=True)
 
     def export_infer_weights(
-        self,
-        accelerator: Accelerator,
-        use_ema: bool = True,
+        self, accelerator: Accelerator, use_ema: bool = True,
     ) -> dict[str, dict[str, torch.Tensor]]:
-        """Export separate per-arch inference snapshots (EMA where enabled and requested)."""
-        self._require_setup()
-        live_sds = self._split_pipeline_state_dicts(accelerator)
-        exported: dict[str, dict[str, torch.Tensor]] = {}
-
-        for comp_name in self._active_components:
-            if not (self.trainable[comp_name] or self.save_frozen_weights):
-                continue
-            if use_ema and comp_name in self.emas:
-                sd = {
-                    k: v.detach().cpu().contiguous().clone()
-                    for k, v in strip_state_dict_prefix(
-                        self.emas[comp_name].module.state_dict()
-                    ).items()
-                }
-            else:
-                sd = live_sds[comp_name]
-            if sd:
-                exported[comp_name] = sd
-
-        return exported
+        return self._export_weights(accelerator, inference=True, use_ema=use_ema)
 
     def get_lr_dict(self) -> dict[str, float]:
         """Return ``{'lr': ...}`` for single param group or ``{'lr/group_i': ...}`` for multiple."""

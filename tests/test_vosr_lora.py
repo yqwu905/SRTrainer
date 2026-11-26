@@ -193,8 +193,9 @@ def test_dit_lora_trains_only_lora_params_and_exports_full_weights(
 
     assert len(calls) == 1
     assert calls[0] == LoRAConfig(enable=True, lora_rank=4, lora_alpha=8.0, checkpoint=None)
-    assert model.trainable_components == ("dit",)
-    assert set(model.emas.keys()) == {"dit"}
+    assert model.vae_ema is None
+    assert model.dit_ema is not None
+    assert model.dino_ema is None
 
     # Only LoRA params on DiT have requires_grad=True; all base DiT params & VAE/DINO are frozen
     dit_named = dict(model.dit.named_parameters())
@@ -220,7 +221,7 @@ def test_dit_lora_trains_only_lora_params_and_exports_full_weights(
     scalars, stepped = model.train_step(batch, global_step=0)
     assert stepped is True
     assert "loss/total" in scalars
-    assert model.emas["dit"].num_updates == 1
+    assert model.dit_ema.num_updates == 1
 
     # LoRA params updated; base DiT params & VAE completely unchanged
     cur_dit = model.dit.state_dict()
@@ -280,8 +281,9 @@ def test_dit_not_trainable_ignores_lora_and_freezes_dit(
     model.setup(acc)
 
     assert calls == [], "attach_dit_lora must NOT be called when trainable.dit=False"
-    assert model.trainable_components == ("vae",)
-    assert set(model.emas.keys()) == {"vae"}
+    assert model.vae_ema is not None
+    assert model.dit_ema is None
+    assert model.dino_ema is None
     assert all(not p.requires_grad for p in model.dit.parameters())
     assert model.dit.training is False
     assert not any("lora" in k.lower() for k in model.dit.state_dict())
@@ -393,7 +395,7 @@ def test_dit_lora_checkpoint_loads_after_attach_for_partial_and_full_ckpts(
         expected = 0.75 if "lora" in k.lower() else 0.25
         assert torch.allclose(v.detach().cpu(), torch.full_like(v.detach().cpu(), expected)), k
     # EMA cloned after lora.checkpoint load must also hold those weights
-    for k, v in model_partial.emas["dit"].module.state_dict().items():
+    for k, v in model_partial.dit_ema.module.state_dict().items():
         if not v.is_floating_point():
             continue
         expected = 0.75 if "lora" in k.lower() else 0.25

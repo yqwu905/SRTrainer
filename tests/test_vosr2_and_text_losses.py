@@ -19,6 +19,7 @@ from safetensors.torch import load_file as load_safetensors_file
 from safetensors.torch import save_file
 
 from archs import AutoencoderKLQwenImage2D, DINOv2Encoder, VOSR2DiT
+from config.schema import VOSRTrainableConfig
 from data.mixed_dataset import MixedSRDataset, train_collate_fn
 from engine import TiledInferencer, Trainer
 from losses import GlyphLoss, OCRKLLoss
@@ -121,7 +122,7 @@ def _make_tiny_vosr_pipeline(
     use_checkpoint: bool = False,
     vae_gradient_checkpointing: bool = False,
     clamp_decode_in_train: bool = True,
-    trainable: dict[str, bool] | None = None,
+    trainable: VOSRTrainableConfig | None = None,
     z_dims: int | None = 16,
     dino_layer: int = 0,
     dino_num_blocks: int = 2,
@@ -302,6 +303,27 @@ def test_vosr_pipeline_tiled_infer_and_replaceable_components(
     assert no_dino_out.shape == (1, 3, 11, 13)
     assert torch.isfinite(no_dino_out).all()
 
+    # When dit.z_dims is None, a present dino module must be skipped in forward()
+    dino_calls = 0
+
+    class _CountingDino(DummyDino):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            nonlocal dino_calls
+            dino_calls += 1
+            return super().forward(x)
+
+    unconditioned = VOSRPipeline(
+        vae=DummyVAE(z_dim=4, spatial_compression_ratio=2),
+        dit=DummyDiT(in_channels=8, out_channels=4, patch_size=2, z_dims=None),
+        dino=_CountingDino(embed_dim=8, image_size=16, patch_size=4),
+        scale=1,
+    ).eval()
+    with torch.no_grad():
+        uncond_out = unconditioned(torch.rand(1, 3, 11, 13))
+    assert uncond_out.shape == (1, 3, 11, 13)
+    assert torch.isfinite(uncond_out).all()
+    assert dino_calls == 0
+
 
 @pytest.mark.parametrize("use_checkpoint", [False, True])
 def test_vosr_gradient_flow_through_frozen_vae_decoder_into_all_dit_blocks(
@@ -314,7 +336,7 @@ def test_vosr_gradient_flow_through_frozen_vae_decoder_into_all_dit_blocks(
         use_checkpoint=use_checkpoint,
         vae_gradient_checkpointing=use_checkpoint,
         clamp_decode_in_train=False,
-        trainable={"vae": False, "dit": True, "dino": False},
+        trainable=VOSRTrainableConfig(vae=False, dit=True, dino=False),
     )
     pipeline.vae.requires_grad_(False).eval()
     assert pipeline.dino is not None
@@ -467,12 +489,19 @@ def test_vosr_model_per_arch_trainability_combinations_ema_and_separate_export(
         nn.init.normal_(model.dit.final_layer.linear.weight, std=0.1)
 
     expected_trainable = {k for k, v in trainable_cfg.items() if v}
-    assert set(model.emas.keys()) == expected_trainable
-    assert set(model.trainable_components) == expected_trainable
+    networks = (
+        ("vae", model.vae, model.vae_ema),
+        ("dit", model.dit, model.dit_ema),
+        ("dino", model.dino, model.dino_ema),
+    )
+    for name, network, ema in networks:
+        assert network is not None
+        assert any(p.requires_grad for p in network.parameters()) == trainable_cfg[name]
+        assert (ema is not None) == trainable_cfg[name]
 
     init_snap = {
-        comp: {k: v.detach().cpu().clone() for k, v in model.get_component(comp).state_dict().items()}
-        for comp in ("vae", "dit", "dino")
+        comp: {k: v.detach().cpu().clone() for k, v in network.state_dict().items()}
+        for comp, network, _ in networks
     }
 
     batch = {"lq": torch.rand(1, 3, 16, 16), "gt": torch.rand(1, 3, 16, 16)}
@@ -480,8 +509,8 @@ def test_vosr_model_per_arch_trainability_combinations_ema_and_separate_export(
     assert stepped is True
     assert "loss/total" in scalars and "loss/l1" in scalars
 
-    for comp in ("vae", "dit", "dino"):
-        cur_sd = model.get_component(comp).state_dict()
+    for comp, network, ema in networks:
+        cur_sd = network.state_dict()
         changed = any(
             not torch.equal(cur_sd[k].detach().cpu(), init_snap[comp][k])
             for k in cur_sd
@@ -489,10 +518,10 @@ def test_vosr_model_per_arch_trainability_combinations_ema_and_separate_export(
         )
         if trainable_cfg[comp]:
             assert changed, f"Trainable component {comp!r} did not update!"
-            assert model.emas[comp].num_updates == 1
+            assert ema.num_updates == 1
         else:
             assert not changed, f"Frozen component {comp!r} unexpectedly mutated!"
-            assert model.get_component(comp).training is False
+            assert network.training is False
 
     # Verify separate per-arch export keys and strict reloadability into each arch
     exported = model.export_weights(acc)
@@ -505,11 +534,9 @@ def test_vosr_model_per_arch_trainability_combinations_ema_and_separate_export(
     # Verify EMA infer network shares frozen components without copying while using EMA for trainable ones
     infer_ema = model.get_infer_network(use_ema=True)
     assert isinstance(infer_ema, VOSRPipeline)
-    for comp in ("vae", "dit", "dino"):
-        if trainable_cfg[comp]:
-            assert infer_ema.get_component(comp) is model.emas[comp].module
-        else:
-            assert infer_ema.get_component(comp) is model.get_component(comp)
+    assert infer_ema.vae is (model.vae_ema.module if model.vae_ema else model.vae)
+    assert infer_ema.dit is (model.dit_ema.module if model.dit_ema else model.dit)
+    assert infer_ema.dino is (model.dino_ema.module if model.dino_ema else model.dino)
 
     # Verify save_frozen_weights=False exports ONLY trainable archs + their EMAs
     model.save_frozen_weights = False
